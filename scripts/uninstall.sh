@@ -38,20 +38,21 @@ warn() { printf '    %swarn%s %s\n' "$YELLOW" "$RESET" "$1"; }
 run()  { if [ "$DRY_RUN" -eq 1 ]; then printf '    would: %s\n' "$*"; else "$@"; fi; }
 
 # Resolve paths exactly as the installer does.
+# Resolved exactly as Pi resolves it: homedir()/<name>/agent, overridden by
+# PI_CODING_AGENT_DIR. Pi honours neither XDG_CONFIG_HOME nor PI_CONFIG_DIR.
 CONFIG_DIR_NAME="${PI_CONFIG_DIR_NAME:-.pi}"
 if [ -n "${PI_HARNESS_CONFIG_DIR:-}" ]; then
-  CONFIG_DIR="$PI_HARNESS_CONFIG_DIR"
-elif [ -n "${PI_CONFIG_DIR:-}" ]; then
-  CONFIG_DIR="$PI_CONFIG_DIR"
-elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
-  CONFIG_DIR="$XDG_CONFIG_HOME/$CONFIG_DIR_NAME"
+  AGENT_DIR="$PI_HARNESS_CONFIG_DIR/agent"
+elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+  AGENT_DIR="$PI_CODING_AGENT_DIR"
 else
-  CONFIG_DIR="$HOME/$CONFIG_DIR_NAME"
+  AGENT_DIR="$HOME/$CONFIG_DIR_NAME/agent"
 fi
 
-EXTENSIONS_DIR="$CONFIG_DIR/agent/extensions"
+CONFIG_DIR="$(dirname "$AGENT_DIR")"
+EXTENSIONS_DIR="$AGENT_DIR/extensions"
 TARGET="$EXTENSIONS_DIR/$EXTENSION_NAME"
-HARNESS_STATE_DIR="${PI_HARNESS_HOME:-$CONFIG_DIR/agent/harness}"
+HARNESS_STATE_DIR="${PI_HARNESS_HOME:-$AGENT_DIR/harness}"
 
 step "Removing the harness extension"
 

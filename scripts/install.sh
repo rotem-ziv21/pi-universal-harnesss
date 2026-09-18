@@ -122,6 +122,12 @@ fi
 # The directory name comes from the installed package's piConfig.configDir — it is
 # NOT assumed to be ".pi", because rebranded distributions use something else and the
 # Pi docs explicitly warn against hardcoding it.
+#
+# The agent directory is then resolved exactly the way Pi resolves it (verified in
+# Pi 0.85.1 dist/config.js): homedir()/<name>/agent, overridden by PI_CODING_AGENT_DIR.
+# Pi honours NEITHER XDG_CONFIG_HOME NOR PI_CONFIG_DIR. Consulting those would install
+# the extension into a directory Pi never reads — it would appear to succeed and then
+# silently never load.
 
 step "Resolving the Pi configuration directory"
 
@@ -138,17 +144,15 @@ fi
 ok "config directory name: $CONFIG_DIR_NAME"
 
 if [ -n "${PI_HARNESS_CONFIG_DIR:-}" ]; then
-  CONFIG_DIR="$PI_HARNESS_CONFIG_DIR"
-elif [ -n "${PI_CONFIG_DIR:-}" ]; then
-  CONFIG_DIR="$PI_CONFIG_DIR"
-elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
-  CONFIG_DIR="$XDG_CONFIG_HOME/$CONFIG_DIR_NAME"
+  AGENT_DIR="$PI_HARNESS_CONFIG_DIR/agent"
+elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+  AGENT_DIR="$PI_CODING_AGENT_DIR"
 else
   [ -n "${HOME:-}" ] || die "HOME is not set and no override was given. Set PI_HARNESS_CONFIG_DIR."
-  CONFIG_DIR="$HOME/$CONFIG_DIR_NAME"
+  AGENT_DIR="$HOME/$CONFIG_DIR_NAME/agent"
 fi
 
-AGENT_DIR="$CONFIG_DIR/agent"
+CONFIG_DIR="$(dirname "$AGENT_DIR")"
 EXTENSIONS_DIR="$AGENT_DIR/extensions"
 HARNESS_STATE_DIR="${PI_HARNESS_HOME:-$AGENT_DIR/harness}"
 TARGET="$EXTENSIONS_DIR/$EXTENSION_NAME"

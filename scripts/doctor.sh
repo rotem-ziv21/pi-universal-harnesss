@@ -63,15 +63,16 @@ else
 fi
 
 # --- paths --------------------------------------------------------------------
+# Resolved exactly as Pi resolves it (see install.sh).
 CONFIG_DIR_NAME="${PI_CONFIG_DIR_NAME:-.pi}"
-if [ -n "${PI_HARNESS_CONFIG_DIR:-}" ]; then CONFIG_DIR="$PI_HARNESS_CONFIG_DIR"
-elif [ -n "${PI_CONFIG_DIR:-}" ]; then       CONFIG_DIR="$PI_CONFIG_DIR"
-elif [ -n "${XDG_CONFIG_HOME:-}" ]; then     CONFIG_DIR="$XDG_CONFIG_HOME/$CONFIG_DIR_NAME"
-else                                          CONFIG_DIR="$HOME/$CONFIG_DIR_NAME"; fi
+if [ -n "${PI_HARNESS_CONFIG_DIR:-}" ]; then AGENT_DIR="$PI_HARNESS_CONFIG_DIR/agent"
+elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then AGENT_DIR="$PI_CODING_AGENT_DIR"
+else                                          AGENT_DIR="$HOME/$CONFIG_DIR_NAME/agent"; fi
 
-EXTENSIONS_DIR="$CONFIG_DIR/agent/extensions"
+CONFIG_DIR="$(dirname "$AGENT_DIR")"
+EXTENSIONS_DIR="$AGENT_DIR/extensions"
 TARGET="$EXTENSIONS_DIR/$EXTENSION_NAME"
-HARNESS_STATE_DIR="${PI_HARNESS_HOME:-$CONFIG_DIR/agent/harness}"
+HARNESS_STATE_DIR="${PI_HARNESS_HOME:-$AGENT_DIR/harness}"
 
 if [ -e "$TARGET" ]; then
   if [ -L "$TARGET" ]; then

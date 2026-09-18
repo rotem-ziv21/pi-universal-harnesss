@@ -10,15 +10,25 @@ import { HarnessError } from "../util/errors.ts";
  * current machine. Every path below is *derived* at runtime, and every step has an
  * explicit override so the harness can be relocated without editing source.
  *
- * Resolution order for the Pi config directory:
- *   1. $PI_HARNESS_CONFIG_DIR  — full override, for exotic setups and tests
- *   2. $PI_CONFIG_DIR          — Pi's own override, if the installation defines one
- *   3. $XDG_CONFIG_HOME/<name> — Linux/RunPod convention when set
- *   4. $HOME/<name>            — the ordinary case on macOS, Linux and containers
+ * **The agent directory must match what Pi actually uses, exactly.** Guessing here is
+ * not a cosmetic error: install into a directory Pi does not read and the extension
+ * never loads, silently, with every check still reporting success.
  *
- * `<name>` is read from the *installed* Pi package's `piConfig.configDir` rather than
- * hardcoded to `.pi`, because rebranded distributions use a different directory and
- * the docs explicitly warn against assuming it.
+ * Verified against Pi 0.85.1 (`dist/config.js`): the agent directory is
+ * `homedir()/<configDirName>/agent`, overridden by `PI_CODING_AGENT_DIR`.
+ * Pi honours **neither** `XDG_CONFIG_HOME` nor `PI_CONFIG_DIR` — an earlier version of
+ * this file consulted both, which on any Linux box with `XDG_CONFIG_HOME` set (common
+ * on RunPod and other container images) would have pointed the harness somewhere Pi
+ * never looks.
+ *
+ * Resolution order for the agent directory:
+ *   1. $PI_HARNESS_CONFIG_DIR/agent  — our own escape hatch, for tests and exotic setups
+ *   2. $PI_CODING_AGENT_DIR          — Pi's documented override, used verbatim
+ *   3. homedir()/<configDirName>/agent
+ *
+ * `<configDirName>` is read from the *installed* Pi package's `piConfig.configDir`
+ * rather than hardcoded to `.pi`, because rebranded distributions use a different
+ * directory and the Pi docs explicitly warn against assuming it.
  */
 
 export const DEFAULT_CONFIG_DIR_NAME = ".pi";
@@ -99,24 +109,30 @@ function candidatePiPackageJsonPaths(): string[] {
 	return out;
 }
 
-export function resolveConfigDir(configDirName: string): string {
-	const explicit = process.env.PI_HARNESS_CONFIG_DIR ?? process.env.PI_CONFIG_DIR;
-	if (explicit) return resolve(explicit);
+/**
+ * The agent directory Pi will actually read, resolved the same way Pi resolves it.
+ * `PI_CODING_AGENT_DIR` is the agent directory itself, not its parent.
+ */
+export function resolveAgentDir(configDirName: string): string {
+	const ours = process.env.PI_HARNESS_CONFIG_DIR;
+	if (ours) return resolve(join(ours, "agent"));
 
-	const xdg = process.env.XDG_CONFIG_HOME;
-	if (xdg) return resolve(join(xdg, configDirName));
+	const pis = process.env.PI_CODING_AGENT_DIR;
+	if (pis) return resolve(pis);
 
-	const home = process.env.HOME ?? homedir();
+	// Node's homedir() already prefers $HOME on POSIX, which is what Pi calls.
+	const home = homedir() || process.env.HOME;
 	if (!home) {
 		throw new HarnessError("CONFIG_INVALID", "Cannot resolve a home directory; set PI_HARNESS_CONFIG_DIR explicitly.");
 	}
-	return resolve(join(home, configDirName));
+	return resolve(join(home, configDirName, "agent"));
 }
 
 export function resolvePaths(options: { configDirName?: string } = {}): HarnessPaths {
 	const configDirName = discoverConfigDirName(options.configDirName);
-	const configDir = resolveConfigDir(configDirName);
-	const agentDir = join(configDir, "agent");
+	const agentDir = resolveAgentDir(configDirName);
+	// The config directory is whatever contains the agent directory, whichever way we got there.
+	const configDir = dirname(agentDir);
 	const harnessDir = process.env.PI_HARNESS_HOME ? resolve(process.env.PI_HARNESS_HOME) : join(agentDir, "harness");
 
 	return {
