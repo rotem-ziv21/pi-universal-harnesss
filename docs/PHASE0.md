@@ -20,8 +20,7 @@ Everything below was verified against the machine, not assumed.
 | Global config | `~/.pi/agent/` |
 | Global extensions | `~/.pi/agent/extensions/` |
 | Sessions | `~/.pi/agent/sessions/` |
-| Active default model | `openai-codex/gpt-5.5` |
-| Pre-existing extensions | 4 Orca extensions — **must not be touched** |
+| Pre-existing extensions | Several unrelated third-party extensions — **must not be touched** |
 
 Extensions are loaded through [jiti](https://github.com/unjs/jiti), so **TypeScript
 runs directly with no build step**. That removes an entire class of portability
@@ -267,8 +266,8 @@ from the installed Pi package (never hardcodes `.pi`), resolves `$PI_CONFIG_DIR`
 `$XDG_CONFIG_HOME` / `$HOME` in that order, verifies the Pi version satisfies the
 supported range, then symlinks the checkout into
 `<configDir>/agent/extensions/pi-universal-harness`. It creates the state directory,
-never rewrites `settings.json`, and never touches the four pre-existing Orca
-extensions. Re-running is idempotent.
+never rewrites `settings.json`, and never touches any pre-existing third-party
+extension. Re-running is idempotent.
 
 **How the Task Compiler calls a model.** Through `ModelAdapter`, a thin wrapper over
 `ctx.modelRegistry.complete(ctx.model, …)`. It never references a provider name. The
