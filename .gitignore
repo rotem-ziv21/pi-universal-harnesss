@@ -1,0 +1,30 @@
+# --- Secrets: never, under any circumstances ---
+secrets.json
+*.key
+.env
+.env.*
+!.env.example
+
+# --- Local harness state (machine-local, never shared) ---
+state/
+.harness-state/
+*.jsonl
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+*.tsbuildinfo
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Build output (there is none; jiti runs TS directly) ---
+dist/
+build/
+
+# The original mission brief — kept locally, not published.
+promt.md

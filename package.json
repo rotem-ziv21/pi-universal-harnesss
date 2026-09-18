@@ -1,0 +1,19 @@
+{
+  "name": "pi-universal-harness",
+  "version": "0.1.0",
+  "description": "A portable, model-agnostic, task-agnostic execution harness for the Pi coding agent. The model reasons; the harness governs.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.19.0" },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types tests/**/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.85.0"
+  },
+  "keywords": ["pi", "pi-extension", "agent", "harness", "guardrails", "typesafe", "jev", "openrouter"]
+}
