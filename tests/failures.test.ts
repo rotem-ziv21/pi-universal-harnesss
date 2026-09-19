@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { createCheckpointDetector } from "../src/checkpoints/detector.ts";
+import { createEvidencePlanner } from "../src/evidence/planner.ts";
 import { createModelContractReviewer } from "../src/contract/reviewer.ts";
 import { droppedHardUserItems, lock, revise } from "../src/contract/revisions.ts";
 import { createDeterministicJudge } from "../src/judges/deterministic.ts";
@@ -1206,5 +1207,119 @@ describe("Model calls cannot hang the session", () => {
 			[1, 3],
 			[2, 3],
 		]);
+	});
+});
+
+describe("Signals and planning against a weaker compiler model", () => {
+	/**
+	 * Both regressions here came from one live run on a local 27B model.
+	 */
+
+	test("find … -prune is read-only and must not be gated", async () => {
+		const detector = createCheckpointDetector({ config });
+		const c = contract();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+
+		const readOnly = [
+			"find . -path ./node_modules -prune -o -name '*.ts' -print",
+			"find . -type d -name node_modules -prune",
+		];
+
+		for (const command of readOnly) {
+			const decision = await detector.evaluate({ contract: c, state: state.getState(), action: action("bash", { command }) });
+			assert.equal(decision.needsGate, false, `"${command}" is a read-only search idiom and must take the fast path`);
+		}
+	});
+
+	test("prune as a real command is still destructive", async () => {
+		const detector = createCheckpointDetector({ config });
+		const c = contract();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+
+		for (const command of ["git prune", "docker system prune -a", "find . -name '*.log' -delete"]) {
+			const decision = await detector.evaluate({ contract: c, state: state.getState(), action: action("bash", { command }) });
+			assert.equal(decision.needsGate, true, `"${command}" really does destroy data`);
+		}
+	});
+
+	test("a command in a requirement description is found, not reported unverifiable", () => {
+		/**
+		 * A well-formed contract puts the command in verificationHint. Weaker models put
+		 * it in the description instead — and then every requirement reported as
+		 * unverifiable while the command sat in plain sight.
+		 */
+		const weak = contract({
+			requirements: [
+				{
+					id: "r1",
+					description: "Verify the result by running `wc -l data.csv`",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+				},
+			],
+		});
+		const state = createStateManager(weak.id, weak, { persist: false });
+		state.lockContract(weak);
+
+		const plan = createEvidencePlanner().plan({
+			contract: weak,
+			state: state.getState(),
+			checkpoint: {
+				needsGate: true,
+				checkpointType: "completion_claim",
+				severity: "critical",
+				reason: "completion",
+				signals: [],
+				relatedRequirements: ["r1"],
+				escalated: false,
+			},
+			checkpointId: "ckpt-1",
+			action: action("bash", { command: "true" }),
+		});
+
+		const commands = plan.evidenceRequests.filter((r) => r.kind === "command").map((r) => r.parameters.command);
+		assert.deepEqual(commands, ["wc -l data.csv"]);
+		assert.equal(plan.unverifiable.length, 0, "nothing should be unverifiable when the command is right there");
+	});
+
+	test("the hint still wins over the description when both carry a command", () => {
+		const both = contract({
+			successConditions: [
+				{
+					id: "s1",
+					description: "Checked by running `wrong-command`",
+					source: "user",
+					priority: "hard",
+					verificationHint: "run `right-command`",
+					status: "pending",
+				},
+			],
+		});
+		const state = createStateManager(both.id, both, { persist: false });
+		state.lockContract(both);
+
+		const plan = createEvidencePlanner().plan({
+			contract: both,
+			state: state.getState(),
+			checkpoint: {
+				needsGate: true,
+				checkpointType: "completion_claim",
+				severity: "critical",
+				reason: "completion",
+				signals: [],
+				relatedRequirements: ["s1"],
+				escalated: false,
+			},
+			checkpointId: "ckpt-1",
+			action: action("bash", { command: "true" }),
+		});
+
+		assert.deepEqual(
+			plan.evidenceRequests.map((r) => r.parameters.command),
+			["right-command"],
+		);
 	});
 });

@@ -193,9 +193,18 @@ function deriveRequests(
 		];
 	}
 
-	// 2. A command embedded in the verification hint, e.g. "run `npm test`".
-	if (target.verificationHint) {
-		const command = extractCommand(target.verificationHint);
+	/**
+	 * 2. A command embedded in the requirement itself.
+	 *
+	 * The hint is checked first because that is where a well-formed contract puts it.
+	 * The description is checked too, because weaker compiler models routinely emit
+	 * "Verify the result by running `wc -l data.csv`" as a *requirement* with no hint
+	 * at all — and refusing to look there means the command is right in front of us and
+	 * every requirement reports as unverifiable.
+	 */
+	for (const source of [target.verificationHint, target.description]) {
+		if (!source) continue;
+		const command = extractCommand(source);
 		if (command) {
 			return [
 				{

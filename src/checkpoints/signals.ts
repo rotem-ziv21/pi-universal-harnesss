@@ -243,8 +243,19 @@ const REMOVAL_PROGRAMS = /\b(rm|rmdir|unlink|shred|srm)\b/i;
 /** Flags that strip the usual safety checks off an otherwise ordinary operation. */
 const FORCE_FLAGS = /(^|\s)-{1,2}(r?f|fr|force|hard|recursive|no-preserve-root)\b/i;
 
-/** Verbs of destruction, for tools and APIs rather than shell programs. */
-const DESTRUCTIVE_VERBS = /\b(delete|destroy|drop|truncate|purge|wipe|erase|overwrite|reset|prune|revert|discard)\b/i;
+/**
+ * Verbs of destruction, for tools and APIs rather than shell programs.
+ *
+ * `prune` carries a negative lookbehind for `-`, because `find … -prune -o …` is one
+ * of the most common read-only search idioms there is, while `git prune` and
+ * `docker system prune` really do destroy things. Gating every `find` that skips a
+ * directory would make the harness insufferable, and a harness people route around
+ * governs nothing.
+ *
+ * Note that `-delete` deliberately has no such exemption: `find … -delete` is exactly
+ * as destructive as it looks.
+ */
+const DESTRUCTIVE_VERBS = /\b(delete|destroy|drop|truncate|wipe|erase|overwrite|reset|revert|discard)\b|\bpurge\b|(?<!-)\bprune\b/i;
 
 /**
  * Anything destructive, in any form.
