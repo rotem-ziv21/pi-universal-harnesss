@@ -43,6 +43,11 @@ export interface PiModelHost {
 	readonly modelRegistry?: {
 		find(provider: string, modelId: string): unknown;
 		hasConfiguredAuth(model: unknown): boolean;
+		/**
+		 * Pi's own credential lookup. Resolves `/login` credentials and the provider's
+		 * environment variable, so the harness never needs its own copy of a key.
+		 */
+		getApiKeyForProvider?(provider: string): Promise<string | undefined>;
 		complete(
 			model: unknown,
 			context: { systemPrompt?: string; messages: unknown[] },

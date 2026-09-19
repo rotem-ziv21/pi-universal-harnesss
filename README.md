@@ -316,9 +316,21 @@ Continue the task: gather the missing evidence, then declare completion again.
 
 ## Installation
 
+**One line, on any machine that already has Pi:**
+
 ```bash
-git clone <repo> pi-universal-harness
-cd pi-universal-harness
+curl -fsSL https://raw.githubusercontent.com/rotem-ziv21/pi-universal-harnesss/main/scripts/bootstrap.sh | bash
+```
+
+That clones (or updates) the harness and installs it. It is idempotent — re-run it to
+update. On a container it prefers a mounted volume over the root filesystem, so the
+install survives a restart, and warns when it cannot find one.
+
+Or manually:
+
+```bash
+git clone https://github.com/rotem-ziv21/pi-universal-harnesss.git
+cd pi-universal-harnesss
 ./scripts/install.sh
 ```
 
@@ -331,23 +343,23 @@ It never overwrites an existing config, never touches unrelated extensions, and 
 idempotent. `--dry-run` shows exactly what it would do; `--copy` installs without a
 symlink.
 
-Then give the Judge a key — **machine-local, never committed**:
-
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."     # add to your shell profile
-```
-
-or inside Pi:
+Then give the Judge a key. **Pi already has a place for this**, and the harness reads
+it rather than keeping its own copy:
 
 ```
-/harness setup
+pi
+/login              # choose OpenRouter, paste your key
+/harness doctor     # confirm
 ```
 
-Verify:
+That is the whole configuration. One place to log in, one place to rotate, nothing to
+carry between machines.
 
-```
-/harness doctor
-```
+The key is resolved fresh on every use, so a `/login` performed mid-session takes
+effect on the very next gate — no reload.
+
+Two alternatives remain for anyone who would rather not log in to OpenRouter inside Pi:
+`export OPENROUTER_API_KEY=...`, or `/harness setup` to store it locally at mode 0600.
 
 ### Portability
 
@@ -462,8 +474,10 @@ Other guarantees:
 
 ## Security
 
-- The API key is read from `OPENROUTER_API_KEY`, then from a local store at mode `0600`,
-  then reported as unconfigured. Never from tracked config, never from source.
+- The API key is resolved from **Pi's own credential store** (`/login`, which also covers
+  `OPENROUTER_API_KEY`), then from a harness-local store at mode `0600`, then reported as
+  unconfigured. Never from tracked config, never from source. Preferring Pi's store means
+  there is usually no second copy of the key to protect at all.
 - Redaction runs at the **boundary** — every log write and every rendered command output
   — rather than trusting each call site to remember. Registered key values, common
   credential formats (OpenRouter, Anthropic, OpenAI, GitHub, AWS, Slack, JWT, Google) and

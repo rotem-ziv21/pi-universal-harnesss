@@ -14,7 +14,7 @@ import { createOpenRouterJevJudge } from "../judges/openrouter-jev.ts";
 import { createJudgeRouter, type JudgeRouter } from "../judges/router.ts";
 import { createCurrentModelAdapter, createPinnedModelAdapter, type ModelAdapter, type PiModelHost } from "../models/model-adapter.ts";
 import { createProgressMonitor } from "../progress/monitor.ts";
-import { resolveOpenRouterKey, type ResolvedSecret } from "../security/secrets.ts";
+import { createKeyResolver, type KeyResolver, resolveOpenRouterKey, type ResolvedSecret } from "../security/secrets.ts";
 import { createStateManager, restoreStateManager, type StateManager } from "../state/state-manager.ts";
 import { errorMessage } from "../util/errors.ts";
 import { newTaskId } from "../util/ids.ts";
@@ -37,7 +37,10 @@ export interface HarnessRuntime {
 	readonly paths: HarnessPaths;
 	readonly config: HarnessConfig;
 	readonly logger: Logger;
+	/** Synchronous snapshot taken at startup; may be stale after `/login`. */
 	readonly secret: ResolvedSecret;
+	/** Live resolution, preferring Pi's own credentials. Use this for anything current. */
+	readonly resolveKey: KeyResolver;
 	readonly judge: JudgeRouter;
 	readonly warnings: readonly string[];
 
@@ -125,6 +128,15 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 
 	const secret = resolveOpenRouterKey(paths);
 
+	/**
+	 * Live key resolution, asked fresh on every use.
+	 *
+	 * `host` is Pi's ExtensionContext, which carries `modelRegistry`. Reading through it
+	 * means `/login` is the single place a key is configured, and a login performed
+	 * mid-session is picked up on the next gate with no reload.
+	 */
+	let resolveKey: KeyResolver = createKeyResolver({ paths, host: deps.host.modelRegistry });
+
 	// --- model-dependent components, rebuilt on /model ---
 	let host = deps.host;
 	let modelAdapter: ModelAdapter = buildAdapter(host, config.compiler);
@@ -143,7 +155,7 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 		config.judge.enabled && config.judge.provider === "openrouter"
 			? createOpenRouterJevJudge({
 					config: config.judge,
-					apiKey: secret.value,
+					getApiKey: async () => (await resolveKey()).value,
 					logger,
 					...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
 				})
@@ -223,6 +235,7 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 		secret,
 		judge,
 		warnings,
+		resolveKey: () => resolveKey(),
 
 		get compilerId() {
 			return modelAdapter.available ? modelAdapter.id : `${modelAdapter.id} (unavailable)`;
@@ -235,6 +248,7 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 
 		refreshModel(nextHost: PiModelHost): void {
 			host = nextHost;
+			resolveKey = createKeyResolver({ paths, host: nextHost.modelRegistry });
 			modelAdapter = buildAdapter(host, config.compiler);
 			reviewerAdapter = buildAdapter(host, config.contractReviewer);
 			compiler = createTaskCompiler(modelAdapter, { logger, maxRepairAttempts: config.compiler.maxRepairAttempts });

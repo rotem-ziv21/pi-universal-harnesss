@@ -7,6 +7,7 @@ import { createDeterministicJudge } from "../src/judges/deterministic.ts";
 import { isStale } from "../src/judges/judge.ts";
 import { createOpenRouterJevJudge } from "../src/judges/openrouter-jev.ts";
 import { resolveMountPoint } from "../src/pi/doctor.ts";
+import { createKeyResolver, OPENROUTER_ENV_VAR, writeSecret } from "../src/security/secrets.ts";
 import { createJudgeRouter } from "../src/judges/router.ts";
 import { createStubModelAdapter } from "../src/models/model-adapter.ts";
 import { completeStructured } from "../src/models/structured.ts";
@@ -181,7 +182,7 @@ describe("Judge failures", () => {
 	});
 
 	test("a missing API key is reported as JUDGE_AUTH_MISSING, not as a network error", async () => {
-		const judge = createOpenRouterJevJudge({ config: config.judge, apiKey: undefined });
+		const judge = createOpenRouterJevJudge({ config: config.judge, getApiKey: async () => undefined });
 		assert.equal(await judge.isAvailable(), false);
 
 		await assert.rejects(
@@ -200,7 +201,7 @@ describe("Judge failures", () => {
 	test("HTTP 404 explains that the alpha decisions path may have moved", async () => {
 		const judge = createOpenRouterJevJudge({
 			config: { ...config.judge, maxRetries: 0 },
-			apiKey: "sk-or-v1-test",
+			getApiKey: async () => "sk-or-v1-test",
 			fetchImpl: fakeFetch(() => ({ status: 404, body: "not found" })),
 		});
 
@@ -215,7 +216,7 @@ describe("Judge failures", () => {
 		let calls = 0;
 		const judge = createOpenRouterJevJudge({
 			config: { ...config.judge, maxRetries: 2 },
-			apiKey: "sk-or-v1-test",
+			getApiKey: async () => "sk-or-v1-test",
 			fetchImpl: fakeFetch(() => {
 				calls++;
 				return { status: 429, body: "rate limited" };
@@ -232,7 +233,7 @@ describe("Judge failures", () => {
 	test("a malformed response is rejected rather than half-interpreted", async () => {
 		const judge = createOpenRouterJevJudge({
 			config: { ...config.judge, maxRetries: 0 },
-			apiKey: "sk-or-v1-test",
+			getApiKey: async () => "sk-or-v1-test",
 			fetchImpl: fakeFetch(() => ({ body: { model: "jev", nonsense: true } })),
 		});
 
@@ -354,7 +355,7 @@ describe("Judge decision normalization", () => {
 	const jevJudge = (answers: Record<string, unknown>) =>
 		createOpenRouterJevJudge({
 			config: config.judge,
-			apiKey: "sk-or-v1-test",
+			getApiKey: async () => "sk-or-v1-test",
 			fetchImpl: fakeFetch(() => ({ body: { model: "jev", answers, usage: { input_tokens: 10, output_tokens: 2 } } })),
 		});
 
@@ -420,7 +421,7 @@ describe("Judge decision normalization", () => {
 			body: { model: "jev", answers: { verdict: choiceAnswer("PASS", { PASS: 1 }, 0.99), req_r1: noulAnswer(0.9), con_c1: noulAnswer(0) } },
 		}));
 
-		await createOpenRouterJevJudge({ config: config.judge, apiKey: "sk-or-v1-test", fetchImpl }).evaluate(query);
+		await createOpenRouterJevJudge({ config: config.judge, getApiKey: async () => "sk-or-v1-test", fetchImpl }).evaluate(query);
 
 		const call = fetchImpl.calls[0]!;
 		assert.ok(call.url.endsWith("/alpha/decisions"), `expected the decisions endpoint, got ${call.url}`);
@@ -815,5 +816,101 @@ describe("Ephemeral state detection in containers", () => {
 
 	test("unparseable input yields no answer rather than a wrong one", () => {
 		assert.equal(resolveMountPoint("/root/x", ""), undefined);
+	});
+});
+
+describe("Credentials come from Pi itself (§/login)", () => {
+	/**
+	 * Pi's `/login` already stores an OpenRouter key, and its ModelRegistry resolves
+	 * both that store and the environment variable. Reading through Pi means one place
+	 * to log in and one place to rotate, instead of a parallel secret the user has to
+	 * carry between machines.
+	 */
+	const host = (key?: string) => ({ getApiKeyForProvider: async () => key });
+
+	test("a key Pi holds is preferred over the harness's own store", async () => {
+		const paths = tempPaths();
+		try {
+			writeSecret(paths, OPENROUTER_ENV_VAR, "sk-or-v1-from-harness-store");
+			const resolved = await createKeyResolver({ paths, host: host("sk-or-v1-from-pi") })();
+
+			assert.equal(resolved.source, "pi");
+			assert.equal(resolved.value, "sk-or-v1-from-pi");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the harness store is still honoured when Pi has no key", async () => {
+		const paths = tempPaths();
+		try {
+			writeSecret(paths, OPENROUTER_ENV_VAR, "sk-or-v1-from-harness-store");
+			const resolved = await createKeyResolver({ paths, host: host(undefined) })();
+
+			assert.equal(resolved.source, "store");
+			assert.equal(resolved.value, "sk-or-v1-from-harness-store");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("no host and no store resolves to unconfigured, not to a crash", async () => {
+		const paths = tempPaths();
+		try {
+			const resolved = await createKeyResolver({ paths, host: undefined })();
+			assert.equal(resolved.source, "none");
+			assert.equal(resolved.value, undefined);
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("a throwing credential lookup degrades quietly instead of breaking the gate", async () => {
+		const paths = tempPaths();
+		try {
+			const angry = {
+				getApiKeyForProvider: async () => {
+					throw new Error("no such provider");
+				},
+			};
+			const resolved = await createKeyResolver({ paths, host: angry })();
+			assert.equal(resolved.source, "none");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the key is resolved per call, so /login mid-session takes effect", async () => {
+		const paths = tempPaths();
+		try {
+			let current: string | undefined;
+			const resolve = createKeyResolver({ paths, host: { getApiKeyForProvider: async () => current } });
+
+			assert.equal((await resolve()).source, "none", "before /login");
+			current = "sk-or-v1-just-logged-in";
+			assert.equal((await resolve()).source, "pi", "after /login, with no reload");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the judge reports itself available only once a key exists", async () => {
+		let current: string | undefined;
+		const judge = createOpenRouterJevJudge({
+			config: config.judge,
+			getApiKey: async () => current,
+		});
+
+		assert.equal(await judge.isAvailable(), false);
+		current = "sk-or-v1-test";
+		assert.equal(await judge.isAvailable(), true);
+	});
+
+	test("a missing key names /login in the error, since that is where it comes from", async () => {
+		const judge = createOpenRouterJevJudge({ config: config.judge, getApiKey: async () => undefined });
+		await assert.rejects(
+			() => judge.evaluate({ state: {} as never, requirements: [], constraints: [], checkpointType: "x", stateVersion: 1 }),
+			(e: unknown) => e instanceof HarnessError && e.code === "JUDGE_AUTH_MISSING" && /\/login/.test(e.message),
+		);
 	});
 });

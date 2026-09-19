@@ -200,7 +200,7 @@ export function renderStatus(args: {
 	if (args.judgeFallbacks.length > 0) {
 		lines.push(`Judge fallbacks:    ${args.judgeFallbacks.join(" → ")}`);
 	}
-	lines.push(`OpenRouter Key:     ${args.keySource === "none" ? "not configured" : `configured (${args.keySource}) ${args.keyFingerprint}`}`);
+	lines.push(`OpenRouter Key:     ${args.keySource === "none" ? "not configured — run /login and choose OpenRouter" : `configured ${args.keySource} ${args.keyFingerprint}`}`);
 
 	if (args.task) {
 		lines.push("");

@@ -1,7 +1,7 @@
 import { displayPath, isWritable } from "../config/paths.ts";
 import { updateConfig } from "../config/loader.ts";
 import { runDoctor } from "./doctor.ts";
-import { checkPermissions, deleteSecret, OPENROUTER_ENV_VAR, resolveOpenRouterKey, writeSecret } from "../security/secrets.ts";
+import { checkPermissions, deleteSecret, describeSource, OPENROUTER_ENV_VAR, resolveOpenRouterKey, writeSecret } from "../security/secrets.ts";
 import { fingerprint } from "../security/redact.ts";
 import { clamp } from "../util/json.ts";
 import { errorMessage } from "../util/errors.ts";
@@ -52,14 +52,22 @@ export function registerCommands(pi: PiExtensionAPI, deps: CommandDeps): void {
 
 async function dispatch(sub: string, argument: string, rt: HarnessRuntime, ctx: any, pi: PiExtensionAPI): Promise<void> {
 	switch (sub) {
-		case "status":
-			return show(ctx, pi, statusText(rt));
+		case "status": {
+			// Ask Pi for the key now: a /login since startup should be reflected.
+			const live = await rt.resolveKey();
+			return show(ctx, pi, statusText(rt, live));
+		}
 
 		case "setup":
 			return setup(rt, ctx, pi);
 
 		case "doctor": {
-			const report = await runDoctor({ paths: rt.paths, config: rt.config, judge: rt.judge, secret: rt.secret });
+			const report = await runDoctor({
+				paths: rt.paths,
+				config: rt.config,
+				judge: rt.judge,
+				secret: await rt.resolveKey(),
+			});
 			return show(ctx, pi, report);
 		}
 
@@ -112,7 +120,17 @@ async function setup(rt: HarnessRuntime, ctx: any, pi: PiExtensionAPI): Promise<
 		return show(ctx, pi, `/harness setup needs an interactive session. Set ${OPENROUTER_ENV_VAR} in your environment instead.`);
 	}
 
-	const current = resolveOpenRouterKey(rt.paths);
+	const current = await rt.resolveKey();
+
+	if (current.source === "pi") {
+		const replace = await ctx.ui.confirm(
+			"Harness setup",
+			`Pi already has an OpenRouter key from /login (${current.fingerprint}).\n\n` +
+				"The harness reads that key directly, so there is nothing to configure here. Storing a second copy " +
+				"means two places to rotate.\n\nStore one anyway?",
+		);
+		if (!replace) return show(ctx, pi, "Nothing changed. The harness will keep using Pi's own credentials.");
+	}
 
 	if (current.source === "env") {
 		const replace = await ctx.ui.confirm(
@@ -166,7 +184,7 @@ async function setup(rt: HarnessRuntime, ctx: any, pi: PiExtensionAPI): Promise<
 
 // --- renderers ---
 
-function statusText(rt: HarnessRuntime): string {
+function statusText(rt: HarnessRuntime, live = rt.secret): string {
 	const task = rt.getTask();
 	const stats = rt.judge.stats();
 	const described = rt.judge.describe();
@@ -178,8 +196,8 @@ function statusText(rt: HarnessRuntime): string {
 		judgePrimary: described.primary,
 		judgeFallbacks: described.fallbacks,
 		judgeEnabled: described.enabled,
-		keySource: rt.secret.source,
-		keyFingerprint: rt.secret.fingerprint,
+		keySource: describeSource(live.source),
+		keyFingerprint: live.fingerprint,
 		statePath: rt.paths.harnessDir,
 		stateHealthy: isWritable(rt.paths.harnessDir),
 		...(task
@@ -390,7 +408,7 @@ function judgeText(rt: HarnessRuntime): string {
 	lines.push(`Fallbacks:       ${described.fallbacks.join(" → ") || "(none)"}`);
 	lines.push(`Endpoint:        ${rt.config.judge.baseUrl}${rt.config.judge.decisionsPath}`);
 	lines.push(`Model:           ${rt.config.judge.model}`);
-	lines.push(`Key:             ${rt.secret.source === "none" ? "not configured" : `${rt.secret.source} ${rt.secret.fingerprint}`}`);
+	lines.push(`Key:             ${rt.secret.source === "none" ? "not configured" : `${describeSource(rt.secret.source)} ${rt.secret.fingerprint}`}`);
 	lines.push(`Failure policy:  critical=${rt.config.judge.failurePolicy.critical}, noncritical=${rt.config.judge.failurePolicy.noncritical}`);
 	lines.push("");
 	lines.push(`Calls:           ${stats.calls}`);

@@ -85,8 +85,14 @@ interface DecisionsResponse {
 
 export interface OpenRouterJevOptions {
 	readonly config: JudgeConfig;
-	/** Resolved by `security/secrets.ts`. Absent means the Judge is unconfigured. */
-	readonly apiKey?: string | undefined;
+	/**
+	 * Resolves the API key at call time rather than at construction.
+	 *
+	 * Deferred on purpose: the key usually comes from Pi's own credential store, so a
+	 * `/login` performed mid-session must take effect on the next gate instead of
+	 * requiring a reload. Returning undefined means the Judge is unconfigured.
+	 */
+	readonly getApiKey: () => Promise<string | undefined>;
 	readonly logger?: Logger;
 	/** Injectable for tests. */
 	readonly fetchImpl?: typeof fetch;
@@ -114,8 +120,12 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 
 	/** One request, with bounded retry on transient failures only. */
 	async function post(body: DecisionsRequest, signal: AbortSignal | undefined): Promise<{ response: DecisionsResponse; latencyMs: number }> {
-		if (!options.apiKey) {
-			throw new HarnessError("JUDGE_AUTH_MISSING", "No OpenRouter API key. Set OPENROUTER_API_KEY or run `/harness setup`.");
+		const apiKey = await options.getApiKey();
+		if (!apiKey) {
+			throw new HarnessError(
+				"JUDGE_AUTH_MISSING",
+				"No OpenRouter API key. Run `/login` in Pi and choose OpenRouter, or set OPENROUTER_API_KEY.",
+			);
 		}
 
 		let lastError: HarnessError | undefined;
@@ -136,7 +146,7 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 				const httpResponse = await doFetch(endpoint, {
 					method: "POST",
 					headers: {
-						Authorization: `Bearer ${options.apiKey}`,
+						Authorization: `Bearer ${apiKey}`,
 						"Content-Type": "application/json",
 						// Attribution headers OpenRouter uses for dashboards. Harmless if ignored.
 						"HTTP-Referer": "https://github.com/pi-universal-harness",
@@ -185,7 +195,8 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 		id,
 
 		async isAvailable(): Promise<boolean> {
-			return Boolean(config.enabled && options.apiKey);
+			if (!config.enabled) return false;
+			return Boolean(await options.getApiKey());
 		},
 
 		async evaluate(query: JudgeQuery): Promise<JudgeDecision> {

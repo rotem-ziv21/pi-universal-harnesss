@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { displayPath, discoverConfigDirName, type HarnessPaths, isWritable, pathExists } from "../config/paths.ts";
 import type { HarnessConfig } from "../config/schema.ts";
 import type { JudgeRouter } from "../judges/router.ts";
-import { checkPermissions, type ResolvedSecret } from "../security/secrets.ts";
+import { checkPermissions, describeSource, type ResolvedSecret } from "../security/secrets.ts";
 import { errorMessage } from "../util/errors.ts";
 
 /**
@@ -157,10 +157,17 @@ function secretChecks(args: DoctorArgs): Check[] {
 		checks.push({
 			name: "OpenRouter API key",
 			status: configured ? "PASS" : "FAIL",
-			detail: configured ? `Configured via ${args.secret.source} (${args.secret.fingerprint})` : "Not configured.",
+			detail: configured
+				? `Configured ${describeSource(args.secret.source)} (${args.secret.fingerprint})`
+				: "Not configured.",
 			...(configured
 				? {}
-				: { fix: "Run /harness setup, or export OPENROUTER_API_KEY in your shell profile." }),
+				: {
+						fix:
+							"Run /login inside Pi and choose OpenRouter — the harness reads the key Pi stores, " +
+							"so there is nothing else to configure.\n" +
+							"     Alternatives: export OPENROUTER_API_KEY, or run /harness setup.",
+					}),
 		});
 	} else {
 		checks.push({ name: "OpenRouter API key", status: "WARN", detail: "The Judge is disabled, so no key is needed." });

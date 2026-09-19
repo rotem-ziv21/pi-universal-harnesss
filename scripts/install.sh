@@ -265,11 +265,12 @@ fi
 printf '\n%sInstalled.%s\n\n' "$BOLD" "$RESET"
 echo "Next steps:"
 echo
-echo "  1. Give the Judge an API key (machine-local; it never goes into git):"
+echo "  1. Give the Judge a key. The harness reads the key Pi already holds, so"
+echo "     logging in to Pi is all that is needed:"
 echo
-echo "       export OPENROUTER_API_KEY=\"sk-or-v1-…\"      # add to your shell profile"
-echo "     or, inside Pi:"
-echo "       /harness setup"
+echo "       /login          # inside Pi: choose OpenRouter, paste your key"
+echo
+echo "     Alternatives: export OPENROUTER_API_KEY, or run /harness setup."
 echo
 echo "  2. Start Pi and confirm everything is healthy:"
 echo
