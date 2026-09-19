@@ -1,3 +1,5 @@
+import type { ResourceEffect, ResourceProvenance, ResourceScope } from "../resources/types.ts";
+
 /**
  * Checkpoint vocabulary (§23).
  *
@@ -26,46 +28,50 @@ export type CheckpointType =
 
 export type CheckpointSeverity = "critical" | "noncritical";
 
-/** Normalized meaning of a tool call. Payload text is deliberately not inspected. */
+/** Normalized meaning of an action after a tool-specific adapter has parsed it. */
 export type ActionType =
-	| "file_read"
-	| "file_write"
-	| "file_delete"
-	| "file_move"
-	| "directory_create"
-	| "dependency_change"
-	| "git_commit"
-	| "remote_mutation"
-	| "deployment"
-	| "database_mutation"
-	| "execute_local_code"
-	| "local_command"
+	| "resource_read"
+	| "resource_mutation"
+	| "local_execution"
+	| "external_mutation"
 	| "unknown";
 
+/**
+ * Task-independent capabilities used by policy.
+ *
+ * Concrete programs and tool names belong in adapters. Policy consumes only this
+ * vocabulary plus resource provenance and scope.
+ */
 export type ActionCapability =
-	| "read_file"
-	| "write_file"
-	| "delete_file"
-	| "move_file"
-	| "create_directory"
-	| "change_dependencies"
-	| "commit_git"
+	| "read_resource"
+	| "create_resource"
+	| "modify_resource"
+	| "delete_resource"
+	| "move_resource"
+	| "query_resource"
+	| "execute_code"
+	| "install_dependency"
+	| "commit"
 	| "mutate_remote"
+	| "publish"
 	| "deploy"
-	| "mutate_database"
-	| "execute_local_code"
-	| "run_tests";
+	| "generate_artifact";
+
 
 export interface ActionSemantics {
 	readonly actionType: ActionType;
-	readonly target?: string;
-	readonly targetOwnership: "task_created" | "preexisting" | "outside_scope" | "unknown";
+	readonly classification: "known" | "declared" | "unknown";
 	readonly mutationType: "create" | "modify" | "delete" | "read" | "execute" | "none";
 	/** High means readily reversible; low means irreversible or externally visible. */
 	readonly reversibility: "high" | "medium" | "low";
 	readonly externalSideEffect: boolean;
 	readonly capabilities: readonly ActionCapability[];
-	/** Active command tokens only. Never file content, request bodies, patches, or data. */
+	readonly effects: readonly ResourceEffect[];
+	/** Convenience projection of the first resource effect. */
+	readonly target?: string;
+	readonly targetProvenance: ResourceProvenance;
+	readonly targetScope: ResourceScope;
+	/** Active operation tokens only. Never file content, request bodies, patches, or data. */
 	readonly operationText: string;
 }
 

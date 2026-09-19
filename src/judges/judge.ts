@@ -71,7 +71,8 @@ export interface JudgeState {
 	readonly normalizedAction: Readonly<{
 		actionType: string;
 		target?: string;
-		targetOwnership: string;
+		targetProvenance: string;
+		targetScope: string;
 		mutationType: string;
 		reversibility: string;
 		externalSideEffect: boolean;

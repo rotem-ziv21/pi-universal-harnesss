@@ -50,15 +50,15 @@ The model is never asked to remember any of this.
 
 ## What it is not
 
-It is **not** a collection of rules about code. There is no "run tests before push"
-anywhere in it. The word `git` does not appear in any executable line of the checkpoint
-detector, the evidence planner, or the Judge payload builder — there is a test that
-enforces this.
+It is **not** a collection of task-domain rules. Core policy never asks whether the
+task is "code", "data", or "image" work. It evaluates typed capabilities, resource
+operations, provenance, scope, reversibility, and external visibility.
 
-The schema is fixed. The content comes from the task in front of it. The same harness
-governs software development, git operations, deployment, security audits, dataset
-preparation, image generation, data processing, model-training preparation, research
-and general agent work.
+Concrete tool and command knowledge is isolated in semantic adapters. The shell
+adapter may know how a program expresses deletion or publication; the detector,
+evidence planner, completion evaluator, and Judge payload consume only the normalized
+result. Adding a new tool means adding an adapter or supplying a structured
+`harnessSemantics` declaration, not adding a branch to policy.
 
 ---
 
@@ -73,11 +73,12 @@ static; the content is dynamic**.
 TaskContract
 ├── originalRequest      the user's words, unmodified
 ├── goal
+├── workspace            allowed scopes and protected resources
 ├── requirements         things that must be ACHIEVED
-├── constraints          boundaries on HOW
-├── successConditions    what must be demonstrably true, and verifiable
+├── constraints          boundaries on HOW, optionally with typed action policy
+├── successConditions    what must be demonstrably true
 ├── forbiddenConditions  outcomes that must never occur
-├── criticalActions      actions verified BEFORE they run
+├── criticalActions      typed action selectors verified BEFORE they run
 ├── ambiguities          what the compiler could not resolve
 └── assumptions          what it filled in — never presented as user instructions
 ```
@@ -135,12 +136,14 @@ The harness owns the state. The model may read it and reason about it, but never
 ```
 stateVersion 47
 ├── contract + contractVersion + revision history
-├── verifiedFacts      ← requires runtime evidence. Enforced, not requested.
-├── hypotheses         ← what the model believes. A structurally different type.
-├── evidence           ← with provenance, trust level, and freshness
-├── actions            ← with equivalence signatures, for loop detection
+├── workspace
+│   └── resource registry ← URI, kind, provenance, scope, status, creating action
+├── verifiedFacts        ← requires runtime evidence. Enforced, not requested.
+├── hypotheses           ← what the model believes. A structurally different type.
+├── evidence             ← expected, observed, provenance, trust, freshness
+├── actions              ← normalized resource effects and loop signatures
 ├── checkpoints
-├── decisions          ← every Judge verdict, including ones not applied
+├── decisions            ← every Judge verdict, including ones not applied
 └── counters
 ```
 
@@ -168,59 +171,55 @@ fact. "SQL injection" is a hypothesis, and it is stored as one.
 
 ### 5. Checkpoint detection
 
-Every tool call is first normalized into active semantics:
+Every tool call is normalized into active semantics:
 
 ```
-actionType · target · targetOwnership · mutationType · reversibility
+actionType · classification · mutationType · reversibility
 externalSideEffect · capabilities
+resource effects[] = URI · kind · operation · provenance · scope
 ```
 
 Only operation fields are classified. File content, patches, replacement text and
-request bodies are data; words such as `unlink`, `rm -rf` or `git push` inside that data
-cannot become destructive-action signals.
+request bodies are data; words inside those payloads cannot become capabilities.
+Built-in file tools, shell syntax, and known commands are adapters. Unknown custom
+tools are reviewed conservatively unless they provide structured semantics.
 
 Checkpoint policy then runs cheapest-first:
 
 ```
-Read-only?                       ──yes──► allow
-Direct hard-policy violation?   ──yes──► block without a Judge
-Relevant conditional contract? ──yes──► evidence gate
-Reversible local PLAN/BUILD?    ──yes──► allow construction
-Generic high-risk side effect?  ──yes──► evidence gate
-Ambiguous residual risk?        ──yes──► narrow Judge escalation
+Read/query only?                   ──yes──► allow
+Protected/out-of-scope mutation?  ──yes──► block without a Judge
+Typed forbidden policy match?     ──yes──► block without a Judge
+Typed review/critical match?       ──yes──► evidence gate
+Reversible local PLAN/EXECUTE?     ──yes──► allow construction
+Generic high-risk side effect?     ──yes──► evidence gate
+Unknown classification?           ──yes──► conservative review
 ```
 
-Constraint matching is capability-aware. A dependency constraint can match an actual
-package installation, but not a README write; a delete prohibition can match an actual
-delete operation, but not source code that mentions deletion.
-
-> A gap found during live testing: the contract named "delete the .log files" as
-> critical. `find … -delete` was correctly blocked three times, and the model then
-> reached the same outcome with `rm -f -- ./*.log`, which matched nothing. A gate
-> defeated by rephrasing is a vocabulary filter, not a gate. Removal *programs* are now
-> named explicitly, and `isMutating` and `destructiveSignal` share one definition so
-> they cannot drift apart again. There is a regression test with six equivalent
-> phrasings.
+Policy selectors use task-independent dimensions: capability, operation, resource
+kind, provenance, scope, external visibility, and optional URI prefix. Descriptions
+remain authoritative human intent, but are never regex-dispatched into policy.
 
 ### 6. Evidence planning and collection
 
 Once a checkpoint fires, the planner asks: *what must be proven before this may proceed?*
-Planning happens before the final gate decision so the harness can detect circular
-dependencies: reversible task-local construction needed to create the proof is allowed
-during BUILD rather than being blocked for not already having that proof.
+Planning happens before the final gate decision so the harness can detect typed circular
+dependencies: reversible construction that creates a resource named by a verification
+strategy is allowed before that resource can be inspected.
 
-The answer comes from the contract, not from a checklist:
+The answer is a typed strategy from the contract:
 
-1. Skip a requirement only when fresh, non-superseded evidence explicitly supports it.
-2. Derive a check from a machine-checkable `check`, the condition's
-   `verificationHint`, or project `preferredCommands`.
-3. Record failed checks as contradictory evidence, never as satisfaction.
-4. Report items with no route as **unverifiable** rather than silently dropping them.
+- `command_execution` carries a program and argument vector separately, plus typed
+  exit/output expectations. No shell string is extracted from prose.
+- `resource_state` checks existence, absence, or an exact hash.
+- `event_log_assertion` evaluates normalized successful actions.
+- `semantic_evaluation` and `visual_evaluation` remain model interpretation and cannot
+  masquerade as runtime evidence.
+- `user_confirmation` records an explicit user response.
 
-Judge payloads contain a stable evidence bundle per requirement. Each bundle names
-selected evidence and why it was selected, plus bounded exclusion reasons for stale,
-superseded or differently mapped evidence. Reviewer output remains
-`model_interpretation`, never runtime fact.
+Fresh, requirement-linked evidence is reused. Failed checks are contradictory evidence.
+Items with no typed route are reported as **unverifiable**. Arbitrary successful tool
+calls, filenames, and words in descriptions never satisfy a condition implicitly.
 
 ### 7. The Judge
 
@@ -300,19 +299,20 @@ Judge evaluated v41 → state is now v43 → decision recorded, NOT applied → 
 
 ### 10. Phase-aware completion
 
-Task execution advances through `PLAN → BUILD → VERIFY → FINALIZE`. Reversible,
-task-local construction is allowed in PLAN and BUILD; irreversible and external actions
-remain gated. A rejected completion returns to VERIFY.
+Task execution advances through `PLAN → EXECUTE → VERIFY → FINALIZE`. These phases
+describe lifecycle state, not a software workflow: a research query, a rendered
+document, a local program, and a generated image use the same transitions. Reversible
+allowed-scope work can proceed during PLAN, EXECUTE, and VERIFY; irreversible,
+protected-scope, and external actions remain gated. Adding evidence moves the task to
+VERIFY. A rejected completion returns there.
 
 The worker cannot declare "task completed" and bypass verification. The gate runs from
 Pi's `agent_settled` event, which fires when Pi will not continue on its own.
 
 At FINALIZE every hard requirement, success condition, constraint and forbidden
-condition receives its own `SATISFIED`, `UNSATISFIED` or `UNKNOWN` result. The harness
-settles runtime-observable facts first: test exit status, exact command output, file
-existence/content, and the event-log absence or presence of forbidden actions.
-`UNSATISFIED` blocks directly; only `UNKNOWN` conditions reach the Judge. A single
-opaque verdict therefore cannot erase already-proven conditions.
+condition receives its own `SATISFIED`, `UNSATISFIED` or `UNKNOWN` result. Deterministic
+results come only from fresh, explicitly linked typed evidence or structured event-log
+policy. `UNSATISFIED` blocks directly; only `UNKNOWN` conditions reach the Judge.
 
 On rejection the harness pushes structured feedback back with `triggerTurn`, so the
 worker resumes with the exact remaining conditions instead of repeating the same
@@ -530,13 +530,14 @@ Global config lives outside the repository and contains **no secrets**:
 }
 ```
 
-Optional project config at `<project>/.pi/harness.json` *helps* the Evidence Planner but
-never replaces contract logic. **The harness works with no project config at all.**
+Optional project config at `<project>/.pi/harness.json` gives the Task Compiler trusted
+project context and adds protected resources to workspace policy. It never replaces
+contract logic. **The harness works with no project config at all.**
 
 ```json
 {
   "projectType": "backend",
-  "preferredCommands": { "test": "npm test", "lint": "npm run lint" },
+  "preferredCommands": { "verification": "npm test" },
   "protectedPaths": ["infra/production/**"]
 }
 ```
@@ -573,22 +574,20 @@ content — which, for a Task Contract, means fabricating user requirements.
 ## Development
 
 ```bash
-npm test          # 74 tests
+npm test
 npm run typecheck
 ```
 
-Tests cover three unrelated workflows (coding, dataset, image) through identical harness
-code, plus the §61 failure modes: compiler misses a requirement, reviewer catches it,
-compiler invents a user constraint, stale `stateVersion`, OpenRouter unavailable, key
-missing, invalid Judge response, contradicting evidence, repeated strategies, completion
-without evidence, mid-task requirement change, hard-constraint violation,
-`MORE_EVIDENCE`, and restart recovery.
+Tests exercise the same core across local code/file work, protected-source
+transformation, non-code artifact generation, externally visible publication, and the
+CSV reproduction. Regression coverage also pairs each reproduction with an unrelated
+domain: rendered artifacts for provenance and shell semantics, qualitative document
+checks for non-executable prose, and generic reports for evidence linkage.
 
-One test reads the source of the detector, signals, planner and payload builder and
-fails if any executable line mentions git, npm, a specific tool name or a task domain.
-Comments are stripped first — several of those files *discuss* git precisely to explain
-why they do not branch on it, and a test that failed on the explanation would push us to
-delete the explanation rather than keep the property.
+Additional suites cover compiler/reviewer failures, stale state, unavailable Judges,
+credential resolution, contradictory evidence, repeated strategies, completion without
+evidence, contract revision, hard-policy violations, `MORE_EVIDENCE`, and restart
+recovery.
 
 ### Repository layout
 
@@ -601,6 +600,7 @@ delete the explanation rather than keep the property.
 │   ├── state/       types · event-store · reducer · state-manager · freshness
 │   ├── checkpoints/ types · action-semantics · detector · signals
 │   ├── evidence/    types · planner · collector · dependency · completion
+│   ├── resources/    types · registry
 │   ├── judges/      judge · payload · normalize · openrouter-jev
 │   │                model-judge · deterministic · router
 │   ├── progress/    monitor
@@ -623,12 +623,15 @@ Permanently in core, regardless of task:
 
 1. Explicit hard user constraints cannot be silently removed.
 2. Hypotheses do not automatically become verified facts.
-3. Stale Judge decisions are not applied.
-4. Runtime evidence outranks model claims.
-5. Judge decisions carry provenance.
-6. Contract revisions are versioned and diffed.
-7. Important decisions are auditable.
-8. Completion requires contract evaluation.
+3. Natural-language descriptions are never executed or regex-dispatched into policy.
+4. Resource provenance is recorded from successful normalized effects, including
+   task-created single files and non-filesystem resources.
+5. Protected and outside-allowed resource mutations are blocked deterministically.
+6. Stale Judge decisions are not applied.
+7. Runtime evidence outranks model claims.
+8. Evidence satisfies only the contract item ids explicitly linked to it.
+9. Contract revisions are versioned and diffed.
+10. Completion requires per-condition contract evaluation.
 
 Everything else is dynamic.
 
@@ -640,20 +643,28 @@ Everything else is dynamic.
    reports a clear diagnostic if it moves.
 2. **Jev returns no prose.** `reasons` are synthesized from calibrated probabilities —
    accurate and reproducible, but template-shaped rather than free-form.
-3. **Checkpoint detection on novel actions is heuristic.** Contract-derived signals are
-   exact; the generic classifier is documented and biased toward over-gating.
-4. **The compiler is one model call.** A bad contract produces bad gating for the whole
-   task. Review mitigates but does not eliminate this.
-5. **Structured output is prompt-constrained, not schema-enforced**, for portability.
-   Small local models fail validation more often; after two repair attempts the harness
-   degrades to a minimal contract built from the raw request and says so, rather than
-   fabricating one.
-6. **Sibling tool results are not visible at gate time** in Pi's parallel tool mode — a
-   documented Pi constraint.
-7. **No cost data from the decisions endpoint.** Calls, retries, failures, latency and
+3. **Adapters define observable semantics.** Built-in file tools and common shell
+   programs have adapters; custom tools must supply `harnessSemantics`. Unknown tools
+   are conservatively reviewed. The shell adapter models common sequencing,
+   redirection, descriptor duplication, and `cd`, but is not a complete POSIX shell.
+4. **The registry sees harness-routed effects.** Successful tool results update exact
+   resource URIs. Mutations performed out of band, or by a tool that declares incomplete
+   effects, are not observable until a later direct check.
+5. **Qualitative verification remains interpretation.** Semantic and visual reviewers
+   are labelled `model_interpretation`; they do not become deterministic completion
+   proof without a Judge or explicit user confirmation.
+6. **The compiler is one model call.** A bad contract can omit a typed selector or
+   verification route. Review mitigates but does not eliminate this.
+7. **Structured output is prompt-constrained, not provider-schema-enforced**, for
+   portability. After bounded repair failures the harness degrades to a minimal
+   contract and relies on generic gating.
+8. **Sibling tool results are not visible at gate time** in Pi's parallel tool mode —
+   a documented Pi constraint.
+9. **No cost data from the decisions endpoint.** Calls, retries, failures, latency and
    tokens are tracked; cost is estimated from a configurable rate.
-8. **Extensions run with full user permissions.** Pi has no sandbox for them. The harness
-   only ever writes inside its own state directory.
+10. **Extensions run with full user permissions.** Pi has no sandbox for them. The
+   harness only writes its own persistent state; governing agent tool effects remains
+   policy enforcement, not OS isolation.
 
 ---
 

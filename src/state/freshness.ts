@@ -99,22 +99,15 @@ export function currentEvidence(evidence: readonly EvidenceRef[]): EvidenceRef[]
 	return evidence.filter((e) => !e.supersededBy);
 }
 
-/** Targets changed by successful mutations at or after an evidence observation. */
+/** Resource URIs changed by successful mutations at or after an evidence observation. */
 export function changedTargetsSince(actions: readonly RecordedAction[], stateVersion: number): ReadonlySet<string> {
 	const targets = new Set<string>();
 	for (const action of actions) {
-		const semantics = action.actionSemantics;
-		if (
-			action.outcome !== "succeeded" ||
-			action.stateVersion < stateVersion ||
-			!semantics?.target ||
-			semantics.mutationType === "read" ||
-			semantics.mutationType === "none" ||
-			semantics.mutationType === "execute"
-		) {
-			continue;
+		if (action.outcome !== "succeeded" || action.stateVersion < stateVersion) continue;
+		for (const effect of action.actionSemantics.effects) {
+			if (effect.operation === "read" || effect.operation === "query" || effect.operation === "execute") continue;
+			targets.add(effect.uri);
 		}
-		targets.add(semantics.target);
 	}
 	return targets;
 }

@@ -39,100 +39,121 @@ export interface TaskCompiler {
 	compile(input: CompilerInput): Promise<TaskContract>;
 }
 
-const SYSTEM_PROMPT = `You compile a user's request into a structured Task Contract for an execution harness.
+const SYSTEM_PROMPT = `You compile a user's request into a structured Task Contract for a domain-agnostic execution harness.
 
-The harness is domain-agnostic. It governs software work, git operations, deployments, security audits, dataset preparation, image generation, data processing, model-training preparation, research, and general agent tasks. Your output must fit whichever of those this request is, without assuming it is any of them.
+The contract separates human intent from executable verification:
+- Descriptions are prose. The harness NEVER parses them into commands or policy.
+- "verification" contains typed strategies. Use command_execution only when the exact
+  program and argument vector are explicitly known from the user or project context.
+- For qualitative claims use semantic_evaluation or visual_evaluation. For direct
+  resource facts use resource_state. For action-history invariants use
+  event_log_assertion. Use user_confirmation only when the user must decide.
+- Do not invent a command from phrases such as "run a comparison" or "verify visually".
 
-THE DISTINCTIONS THAT MATTER
+SOURCE AND PRIORITY
+- source "user": stated by the user; preserve their words in quote.
+- source "compiler": inferred best practice. Never label an inference as user.
+- priority "hard": cannot be traded away. Explicit user requirements and prohibitions
+  are hard. Compiler-derived preferences are normally soft.
 
-1. source
-   "user"     - the user stated this. Quote their words in "quote".
-   "compiler" - you inferred it as good practice. The user never said it.
-   Never mark your own inference as "user". This is the single most damaging
-   error you can make: the harness treats "user" statements as authoritative and
-   will block work to protect them.
+ITEM TYPES
+- requirement: something to achieve.
+- constraint: a boundary on execution. When it maps to action semantics, add policy
+  with effect forbid or require_review and an action selector.
+- successCondition: something demonstrably true at completion, with typed verification
+  whenever the environment exposes a real way to verify it.
+- forbiddenCondition: an outcome that must never occur. Add a typed forbid policy only
+  when action semantics can directly represent it.
+- criticalAction: an action to verify before execution. Add an action selector using
+  task-independent capabilities, resource operations, provenance, scope, kind, or
+  externalSideEffect. Never encode a concrete tool name in policy.
+- ambiguity: unresolved meaning, blocking only when proceeding could cause harm.
+- assumption: compiler-filled context, never a user instruction.
 
-2. priority
-   "hard" - may not be traded away under any circumstances.
-   "soft" - a preference; may yield to a hard item.
-   An explicit user prohibition or requirement is "hard". Do not soften it.
-   "Do not touch production" is hard. It is not "prefer not to touch production".
-   Your own derived best practices are almost always "soft".
+ACTION CAPABILITIES
+read_resource, create_resource, modify_resource, delete_resource, move_resource,
+query_resource, execute_code, install_dependency, commit, mutate_remote, publish,
+deploy, generate_artifact.
 
-3. requirement vs constraint
-   requirement - something that must be ACHIEVED.  ("authentication works again")
-   constraint  - a boundary on HOW it may be done. ("do not modify the frontend")
+RESOURCE DIMENSIONS
+- operation: read, create, modify, delete, move, execute, query, publish, deploy.
+- provenance: preexisting, created_by_current_task, created_by_harness, external, unknown.
+- scope: allowed, protected, outside_allowed, external, unknown.
+- kind: file, directory, vcs_ref, api_object, database_record, deployment, artifact,
+  remote_resource, unknown.
 
-4. successCondition vs requirement
-   A success condition is what must be demonstrably TRUE and VERIFIABLE for the
-   task to be finished. Write it so that evidence could settle it.
-   Add "verificationHint" describing what would prove it, in general terms.
-
-5. forbiddenCondition
-   An outcome that must never occur, as opposed to an action that is forbidden.
-   ("training data leaks into the validation split")
-
-6. criticalAction
-   An action that must be verified BEFORE it is performed, because it is
-   irreversible, externally visible, destructive, or the user gated it.
-   Describe it in the vocabulary of the task, not of a tool.
-   Good: "publish the repository changes to the shared remote"
-   Bad:  "run git push"
-   Set "reversible" to "no" when the action cannot be undone.
-
-7. ambiguity
-   Something you genuinely could not determine. Give the interpretation you would
-   default to. Mark "blocking": true only if proceeding under any interpretation
-   could cause harm.
-
-8. assumption
-   Something you filled in that the user did not say. Keep these OUT of
-   requirements and constraints. An assumption is never a user instruction.
+VERIFICATION STRATEGIES
+- command_execution: {program, args, cwd?, expectExitCode, stdout?, stderr?}. Program
+  and args are separate; no shell strings.
+- resource_state: {resource, condition: exists|absent|hash_equals, expectedHash?}.
+- event_log_assertion: {action, operator: equals|at_least|at_most|none, count}.
+- semantic_evaluation: {instructions, evidenceSources}.
+- visual_evaluation: {instructions, resources}.
+- user_confirmation: {prompt}.
 
 RULES
-- Be faithful, not thorough. Do not pad the contract with generic best practices.
-- If the user gave a numeric limit ("stop after 10 attempts"), that is a hard
-  constraint with source "user".
-- If the request is trivial and carries no real obligations, return a minimal
-  contract: a goal, and nothing else. Empty arrays are correct and expected.
-- successConditions should be few and decisive. Three good ones beat ten vague ones.
+- Be faithful, not exhaustive. Do not pad with generic best practices.
+- A numeric limit from the user is hard.
+- Empty arrays are correct for trivial requests.
+- A strategy must be executable with available tools or explicitly identify the
+  qualitative evaluator. If no real verification route is known, omit it rather than
+  disguise prose as an executable check.
 
-EXAMPLES OF THE SHAPE (different domains, to show this is not about any one of them)
-
-Request: "Fix the authentication bug. Do not touch the frontend. Run tests. Only push if everything is safe."
-  goal: "Fix the backend authentication defect"
-  constraints: [{description: "The frontend must not be modified", source: "user", priority: "hard", quote: "Do not touch the frontend"}]
-  successConditions: [{description: "The authentication defect no longer reproduces", source: "user", priority: "hard", verificationHint: "The failing behaviour is exercised and now succeeds"},
-                      {description: "The existing test suite passes", source: "user", priority: "hard", verificationHint: "Test runner reports zero failures"}]
-  criticalActions: [{description: "Publish the repository changes to the shared remote", source: "user", rationale: "User gated this on everything being safe", reversible: "no"}]
-
-Request: "Prepare a brand-classification dataset. Do not modify the original dataset. Avoid train/validation leakage."
-  goal: "Produce a training-ready brand-classification dataset"
-  constraints: [{description: "The original source dataset must remain unchanged", source: "user", priority: "hard", quote: "Do not modify the original dataset"}]
-  forbiddenConditions: [{description: "Any sample appears in both the train and validation splits", source: "user", priority: "hard"}]
-  successConditions: [{description: "Train and validation splits exist and are disjoint", source: "user", priority: "hard", verificationHint: "Split membership is compared and the intersection is empty"}]
-  criticalActions: [{description: "Write over or finalize the dataset on disk", source: "compiler", rationale: "Destructive to prior output", reversible: "no"}]
-
-Request: "Create an image about Kubernetes with the exact text 'Ship it safely' on the left."
-  goal: "Produce the requested Kubernetes visual"
-  requirements: [{description: "The image is thematically about Kubernetes", source: "user", priority: "hard", quote: "an image about Kubernetes"},
-                 {description: "The image contains the exact text 'Ship it safely'", source: "user", priority: "hard", quote: "the exact text 'Ship it safely'"},
-                 {description: "That text appears on the left side of the image", source: "user", priority: "hard", quote: "on the left"}]
-  successConditions: [{description: "Text recognised in the image matches 'Ship it safely' exactly", source: "user", priority: "hard", verificationHint: "Text extracted from the generated image is compared character by character"},
-                      {description: "The recognised text is positioned in the left portion of the image", source: "user", priority: "hard", verificationHint: "The text bounding box centre falls in the left half"}]`;
+EXAMPLES
+1. A local source file must remain untouched:
+   constraint.policy = {effect:"forbid", action:{capabilities:["modify_resource"],
+   provenances:["preexisting"], targetUriPrefix:"file:///known/source"}}
+2. Publishing any artifact needs review:
+   criticalAction.action = {capabilities:["publish"], externalSideEffect:true}
+3. A generated poster needs qualitative inspection:
+   successCondition.verification = [{kind:"visual_evaluation",
+   instructions:"Compare the rendered poster with the requested composition",
+   resources:["output/poster.png"]}]
+4. A protected input collection must never be changed:
+   constraint.policy = {effect:"forbid", action:{operations:["modify","delete"],
+   scopes:["protected"]}}
+5. An exact verifier is known from project context:
+   successCondition.verification = [{kind:"command_execution", program:"python3",
+   args:["tools/verify.py","output.bin"], expectExitCode:0}]`;
 
 const EXAMPLE_OUTPUT: CompiledContract = {
-	goal: "Short imperative statement of what must be achieved",
-	domain: "free-text label, descriptive only",
-	requirements: [{ description: "Something that must be achieved", source: "user", priority: "hard", quote: "user's words" }],
-	constraints: [{ description: "A boundary on how it may be done", source: "user", priority: "hard", quote: "user's words" }],
-	successConditions: [
-		{ description: "Something verifiable that must be true", source: "user", priority: "hard", verificationHint: "What would prove it" },
+	goal: "Produce the requested artifact without mutating protected inputs",
+	domain: "artifact generation",
+	workspace: { allowedScopes: [], protectedResources: ["inputs/source"] },
+	requirements: [
+		{
+			description: "The requested artifact exists",
+			source: "user",
+			priority: "hard",
+			quote: "produce the artifact",
+			verification: [{ kind: "resource_state", resource: "output/artifact.bin", condition: "exists" }],
+		},
 	],
+	constraints: [
+		{
+			description: "Protected inputs remain unchanged",
+			source: "user",
+			priority: "hard",
+			quote: "do not modify the inputs",
+			policy: {
+				effect: "forbid",
+				action: { operations: ["modify", "delete"], scopes: ["protected"] },
+			},
+		},
+	],
+	successConditions: [],
 	forbiddenConditions: [],
-	criticalActions: [{ description: "An action to verify before performing", source: "compiler", rationale: "Why", reversible: "no" }],
+	criticalActions: [
+		{
+			description: "Publish an artifact outside the workspace",
+			source: "compiler",
+			rationale: "Externally visible and difficult to reverse",
+			reversible: "no",
+			action: { capabilities: ["publish"], externalSideEffect: true },
+		},
+	],
 	ambiguities: [],
-	assumptions: [{ description: "Something you filled in that the user did not say", confidence: 0.6 }],
+	assumptions: [],
 };
 
 export function createTaskCompiler(adapter: ModelAdapter, options: { logger?: Logger; maxRepairAttempts?: number; timeoutMs?: number } = {}): TaskCompiler {
@@ -217,69 +238,69 @@ function buildUserPrompt(input: CompilerInput): string {
  * (`r1`, `c2`, `s3`) and impossible for a model to collide or reuse across revisions.
  */
 function materialize(compiled: CompiledContract, input: CompilerInput, modelId: string): TaskContract {
-	const projectConstraints = (input.projectConfig?.protectedPaths ?? []).map((path, i) => ({
-		id: `c${compiled.constraints.length + i + 1}`,
-		description: `Project configuration marks this path as protected and it must not be modified: ${path}`,
-		source: "system" as const,
-		priority: "hard" as const,
-		check: { kind: "path_unmodified" as const, target: path },
-	}));
-
+	const allowedScopes = compiled.workspace?.allowedScopes.length ? compiled.workspace.allowedScopes : [input.cwd];
+	const protectedResources = [
+		...new Set([...(compiled.workspace?.protectedResources ?? []), ...(input.projectConfig?.protectedPaths ?? [])]),
+	];
 	return {
 		id: newTaskId(),
 		version: 1,
 		originalRequest: input.request,
 		goal: compiled.goal,
-		requirements: compiled.requirements.map((r, i) => ({
-			id: `r${i + 1}`,
-			description: r.description,
-			source: r.source,
-			priority: r.priority,
+		workspace: { allowedScopes, protectedResources },
+		requirements: compiled.requirements.map((requirement, index) => ({
+			id: `r${index + 1}`,
+			description: requirement.description,
+			source: requirement.source,
+			priority: requirement.priority,
 			status: "pending" as const,
-			...(r.quote ? { quote: r.quote } : {}),
+			...(requirement.quote ? { quote: requirement.quote } : {}),
+			...(requirement.verification ? { verification: requirement.verification } : {}),
 		})),
-		constraints: [
-			...compiled.constraints.map((c, i) => ({
-				id: `c${i + 1}`,
-				description: c.description,
-				source: c.source,
-				priority: c.priority,
-				...(c.quote ? { quote: c.quote } : {}),
-			})),
-			...projectConstraints,
-		],
-		successConditions: compiled.successConditions.map((s, i) => ({
-			id: `s${i + 1}`,
-			description: s.description,
-			source: s.source,
-			priority: s.priority,
+		constraints: compiled.constraints.map((constraint, index) => ({
+			id: `c${index + 1}`,
+			description: constraint.description,
+			source: constraint.source,
+			priority: constraint.priority,
+			...(constraint.quote ? { quote: constraint.quote } : {}),
+			...(constraint.policy ? { policy: constraint.policy } : {}),
+			...(constraint.verification ? { verification: constraint.verification } : {}),
+		})),
+		successConditions: compiled.successConditions.map((condition, index) => ({
+			id: `s${index + 1}`,
+			description: condition.description,
+			source: condition.source,
+			priority: condition.priority,
 			status: "pending" as const,
-			...(s.verificationHint ? { verificationHint: s.verificationHint } : {}),
+			...(condition.verification ? { verification: condition.verification } : {}),
 		})),
-		forbiddenConditions: compiled.forbiddenConditions.map((f, i) => ({
-			id: `f${i + 1}`,
-			description: f.description,
-			source: f.source,
-			priority: f.priority,
+		forbiddenConditions: compiled.forbiddenConditions.map((condition, index) => ({
+			id: `f${index + 1}`,
+			description: condition.description,
+			source: condition.source,
+			priority: condition.priority,
+			...(condition.policy ? { policy: condition.policy } : {}),
+			...(condition.verification ? { verification: condition.verification } : {}),
 		})),
-		criticalActions: compiled.criticalActions.map((a, i) => ({
-			id: `a${i + 1}`,
-			description: a.description,
-			source: a.source,
-			reversible: a.reversible ?? "unknown",
+		criticalActions: compiled.criticalActions.map((critical, index) => ({
+			id: `a${index + 1}`,
+			description: critical.description,
+			source: critical.source,
+			reversible: critical.reversible ?? "unknown",
 			requiresVerificationOf: [],
-			...(a.rationale ? { rationale: a.rationale } : {}),
+			...(critical.rationale ? { rationale: critical.rationale } : {}),
+			...(critical.action ? { action: critical.action } : {}),
 		})),
-		ambiguities: compiled.ambiguities.map((a, i) => ({
-			id: `q${i + 1}`,
-			description: a.description,
-			blocking: a.blocking ?? false,
-			...(a.defaultInterpretation ? { defaultInterpretation: a.defaultInterpretation } : {}),
+		ambiguities: compiled.ambiguities.map((ambiguity, index) => ({
+			id: `q${index + 1}`,
+			description: ambiguity.description,
+			blocking: ambiguity.blocking ?? false,
+			...(ambiguity.defaultInterpretation ? { defaultInterpretation: ambiguity.defaultInterpretation } : {}),
 		})),
-		assumptions: compiled.assumptions.map((a, i) => ({
-			id: `m${i + 1}`,
-			description: a.description,
-			confidence: a.confidence ?? 0.5,
+		assumptions: compiled.assumptions.map((assumption, index) => ({
+			id: `m${index + 1}`,
+			description: assumption.description,
+			confidence: assumption.confidence ?? 0.5,
 		})),
 		metadata: {
 			createdAt: nowIso(),

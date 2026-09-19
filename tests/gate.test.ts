@@ -60,7 +60,7 @@ const gitPushContract = contract({
 			description: "The test suite passes",
 			source: "user",
 			priority: "hard",
-			verificationHint: "run `truetest`",
+			verification: [{ kind: "command_execution", program: "truetest", args: [], expectExitCode: 0 }],
 			status: "pending",
 		},
 	],
@@ -259,7 +259,7 @@ describe("The completion gate (§44)", () => {
 });
 
 describe("Evidence collection feeds the Judge", () => {
-	test("a derived command runs and its exit code becomes evidence", async () => {
+	test("an explicit typed command runs and its exit code becomes evidence", async () => {
 		const executed: string[] = [];
 		const exec: ExecFn = async (command, args) => {
 			executed.push([command, ...args].join(" "));
@@ -277,17 +277,17 @@ describe("Evidence collection feeds the Judge", () => {
 				cwd: process.cwd(),
 			});
 
-			assert.deepEqual(executed, ["truetest"], "the command must come from the contract's own hint");
+			assert.deepEqual(executed, ["truetest"], "the command must come from the typed contract strategy");
 
 			const evidence = state.getState().evidence;
 			assert.equal(evidence.length, 1);
 			assert.equal(evidence[0]?.trust, "runtime_evidence");
-			assert.ok(evidence[0]?.summary.includes("exit 0"));
+			assert.ok(evidence[0]?.summary.includes("exited 0"));
 
 			// The Judge sees it, keyed by the requirement it bears on.
 			const payload = judge.calls[0]!.state;
 			assert.equal(payload.evidence.length, 1);
-			assert.ok(payload.evidence[0]?.result.includes("exit 0"));
+			assert.match(payload.evidence[0]?.result ?? "", /exited 0/);
 		} finally {
 			cleanup();
 		}
@@ -307,7 +307,14 @@ describe("Evidence collection feeds the Judge", () => {
 					description: "cleanup happened",
 					source: "user",
 					priority: "hard",
-					verificationHint: "run `rm -rf / ; echo done`",
+					verification: [
+						{
+							kind: "command_execution",
+							program: "rm -rf / ; echo done",
+							args: [],
+							expectExitCode: 0,
+						},
+					],
 					status: "pending",
 				},
 			],

@@ -1261,12 +1261,7 @@ describe("Signals and planning against a weaker compiler model", () => {
 		}
 	});
 
-	test("a command in a requirement description is found, not reported unverifiable", () => {
-		/**
-		 * A well-formed contract puts the command in verificationHint. Weaker models put
-		 * it in the description instead — and then every requirement reported as
-		 * unverifiable while the command sat in plain sight.
-		 */
+	test("prose that looks like a command remains non-executable", () => {
 		const weak = contract({
 			requirements: [
 				{
@@ -1280,7 +1275,6 @@ describe("Signals and planning against a weaker compiler model", () => {
 		});
 		const state = createStateManager(weak.id, weak, { persist: false });
 		state.lockContract(weak);
-
 		const plan = createEvidencePlanner().plan({
 			contract: weak,
 			state: state.getState(),
@@ -1296,13 +1290,11 @@ describe("Signals and planning against a weaker compiler model", () => {
 			checkpointId: "ckpt-1",
 			action: action("bash", { command: "true" }),
 		});
-
-		const commands = plan.evidenceRequests.filter((r) => r.kind === "command").map((r) => r.parameters.command);
-		assert.deepEqual(commands, ["wc -l data.csv"]);
-		assert.equal(plan.unverifiable.length, 0, "nothing should be unverifiable when the command is right there");
+		assert.equal(plan.evidenceRequests.length, 0);
+		assert.equal(plan.unverifiable[0]?.requirementId, "r1");
 	});
 
-	test("the hint still wins over the description when both carry a command", () => {
+	test("a typed strategy is authoritative even when prose mentions another command", () => {
 		const both = contract({
 			successConditions: [
 				{
@@ -1310,14 +1302,13 @@ describe("Signals and planning against a weaker compiler model", () => {
 					description: "Checked by running `wrong-command`",
 					source: "user",
 					priority: "hard",
-					verificationHint: "run `right-command`",
+					verification: [{ kind: "command_execution", program: "right-command", args: [], expectExitCode: 0 }],
 					status: "pending",
 				},
 			],
 		});
 		const state = createStateManager(both.id, both, { persist: false });
 		state.lockContract(both);
-
 		const plan = createEvidencePlanner().plan({
 			contract: both,
 			state: state.getState(),
@@ -1333,10 +1324,8 @@ describe("Signals and planning against a weaker compiler model", () => {
 			checkpointId: "ckpt-1",
 			action: action("bash", { command: "true" }),
 		});
-
-		assert.deepEqual(
-			plan.evidenceRequests.map((r) => r.parameters.command),
-			["right-command"],
-		);
+		assert.equal(plan.evidenceRequests[0]?.strategy.kind, "command_execution");
+		const strategy = plan.evidenceRequests[0]?.strategy;
+		assert.equal(strategy?.kind === "command_execution" ? strategy.program : undefined, "right-command");
 	});
 });

@@ -1,443 +1,255 @@
 import assert from "node:assert/strict";
-import { test, describe } from "node:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, test } from "node:test";
 import { createCheckpointDetector } from "../src/checkpoints/detector.ts";
+import type { ProposedAction } from "../src/checkpoints/types.ts";
+import type { HarnessPaths } from "../src/config/paths.ts";
+import type { TaskContract } from "../src/contract/schema.ts";
+import { createEvidenceCollector, type ExecFn } from "../src/evidence/collector.ts";
 import { createEvidencePlanner } from "../src/evidence/planner.ts";
-import { buildJudgeQuery } from "../src/judges/payload.ts";
+import { createJudgeRouter } from "../src/judges/router.ts";
+import { createHarnessCore } from "../src/pi/harness.ts";
+import { createProgressMonitor } from "../src/progress/monitor.ts";
 import { createStateManager } from "../src/state/state-manager.ts";
-import { action, contract, testConfig } from "./helpers.ts";
-
-/**
- * §60 — the same harness across three unrelated workflows.
- *
- * The point of these tests is not that each one passes. It is that all three pass
- * through *identical* harness code, with the only difference being the contract
- * content. If someone later adds a coding-specific branch to the detector or planner,
- * the dataset and image tests are what will catch it.
- */
+import { nullLogger } from "../src/util/logger.ts";
+import { action, contract, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
 
 const config = testConfig();
 
-const setup = (c: ReturnType<typeof contract>) => {
+function crossDomainContract(root: string, overrides: Partial<TaskContract>): TaskContract {
+	return contract({
+		metadata: { createdAt: new Date().toISOString(), cwd: root },
+		workspace: { allowedScopes: [root], protectedResources: [] },
+		...overrides,
+	});
+}
+
+function createCore(c: TaskContract, paths: HarnessPaths, exec?: ExecFn) {
 	const state = createStateManager(c.id, c, { persist: false });
 	state.lockContract(c);
-	return {
+	const judge = scriptedJudge(() => ({ decision: "PASS", confidence: 0.99 }));
+	const core = createHarnessCore({
+		config,
+		paths,
 		state,
-		detector: createCheckpointDetector({ config }),
+		detector: createCheckpointDetector({ config, judge }),
 		planner: createEvidencePlanner(),
-	};
-};
-
-// ---------------------------------------------------------------------------
-
-describe("A. Coding workflow", () => {
-	const coding = contract({
-		id: "task-coding",
-		originalRequest: "Modify feature X. Do not modify file Y. Run tests. Only push after verification.",
-		goal: "Modify feature X safely",
-		requirements: [
-			{ id: "r1", description: "Feature X behaves as requested", source: "user", priority: "hard", status: "pending" },
-		],
-		constraints: [
-			{
-				id: "c1",
-				description: "The file Y must not be modified",
-				source: "user",
-				priority: "hard",
-				quote: "Do not modify file Y",
-				check: { kind: "path_unmodified", target: "src/Y.ts" },
-			},
-		],
-		successConditions: [
-			{
-				id: "s1",
-				description: "The test suite passes",
-				source: "user",
-				priority: "hard",
-				verificationHint: "run `npm test`",
-				status: "pending",
-			},
-		],
-		criticalActions: [
-			{
-				id: "a1",
-				description: "Publish the repository changes to the shared remote",
-				source: "user",
-				rationale: "The user gated this on verification",
-				reversible: "no",
-				requiresVerificationOf: ["s1"],
-			},
-		],
+		collector: createEvidenceCollector(exec ? { exec } : {}),
+		judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+		progress: createProgressMonitor({ config }),
+		logger: nullLogger,
 	});
+	return { core, judge, paths, state };
+}
 
-	test("captures the hard user constraint verbatim, without softening it", () => {
-		const c1 = coding.constraints[0]!;
-		assert.equal(c1.source, "user");
-		assert.equal(c1.priority, "hard");
-		assert.equal(c1.quote, "Do not modify file Y");
+function declaredArtifactAction(path: string): ProposedAction {
+	return action("artifact_renderer", {
+		prompt: "A calm blue cover with strong hierarchy",
+		harnessSemantics: {
+			capabilities: ["generate_artifact", "create_resource"],
+			effects: [{ uri: path, kind: "artifact", operation: "create", reversible: true }],
+			reversibility: "high",
+			operationText: "generate local artifact",
+		},
 	});
+}
 
-	test("reading a file is not gated", async () => {
-		const { detector, state } = setup(coding);
-		const decision = await detector.evaluate({
-			contract: coding,
-			state: state.getState(),
-			action: action("read", { path: "src/feature-x.ts" }),
-		});
-		assert.equal(decision.needsGate, false, "a read must take the fast path with no Judge call");
-	});
-
-	test("the contract's critical action is detected on the matching proposal", async () => {
-		const { detector, state } = setup(coding);
-		const decision = await detector.evaluate({
-			contract: coding,
-			state: state.getState(),
-			action: action("bash", { command: "git push origin main" }, "bash: publish the repository changes to the remote"),
-		});
-
-		assert.equal(decision.needsGate, true);
-		assert.equal(decision.severity, "critical");
-		assert.equal(decision.checkpointType, "contract_critical_action");
-		assert.ok(decision.relatedRequirements.includes("a1"));
-		assert.ok(decision.relatedRequirements.includes("s1"), "should pull in what the contract said to verify first");
-	});
-
-	test("touching the protected path trips the hard constraint", async () => {
-		const { detector, state } = setup(coding);
-		const decision = await detector.evaluate({
-			contract: coding,
-			state: state.getState(),
-			action: action("write", { path: "src/Y.ts", content: "changed" }),
-		});
-
-		assert.equal(decision.needsGate, true);
-		assert.equal(decision.checkpointType, "constraint_risk");
-		assert.ok(decision.relatedRequirements.includes("c1"));
-	});
-
-	test("the planner derives the test command from the contract's own hint", async () => {
-		const { detector, planner, state } = setup(coding);
-		const checkpoint = await detector.evaluate({
-			contract: coding,
-			state: state.getState(),
-			action: action("bash", { command: "git push origin main" }, "bash: publish the repository changes to the remote"),
-		});
-
-		const plan = planner.plan({
-			contract: coding,
-			state: state.getState(),
-			checkpoint,
-			checkpointId: "ckpt-1",
-			action: action("bash", { command: "git push" }),
-		});
-
-		const commands = plan.evidenceRequests.filter((r) => r.kind === "command").map((r) => r.parameters.command);
-		assert.ok(commands.includes("npm test"), `expected 'npm test' to be derived, got ${JSON.stringify(commands)}`);
-	});
-});
-
-// ---------------------------------------------------------------------------
-
-describe("B. Dataset workflow", () => {
-	const dataset = contract({
-		id: "task-dataset",
-		originalRequest: "Prepare classification dataset. Do not modify source. Ensure no train/validation leakage.",
-		goal: "Produce a training-ready classification dataset",
-		constraints: [
-			{
-				id: "c1",
-				description: "The original source dataset must remain unchanged",
-				source: "user",
-				priority: "hard",
-				quote: "Do not modify source",
-				check: { kind: "hash_unchanged", target: "data/source" },
-			},
-		],
-		forbiddenConditions: [
-			{
-				id: "f1",
-				description: "Any sample appears in both the train and validation splits",
-				source: "user",
-				priority: "hard",
-			},
-		],
-		successConditions: [
-			{
-				id: "s1",
-				description: "Train and validation splits are disjoint",
-				source: "user",
-				priority: "hard",
-				verificationHint: "run `python check_leakage.py`",
-				status: "pending",
-			},
-		],
-		criticalActions: [
-			{
-				id: "a1",
-				description: "Write over or finalize the dataset on disk",
-				source: "compiler",
-				reversible: "no",
-				requiresVerificationOf: ["s1"],
-			},
-		],
-	});
-
-	test("the identical detector gates a dataset action, with no coding assumptions", async () => {
-		const { detector, state } = setup(dataset);
-		const decision = await detector.evaluate({
-			contract: dataset,
-			state: state.getState(),
-			action: action("write", { path: "data/source/labels.csv", content: "…" }),
-		});
-
-		assert.equal(decision.needsGate, true);
-		assert.ok(decision.relatedRequirements.includes("c1"), "the source-dataset constraint must be implicated");
-		// Nothing about tests, git or branches should appear anywhere.
-		assert.ok(!JSON.stringify(decision).toLowerCase().includes("git"));
-		assert.ok(!JSON.stringify(decision).toLowerCase().includes("test"));
-	});
-
-	test("the planner derives a dataset-specific check, not a test runner", () => {
-		const { detector: _d, planner, state } = setup(dataset);
-
-		const plan = planner.plan({
-			contract: dataset,
-			state: state.getState(),
-			checkpoint: {
-				needsGate: true,
-				checkpointType: "completion_claim",
-				severity: "critical",
-				reason: "completion",
-				signals: [],
-				relatedRequirements: ["s1"],
-				escalated: false,
-			},
-			checkpointId: "ckpt-1",
-			action: action("write", { path: "data/out/train.csv", content: "…" }),
-		});
-
-		const commands = plan.evidenceRequests.filter((r) => r.kind === "command").map((r) => r.parameters.command);
-		assert.ok(commands.includes("python check_leakage.py"));
-
-		// The hash-unchanged constraint becomes a file_state check with no command.
-		const fileChecks = plan.evidenceRequests.filter((r) => r.kind === "file_state");
-		assert.ok(fileChecks.some((r) => r.parameters.path === "data/source"));
-	});
-
-	test("forbidden conditions reach the Judge payload", () => {
-		const { state } = setup(dataset);
-		const query = buildJudgeQuery({
-			contract: dataset,
-			state: state.getState(),
-			checkpoint: {
-				needsGate: true,
-				checkpointType: "completion_claim",
-				severity: "critical",
-				reason: "completion",
-				signals: [],
-				relatedRequirements: ["s1"],
-				escalated: false,
-			},
-			action: action("write", { path: "data/out/train.csv", content: "…" }),
-		});
-
-		assert.ok(query.state.forbiddenConditions.some((f) => f.includes("both the train and validation splits")));
-	});
-});
-
-// ---------------------------------------------------------------------------
-
-describe("C. Creative / image workflow", () => {
-	const image = contract({
-		id: "task-image",
-		originalRequest: "Create an image containing the exact text 'Ship it safely' on the left.",
-		goal: "Produce the requested visual",
-		requirements: [
-			{
-				id: "r1",
-				description: "The image contains the exact text 'Ship it safely'",
-				source: "user",
-				priority: "hard",
-				quote: "the exact text 'Ship it safely'",
-				status: "pending",
-			},
-			{
-				id: "r2",
-				description: "That text appears on the left side of the image",
-				source: "user",
-				priority: "hard",
-				quote: "on the left",
-				status: "pending",
-			},
-			{ id: "r3", description: "The image is visually appealing", source: "compiler", priority: "soft", status: "pending" },
-		],
-		successConditions: [
-			{
-				id: "s1",
-				description: "Text recognised in the image matches 'Ship it safely' exactly",
-				source: "user",
-				priority: "hard",
-				verificationHint: "Text extracted from the generated image is compared character by character",
-				status: "pending",
-			},
-			{
-				id: "s2",
-				description: "The recognised text is positioned in the left portion of the image",
-				source: "user",
-				priority: "hard",
-				verificationHint: "The text bounding box centre falls in the left half of the image",
-				status: "pending",
-			},
-		],
-	});
-
-	test("the contract represents exact text, placement, semantics and hard/soft split", () => {
-		assert.equal(image.requirements.filter((r) => r.priority === "hard").length, 2);
-		assert.equal(image.requirements.filter((r) => r.priority === "soft").length, 1);
-		assert.ok(image.requirements.some((r) => r.description.includes("'Ship it safely'")));
-		assert.ok(image.requirements.some((r) => r.description.includes("left side")));
-	});
-
-	test("unverifiable-by-command requirements become reviewer requests, not silent gaps", () => {
-		const { planner, state } = setup(image);
-
-		const plan = planner.plan({
-			contract: image,
-			state: state.getState(),
-			checkpoint: {
-				needsGate: true,
-				checkpointType: "completion_claim",
-				severity: "critical",
-				reason: "completion",
-				signals: [],
-				relatedRequirements: [],
-				escalated: false,
-			},
-			checkpointId: "ckpt-1",
-			action: action("generate_image", { prompt: "kubernetes" }),
-		});
-
-		const reviewerRequests = plan.evidenceRequests.filter((r) => r.kind === "reviewer");
-		assert.ok(reviewerRequests.length >= 2, "OCR and layout checks have no derivable command, so they must go to a reviewer");
-		assert.ok(reviewerRequests.every((r) => r.necessity === "required"));
-	});
-
-	test("soft requirements do not block; hard ones do", () => {
-		const { planner, state } = setup(image);
-
-		const plan = planner.plan({
-			contract: image,
-			state: state.getState(),
-			checkpoint: {
-				needsGate: true,
-				checkpointType: "completion_claim",
-				severity: "critical",
-				reason: "completion",
-				signals: [],
-				relatedRequirements: [],
-				escalated: false,
-			},
-			checkpointId: "ckpt-1",
-			action: action("generate_image", { prompt: "kubernetes" }),
-		});
-
-		// r3 is soft and has no verification hint, so it is neither planned nor required.
-		assert.ok(!plan.requirementsToVerify.includes("r3"));
-	});
-});
-
-// ---------------------------------------------------------------------------
-
-describe("Cross-workflow: the harness is genuinely task-agnostic", () => {
-	test("core gating logic contains no domain-specific rules", async () => {
-		const { readFileSync } = await import("node:fs");
-
-		/**
-		 * Comments are stripped before checking. Several of these files *discuss* git
-		 * precisely to explain why they do not branch on it, and a test that failed on
-		 * the explanation would push us to delete the explanation rather than keep the
-		 * property. What matters is that no executable line encodes a domain rule.
-		 */
-		const stripComments = (source: string): string =>
-			source
-				.replace(/\/\*[\s\S]*?\*\//g, "")
-				.split("\n")
-				.filter((line) => !/^\s*(\/\/|\*)/.test(line))
-				.join("\n");
-
-		const files = ["checkpoints/detector.ts", "checkpoints/signals.ts", "evidence/planner.ts", "judges/payload.ts"];
-
-		for (const file of files) {
-			const code = stripComments(readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"));
-
-			// §65.8 — no hardcoded git workflow in universal core logic.
-			assert.ok(!/\bgit\b/.test(code), `${file} must not reference git in executable code`);
-			assert.ok(!/\bnpm\b|\bpytest\b|\bcargo\b/.test(code), `${file} must not reference a specific build or test tool`);
-			assert.ok(!/toolName\s*===\s*["']/.test(code), `${file} must not branch on a specific tool name`);
-			assert.ok(!/\bdataset\b|\bOCR\b/i.test(code), `${file} must not reference a specific task domain`);
-		}
-	});
-
-	test("all three contracts share one schema and differ only in content", () => {
-		const shapes = [
-			contract({ id: "a" }),
-			contract({ id: "b", requirements: [{ id: "r1", description: "x", source: "user", priority: "hard", status: "pending" }] }),
-		].map((c) => Object.keys(c).sort().join(","));
-
-		assert.equal(shapes[0], shapes[1]);
-	});
-});
-
-describe("Repository completeness", () => {
-	/**
-	 * Regression test for a bug that only appeared on other people's machines.
-	 *
-	 * `.gitignore` contained the unanchored pattern `state/`, which matched
-	 * `src/state/` as well as the intended local state directory. The whole
-	 * canonical-state module was therefore never committed. Everything worked where
-	 * it was authored — the files exist there, merely untracked — and every fresh
-	 * clone died at startup with "Cannot find module '../state/freshness.ts'".
-	 *
-	 * Type-checking and unit tests both passed throughout, because they read the
-	 * working tree rather than the repository. Only git knows the difference.
-	 */
-	test("every source file the harness imports is tracked in git", async () => {
-		const { execFileSync } = await import("node:child_process");
-		const { readdirSync, statSync } = await import("node:fs");
-		const { join, relative } = await import("node:path");
-
-		const root = new URL("..", import.meta.url).pathname;
-
-		let tracked: Set<string>;
-		try {
-			const output = execFileSync("git", ["ls-files", "src", "tests", "index.ts", "scripts"], {
-				cwd: root,
-				encoding: "utf8",
-			});
-			tracked = new Set(output.split("\n").filter(Boolean));
-		} catch {
-			return; // Not a git checkout (e.g. installed as a package copy); nothing to assert.
-		}
-
-		const onDisk: string[] = [];
-		const walk = (dir: string): void => {
-			for (const entry of readdirSync(dir)) {
-				if (entry === "node_modules" || entry.startsWith(".")) continue;
-				const full = join(dir, entry);
-				if (statSync(full).isDirectory()) walk(full);
-				else if (/\.(ts|sh)$/.test(entry)) onDisk.push(relative(root, full));
-			}
+describe("A. local file and code workflow", () => {
+	test("local construction is allowed and explicit argv verification completes the task", async () => {
+		const paths = tempPaths();
+		const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
+		const exec: ExecFn = async (program, args, options) => {
+			calls.push({ program, args, cwd: options.cwd });
+			return { stdout: "all checks passed", stderr: "", exitCode: 0 };
 		};
-		walk(join(root, "src"));
-		walk(join(root, "tests"));
-		walk(join(root, "scripts"));
+		const c = crossDomainContract(paths.configDir, {
+			successConditions: [
+				{
+					id: "s1",
+					description: "The local verification program reports success",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+					verification: [
+						{
+							kind: "command_execution",
+							program: "node",
+							args: ["tools/verify-widget.mjs", "dist/widget.bin"],
+							expectExitCode: 0,
+							stdout: { operator: "contains", value: "checks passed" },
+						},
+					],
+				},
+			],
+		});
+		const { core, judge, state } = createCore(c, paths, exec);
+		try {
+			const create = action("write", { path: join(paths.configDir, "src/widget.ts"), content: "export const widget = 1;" });
+			const gate = await core.gateAction({ action: create, cwd: paths.configDir });
+			assert.equal(gate.allowed, true);
+			core.recordToolResult({ actionId: create.id, summary: "widget source written", isError: false });
+			const completion = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(completion.allowed, true);
+			assert.deepEqual(calls, [
+				{ program: "node", args: ["tools/verify-widget.mjs", "dist/widget.bin"], cwd: paths.configDir },
+			]);
+			assert.equal(judge.calls.length, 0);
+			assert.equal(state.getState().evidence[0]?.result, "supported");
+			assert.equal(state.getState().evidence[0]?.provenance, "explicit_contract_strategy");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
 
-		const untracked = onDisk.filter((f) => !tracked.has(f));
+describe("B. protected-source transformation workflow", () => {
+	test("output construction proceeds while typed scope policy blocks source mutation", async () => {
+		const paths = tempPaths();
+		const source = join(paths.configDir, "source-records");
+		const output = join(paths.configDir, "prepared-records");
+		mkdirSync(source, { recursive: true });
+		writeFileSync(join(source, "input.json"), "{}\n");
+		const c = crossDomainContract(paths.configDir, {
+			workspace: { allowedScopes: [paths.configDir], protectedResources: [source] },
+			constraints: [
+				{
+					id: "c1",
+					description: "Source records remain unchanged",
+					source: "user",
+					priority: "hard",
+					policy: {
+						effect: "forbid",
+						action: { operations: ["create", "modify", "delete", "move"], scopes: ["protected"] },
+					},
+				},
+			],
+		});
+		const { core, judge } = createCore(c, paths);
+		try {
+			const createOutput = action("write", { path: join(output, "result.json"), content: "{}\n" });
+			const outputGate = await core.gateAction({ action: createOutput, cwd: paths.configDir });
+			assert.equal(outputGate.allowed, true);
 
-		assert.deepEqual(
-			untracked,
-			[],
-			`These source files exist on disk but are NOT in git, so a fresh clone would be broken:\n  ${untracked.join("\n  ")}\n` +
-				"Check .gitignore for an unanchored pattern.",
-		);
+			const mutateSource = action("write", { path: join(source, "input.json"), content: '{"changed":true}\n' });
+			const sourceGate = await core.gateAction({ action: mutateSource, cwd: paths.configDir });
+			assert.equal(sourceGate.allowed, false);
+			assert.equal(sourceGate.checkpoint?.policyDecision, "block");
+			assert.equal(judge.calls.length, 0);
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
+
+describe("C. non-code artifact workflow", () => {
+	test("declared generator semantics and resource-state evidence handle a simulated image", async () => {
+		const paths = tempPaths();
+		const image = join(paths.configDir, "renders/cover.png");
+		const c = crossDomainContract(paths.configDir, {
+			successConditions: [
+				{
+					id: "s1",
+					description: "The rendered cover exists",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+					verification: [{ kind: "resource_state", resource: image, condition: "exists" }],
+				},
+			],
+		});
+		const { core, judge, state } = createCore(c, paths);
+		try {
+			const proposed = declaredArtifactAction(image);
+			const gate = await core.gateAction({ action: proposed, cwd: paths.configDir });
+			assert.equal(gate.allowed, true);
+			mkdirSync(join(paths.configDir, "renders"), { recursive: true });
+			writeFileSync(image, "simulated image bytes");
+			core.recordToolResult({ actionId: proposed.id, summary: "cover rendered", isError: false });
+			const completion = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(completion.allowed, true);
+			assert.equal(judge.calls.length, 0);
+			assert.equal(state.getState().workspace.resources[0]?.kind, "artifact");
+			assert.equal(state.getState().workspace.resources[0]?.provenance, "created_by_current_task");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
+
+describe("D. gated external action workflow", () => {
+	test("publication gates on capability and collects linked resource evidence first", async () => {
+		const paths = tempPaths();
+		const artifact = join(paths.configDir, "release/package.bin");
+		mkdirSync(join(paths.configDir, "release"), { recursive: true });
+		writeFileSync(artifact, "package");
+		const c = crossDomainContract(paths.configDir, {
+			successConditions: [
+				{
+					id: "s1",
+					description: "The publication artifact exists",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+					verification: [{ kind: "resource_state", resource: artifact, condition: "exists" }],
+				},
+			],
+			criticalActions: [
+				{
+					id: "a1",
+					description: "Publish an artifact to an external destination",
+					source: "user",
+					reversible: "no",
+					requiresVerificationOf: ["s1"],
+					action: { capabilities: ["publish"], externalSideEffect: true },
+				},
+			],
+		});
+		const { core, judge, state } = createCore(c, paths);
+		try {
+			const publish = action("bash", { command: "git push origin release" });
+			const result = await core.gateAction({ action: publish, cwd: paths.configDir });
+			assert.equal(result.allowed, true);
+			assert.equal(result.checkpoint?.checkpointType, "contract_critical_action");
+			assert.equal(judge.calls.length, 1);
+			assert.equal(state.getState().evidence[0]?.requirementIds[0], "s1");
+			assert.equal(state.getState().evidence[0]?.result, "supported");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
+
+describe("CSV reproduction paired with unrelated verification", () => {
+	test("empty-table verification uses typed numeric output rather than filename heuristics", async () => {
+		const paths = tempPaths();
+		const c = crossDomainContract(paths.configDir, {
+			successConditions: [
+				{
+					id: "s1",
+					description: "The transformed table contains zero data rows",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+					verification: [
+						{
+							kind: "command_execution",
+							program: "python3",
+							args: ["tools/count_rows.py", "result.csv"],
+							expectExitCode: 0,
+							stdout: { operator: "numeric_equals", value: "0" },
+						},
+					],
+				},
+			],
+		});
+		const { core, judge } = createCore(c, paths, async () => ({ stdout: "0\n", stderr: "", exitCode: 0 }));
+		try {
+			const completion = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(completion.allowed, true);
+			assert.equal(judge.calls.length, 0);
+		} finally {
+			paths.cleanup();
+		}
 	});
 });

@@ -197,7 +197,8 @@ function buildState(
 		normalizedAction: {
 			actionType: action.actionSemantics.actionType,
 			...(action.actionSemantics.target ? { target: action.actionSemantics.target } : {}),
-			targetOwnership: action.actionSemantics.targetOwnership,
+			targetProvenance: action.actionSemantics.targetProvenance,
+			targetScope: action.actionSemantics.targetScope,
 			mutationType: action.actionSemantics.mutationType,
 			reversibility: action.actionSemantics.reversibility,
 			externalSideEffect: action.actionSemantics.externalSideEffect,

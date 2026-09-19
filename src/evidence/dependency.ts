@@ -1,6 +1,7 @@
-import { basename } from "node:path";
+import { matchesActionSelector } from "../checkpoints/signals.ts";
 import type { ProposedAction } from "../checkpoints/types.ts";
-import { describeContractItem, type TaskContract } from "../contract/schema.ts";
+import type { TaskContract, VerificationStrategy } from "../contract/schema.ts";
+import { resourceUri } from "../resources/registry.ts";
 import type { EvidencePlan } from "./types.ts";
 
 export interface GateDependencyAnalysis {
@@ -9,10 +10,7 @@ export interface GateDependencyAnalysis {
 	readonly reason: string;
 }
 
-/**
- * Prevent an evidence cycle: construction needed to create evidence cannot itself
- * require the evidence, provided the action is reversible, local and task-owned.
- */
+/** Prevent a typed evidence cycle for reversible, allowed-scope construction. */
 export function analyzeGateDependency(
 	plan: EvidencePlan,
 	action: ProposedAction,
@@ -22,35 +20,43 @@ export function analyzeGateDependency(
 	if (
 		semantics.reversibility !== "high" ||
 		semantics.externalSideEffect ||
-		semantics.targetOwnership === "outside_scope"
+		semantics.effects.some((effect) => effect.scope === "protected" || effect.scope === "outside_allowed")
 	) {
 		return {
 			dependsOnBlockedAction: false,
 			requirementIds: [],
-			reason: "The action is not reversible task-local construction, so dependency bypass is unavailable.",
+			reason: "The action is not reversible allowed-scope construction, so dependency bypass is unavailable.",
 		};
 	}
-
-	const dependent: string[] = [];
-	const target = semantics.target ? basename(semantics.target).toLowerCase() : "";
-	for (const requirementId of plan.requirementsToVerify) {
-		const description = describeContractItem(contract, requirementId).toLowerCase();
-		const testCreation = semantics.capabilities.includes("write_file") && /(^|[/_.-])tests?([/_.-]|$)/i.test(target) && /\btests?\b/.test(description);
-		const documentationCreation = semantics.capabilities.includes("write_file") && /^readme(?:\.|$)/i.test(target) && /\b(readme|documentation|usage)\b/.test(description);
-		const executionEvidence = semantics.capabilities.includes("run_tests") && /\b(test|pass|verify)\w*/.test(description);
-		const namedArtifact = target.length > 0 && description.includes(target);
-		if (testCreation || documentationCreation || executionEvidence || namedArtifact) dependent.push(requirementId);
+	const cwd = contract.metadata.cwd ?? process.cwd();
+	const dependent = new Set<string>();
+	for (const request of plan.evidenceRequests) {
+		if (strategyDependsOnAction(request.strategy, action, cwd)) {
+			for (const id of request.requirementIds) dependent.add(id);
+		}
 	}
-
-	return dependent.length > 0
+	return dependent.size > 0
 		? {
 				dependsOnBlockedAction: true,
-				requirementIds: dependent,
-				reason: `The proposed action is needed to produce evidence for ${dependent.join(", ")}; BUILD policy permits it.`,
+				requirementIds: [...dependent],
+				reason: `The proposed action creates resources or events required by typed verification for ${[...dependent].join(", ")}.`,
 			}
 		: {
 				dependsOnBlockedAction: false,
 				requirementIds: [],
-				reason: "No planned evidence is causally dependent on this action.",
+				reason: "No typed verification strategy depends on this action.",
 			};
+}
+
+function strategyDependsOnAction(strategy: VerificationStrategy, action: ProposedAction, cwd: string): boolean {
+	if (strategy.kind === "event_log_assertion") return matchesActionSelector(strategy.action, action);
+	let resources: readonly string[] = [];
+	if (strategy.kind === "resource_state") resources = [strategy.resource];
+	if (strategy.kind === "visual_evaluation") resources = strategy.resources;
+	if (strategy.kind === "semantic_evaluation") resources = strategy.evidenceSources;
+	if (resources.length === 0) return false;
+	const expectedUris = new Set(resources.map((resource) => resourceUri(resource, cwd)));
+	return action.actionSemantics.effects.some(
+		(effect) => expectedUris.has(effect.uri) && effect.operation !== "read" && effect.operation !== "query",
+	);
 }

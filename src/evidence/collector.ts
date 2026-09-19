@@ -1,26 +1,16 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import type { VerificationStrategy } from "../contract/schema.ts";
+import { matchesActionSelector } from "../checkpoints/signals.ts";
 import type { ModelAdapter } from "../models/model-adapter.ts";
 import { redact } from "../security/redact.ts";
+import { resourceUri } from "../resources/registry.ts";
+import type { HarnessState } from "../state/types.ts";
 import { clamp } from "../util/json.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
 import type { CollectedEvidence, CollectionResult, EvidencePlan, EvidenceRequest } from "./types.ts";
-
-/**
- * The Evidence Collector (§28).
- *
- * Executes an `EvidencePlan` and returns observations with full provenance. Everything
- * it produces is Level 1 trust — runtime evidence — except reviewer output, which is
- * Level 3 and labelled as such, because a model's opinion does not become a fact by
- * being collected.
- *
- * Safety: commands come from the Evidence Planner, which only emits things it could
- * derive from the contract or from project config. The collector adds a second
- * barrier anyway — no shell metacharacters, a hard timeout, and output truncation —
- * because "the planner validated it" is exactly the assumption that ages badly.
- */
 
 export interface ExecResult {
 	stdout: string;
@@ -28,24 +18,32 @@ export interface ExecResult {
 	exitCode: number | null;
 }
 
-/** Injected by the Pi adapter, which owns `pi.exec`. Replaceable in tests. */
 export type ExecFn = (command: string, args: string[], options: { signal?: AbortSignal; cwd?: string }) => Promise<ExecResult>;
 
 export interface EvidenceCollector {
 	collect(args: {
 		plan: EvidencePlan;
 		cwd: string;
+		state: HarnessState;
 		signal?: AbortSignal | undefined;
 	}): Promise<CollectionResult>;
 }
 
 export interface CollectorOptions {
 	readonly exec?: ExecFn | undefined;
-	/** Used for `reviewer` requests. Absent means those are reported as unavailable. */
 	readonly reviewer?: ModelAdapter | undefined;
+	readonly confirm?: ((prompt: string) => Promise<boolean>) | undefined;
 	readonly logger?: Logger;
 	readonly commandTimeoutMs?: number;
 	readonly maxOutputChars?: number;
+}
+
+interface CollectionContext {
+	cwd: string;
+	state: HarnessState;
+	signal: AbortSignal | undefined;
+	options: CollectorOptions;
+	maxOutput: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -54,34 +52,24 @@ const DEFAULT_MAX_OUTPUT = 4_000;
 export function createEvidenceCollector(options: CollectorOptions = {}): EvidenceCollector {
 	const log = (options.logger ?? nullLogger).child("evidence:collect");
 	const maxOutput = options.maxOutputChars ?? DEFAULT_MAX_OUTPUT;
-
 	return {
-		async collect({ plan, cwd, signal }): Promise<CollectionResult> {
+		async collect({ plan, cwd, state, signal }): Promise<CollectionResult> {
 			const started = Date.now();
 			const collected: CollectedEvidence[] = [];
 			const failed: Array<{ requestId: string; reason: string }> = [];
-
-			/**
-			 * Sequential, not parallel. Evidence collection can run test suites and
-			 * builds; several at once on the same working tree interfere with each other
-			 * and produce evidence about a state that never existed.
-			 */
 			for (const request of plan.evidenceRequests) {
 				if (signal?.aborted) {
 					failed.push({ requestId: request.id, reason: "aborted" });
 					continue;
 				}
-
 				try {
-					const evidence = await collectOne(request, { cwd, signal, options, maxOutput });
-					collected.push(evidence);
-				} catch (e) {
-					const reason = e instanceof Error ? e.message : String(e);
-					log.warn("evidence collection failed", { request: request.id, kind: request.kind, reason });
+					collected.push(await collectOne(request, { cwd, state, signal, options, maxOutput }));
+				} catch (error) {
+					const reason = error instanceof Error ? error.message : String(error);
+					log.warn("evidence collection failed", { request: request.id, kind: request.strategy.kind, reason });
 					failed.push({ requestId: request.id, reason });
 				}
 			}
-
 			const durationMs = Date.now() - started;
 			log.info("evidence collected", { requests: plan.evidenceRequests.length, ok: collected.length, failed: failed.length, durationMs });
 			return { collected, failed, durationMs };
@@ -89,226 +77,234 @@ export function createEvidenceCollector(options: CollectorOptions = {}): Evidenc
 	};
 }
 
-async function collectOne(
-	request: EvidenceRequest,
-	ctx: { cwd: string; signal: AbortSignal | undefined; options: CollectorOptions; maxOutput: number },
-): Promise<CollectedEvidence> {
-	switch (request.kind) {
-		case "command":
-			return collectCommand(request, ctx);
-		case "file_state":
-			return collectFileState(request, ctx);
-		case "reviewer":
-			return collectReviewer(request, ctx);
-		case "internal":
-		case "prior_tool_output":
-			return {
-				requestId: request.id,
-				requirementIds: request.requirementIds,
-				type: request.kind,
-				summary: `No collector is implemented for ${request.kind} requests.`,
-				value: undefined,
-				sourceType: "harness",
-				source: "collector",
-				trust: "runtime_evidence",
-				freshnessClass: request.freshnessClass,
-				ok: false,
-				error: `unsupported request kind: ${request.kind}`,
-			};
+async function collectOne(request: EvidenceRequest, context: CollectionContext): Promise<CollectedEvidence> {
+	switch (request.strategy.kind) {
+		case "command_execution":
+			return collectCommand(request, request.strategy, context);
+		case "resource_state":
+			return collectResourceState(request, request.strategy, context);
+		case "event_log_assertion":
+			return collectEventLog(request, request.strategy, context);
+		case "semantic_evaluation":
+		case "visual_evaluation":
+			return collectReviewer(request, request.strategy, context);
+		case "user_confirmation":
+			return collectUserConfirmation(request, request.strategy, context);
 	}
 }
 
 async function collectCommand(
 	request: EvidenceRequest,
-	ctx: { cwd: string; signal: AbortSignal | undefined; options: CollectorOptions; maxOutput: number },
+	strategy: Extract<VerificationStrategy, { kind: "command_execution" }>,
+	context: CollectionContext,
 ): Promise<CollectedEvidence> {
-	const command = String(request.parameters.command ?? "");
-	if (!command) throw new Error("command request has no command");
-	if (!ctx.options.exec) throw new Error("no exec function is available to run evidence commands");
-
-	// Second barrier: never pass anything that can chain, redirect or substitute.
-	if (/[;&|><$(){}`\n]/.test(command)) {
-		throw new Error(`refusing to run a command containing shell metacharacters: ${command}`);
-	}
-
-	const [program, ...args] = command.trim().split(/\s+/);
-	if (!program) throw new Error("empty command");
-
+	if (!context.options.exec) throw new Error("no exec function is available to run an explicit verification command");
+	if (!/^[a-z0-9_./-]+$/i.test(strategy.program)) throw new Error(`invalid verification program: ${strategy.program}`);
 	const timeout = new AbortController();
-	const timer = setTimeout(() => timeout.abort(), ctx.options.commandTimeoutMs ?? DEFAULT_TIMEOUT_MS);
-
+	const timer = setTimeout(() => timeout.abort(), context.options.commandTimeoutMs ?? DEFAULT_TIMEOUT_MS);
 	try {
-		const result = await ctx.options.exec(program, args, {
-			cwd: ctx.cwd,
-			...(ctx.signal ? { signal: anySignal(ctx.signal, timeout.signal) } : { signal: timeout.signal }),
+		const commandCwd = strategy.cwd
+			? isAbsolute(strategy.cwd)
+				? strategy.cwd
+				: resolve(context.cwd, strategy.cwd)
+			: context.cwd;
+		const result = await context.options.exec(strategy.program, [...strategy.args], {
+			cwd: commandCwd,
+			...(context.signal ? { signal: anySignal(context.signal, timeout.signal) } : { signal: timeout.signal }),
 		});
-
 		const exitCode = result.exitCode ?? -1;
-		const expected = typeof request.parameters.expectedOutput === "string" ? request.parameters.expectedOutput : undefined;
-		const observed = result.stdout.trim();
-		const comparable =
-			request.parameters.outputComparison === "first_token"
-				? observed.split(/\s+/)[0] ?? ""
-				: observed;
-		const matchesExpected = expected === undefined || comparable === expected;
-		const ok = exitCode === 0 && matchesExpected;
+		const stdout = result.stdout.trim();
+		const stderr = result.stderr.trim();
+		const stdoutMatch = strategy.stdout ? compareOutput(stdout, strategy.stdout) : true;
+		const stderrMatch = strategy.stderr ? compareOutput(stderr, strategy.stderr) : true;
+		const supported = exitCode === strategy.expectExitCode && stdoutMatch && stderrMatch;
 		const output = redact(`${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`.trim());
-
-		return {
-			requestId: request.id,
-			requirementIds: request.requirementIds,
-			type: expected === undefined ? "command_result" : "exact_output",
-			// The summary is what reaches the Judge, so it leads with the decisive fact.
-			summary:
-				expected === undefined
-					? `exit ${exitCode} — ${clamp(output || "(no output)", 300)}`
-					: `exit ${exitCode}; observed ${JSON.stringify(comparable)}; expected ${JSON.stringify(expected)} — ${matchesExpected ? "match" : "MISMATCH"}`,
-			value: { command, exitCode, output: clamp(output, ctx.maxOutput), ...(expected === undefined ? {} : { expected, observed: comparable }) },
+		const expected = { exitCode: strategy.expectExitCode, stdout: strategy.stdout, stderr: strategy.stderr };
+		const observed = { exitCode, stdout: clamp(stdout, context.maxOutput), stderr: clamp(stderr, context.maxOutput) };
+		return baseEvidence(request, {
+			summary: supported
+				? `Explicit command verification matched: ${strategy.program} exited ${exitCode}.`
+				: `Explicit command verification mismatch: ${strategy.program} exited ${exitCode}; output ${clamp(output || "(none)", 240)}.`,
+			result: supported ? "supported" : "contradicted",
+			observed,
+			expected,
+			value: { program: strategy.program, args: strategy.args, cwd: commandCwd, observed, expected },
 			sourceType: "command",
-			source: command,
+			source: `${strategy.program} ${strategy.args.join(" ")}`.trim(),
+			provenance: "explicit_contract_strategy",
 			trust: "runtime_evidence",
-			freshnessClass: request.freshnessClass,
-			ok,
-			...(ok ? {} : { error: exitCode === 0 ? "command output did not match the expected value" : `command exited with ${exitCode}` }),
-		};
+			...(supported ? {} : { error: "command result did not match its typed expectation" }),
+		});
 	} finally {
 		clearTimeout(timer);
 	}
 }
 
-function collectFileState(
+function collectResourceState(
 	request: EvidenceRequest,
-	ctx: { cwd: string; options: CollectorOptions; maxOutput: number },
+	strategy: Extract<VerificationStrategy, { kind: "resource_state" }>,
+	context: CollectionContext,
 ): CollectedEvidence {
-	const rawPath = String(request.parameters.path ?? "");
-	if (!rawPath) throw new Error("file_state request has no path");
-
-	const path = isAbsolute(rawPath) ? rawPath : resolve(ctx.cwd, rawPath);
-	const mode = String(request.parameters.mode ?? "hash_unchanged");
-
+	const path = isAbsolute(strategy.resource) ? strategy.resource : resolve(context.cwd, strategy.resource);
+	let exists = false;
+	let size: number | undefined;
+	let hash: string | undefined;
+	let modifiedAt: string | undefined;
 	try {
 		const stats = statSync(path);
-
-		if (mode === "path_absent") {
-			return evidence(request, {
-				type: "file_state",
-				summary: `${rawPath} exists (expected absent)`,
-				value: { path: rawPath, exists: true },
-				source: path,
-				ok: false,
-				error: "path exists but was expected to be absent",
-			});
-		}
-
-		// Hash only regular files; hashing a directory tree is unbounded work.
-		const hash = stats.isFile() ? createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32) : undefined;
-
-		return evidence(request, {
-			type: "file_state",
-			summary: hash
-				? `${rawPath} exists, size ${stats.size}, sha256:${hash.slice(0, 12)}…`
-				: `${rawPath} exists (${stats.isDirectory() ? "directory" : "non-regular file"})`,
-			value: { path: rawPath, exists: true, size: stats.size, modifiedAt: stats.mtime.toISOString(), ...(hash ? { hash } : {}) },
-			source: path,
-			ok: true,
-			// A hash stays true exactly until that file changes (§21).
-			validity: path,
-		});
+		exists = true;
+		size = stats.size;
+		modifiedAt = stats.mtime.toISOString();
+		if (stats.isFile()) hash = createHash("sha256").update(readFileSync(path)).digest("hex");
 	} catch {
-		const expectedAbsent = mode === "path_absent";
-		return evidence(request, {
-			type: "file_state",
-			summary: `${rawPath} does not exist`,
-			value: { path: rawPath, exists: false },
-			source: path,
-			ok: expectedAbsent,
-			...(expectedAbsent ? {} : { error: "path does not exist" }),
-		});
+		// Absence is an observation, not a collection error.
 	}
+	const supported =
+		strategy.condition === "exists"
+			? exists
+			: strategy.condition === "absent"
+				? !exists
+				: exists && typeof strategy.expectedHash === "string" && hash === strategy.expectedHash;
+	const observed = { path, exists, ...(size === undefined ? {} : { size }), ...(hash ? { hash } : {}), ...(modifiedAt ? { modifiedAt } : {}) };
+	const expected = { condition: strategy.condition, ...(strategy.expectedHash ? { hash: strategy.expectedHash } : {}) };
+	return baseEvidence(request, {
+		summary: `${strategy.resource}: observed ${exists ? "present" : "absent"}; expected ${strategy.condition}${supported ? " (match)" : " (MISMATCH)"}.`,
+		result: supported ? "supported" : "contradicted",
+		observed,
+		expected,
+		value: { observed, expected },
+		sourceType: "file",
+		source: path,
+		provenance: "direct_resource_observation",
+		trust: "runtime_evidence",
+		validity: resourceUri(strategy.resource, context.cwd),
+		...(supported ? {} : { error: "resource state did not match its typed expectation" }),
+	});
 }
 
-/**
- * Reviewer evidence: a focused model judgement about something no command can settle.
- *
- * Trust level is `model_interpretation`, not `runtime_evidence`. This is the whole
- * point of §17 — a reviewer saying "yes, the image is about Kubernetes" is a useful
- * signal and is *not* the same kind of thing as an exit code.
- */
+function collectEventLog(
+	request: EvidenceRequest,
+	strategy: Extract<VerificationStrategy, { kind: "event_log_assertion" }>,
+	context: CollectionContext,
+): CollectedEvidence {
+	const matching = context.state.actions.filter(
+		(action) => action.outcome === "succeeded" && matchesActionSelector(strategy.action, { ...action, input: {}, summary: action.summary }),
+	);
+	const count = matching.length;
+	const supported =
+		strategy.operator === "none"
+			? count === 0
+			: strategy.operator === "equals"
+				? count === strategy.count
+				: strategy.operator === "at_least"
+					? count >= strategy.count
+					: count <= strategy.count;
+	return baseEvidence(request, {
+		summary: `Event-log assertion observed ${count} matching successful action(s); expected ${strategy.operator} ${strategy.count}.`,
+		result: supported ? "supported" : "contradicted",
+		observed: { count, actionIds: matching.map((action) => action.id) },
+		expected: { operator: strategy.operator, count: strategy.count },
+		value: { count, actionIds: matching.map((action) => action.id) },
+		sourceType: "harness",
+		source: "task event log",
+		provenance: "canonical_state",
+		trust: "runtime_evidence",
+		...(supported ? {} : { error: "event-log count did not match its typed expectation" }),
+	});
+}
+
 async function collectReviewer(
 	request: EvidenceRequest,
-	ctx: { signal: AbortSignal | undefined; options: CollectorOptions },
+	strategy: Extract<VerificationStrategy, { kind: "semantic_evaluation" | "visual_evaluation" }>,
+	context: CollectionContext,
 ): Promise<CollectedEvidence> {
-	const reviewer = ctx.options.reviewer;
-	if (!reviewer?.available) throw new Error("no reviewer model is available");
-
-	const question = String(request.parameters.question ?? request.description);
-	const hint = request.parameters.hint ? String(request.parameters.hint) : undefined;
-
+	const reviewer = context.options.reviewer;
+	if (!reviewer?.available) throw new Error(`no reviewer is available for ${strategy.kind}`);
+	const instructions = strategy.instructions;
+	const sources = strategy.kind === "visual_evaluation" ? strategy.resources : strategy.evidenceSources;
 	const response = await reviewer.complete({
 		systemPrompt:
-			"You are an evidence reviewer for an execution harness. Answer the question about the current task state " +
-			"in at most three sentences. State plainly what you can and cannot determine. Do not speculate, and do not " +
-			"claim something is verified when you have not observed it. Begin your reply with VERIFIED, NOT_VERIFIED or " +
-			"CANNOT_DETERMINE.",
-		userPrompt: [
-			`Task goal: ${request.parameters.goal ?? "(not specified)"}`,
-			`Proposed action: ${request.parameters.proposedAction ?? "(not specified)"}`,
-			"",
-			`Question: ${question}`,
-			...(hint ? [`How this should be verified: ${hint}`] : []),
-		].join("\n"),
-		...(ctx.signal ? { signal: ctx.signal } : {}),
+			"You are an evidence reviewer. Assess only the named observed resources and supplied evidence. " +
+			"Begin with VERIFIED, NOT_VERIFIED, or CANNOT_DETERMINE. Never infer that a resource was observed merely because its URI is listed.",
+		userPrompt: [`Verification instructions: ${instructions}`, `Evidence sources: ${sources.join(", ") || "(none supplied)"}`].join("\n"),
+		...(context.signal ? { signal: context.signal } : {}),
 	});
-
 	const text = response.text.trim();
-	const verified = /^VERIFIED\b/i.test(text);
-
-	return evidence(request, {
-		type: "reviewer_assessment",
+	const result = /^VERIFIED\b/i.test(text) ? "supported" : /^NOT_VERIFIED\b/i.test(text) ? "contradicted" : "unknown";
+	return baseEvidence(request, {
 		summary: clamp(text, 400),
-		value: { question, response: text, model: response.model },
-		source: `reviewer:${response.model}`,
+		result,
+		observed: { response: text, sources },
+		expected: instructions,
+		value: { response: text, model: response.model, sources },
 		sourceType: "model",
+		source: `reviewer:${response.model}`,
+		provenance: "model_interpretation_of_named_sources",
 		trust: "model_interpretation",
-		ok: verified,
-		...(verified ? {} : { error: "reviewer did not confirm" }),
+		...(result === "supported" ? {} : { error: "reviewer did not verify the condition" }),
 	});
 }
 
-function evidence(
+async function collectUserConfirmation(
 	request: EvidenceRequest,
-	fields: {
-		type: string;
-		summary: string;
-		value: unknown;
-		source: string;
-		ok: boolean;
-		error?: string;
-		validity?: string;
-		sourceType?: CollectedEvidence["sourceType"];
-		trust?: CollectedEvidence["trust"];
-	},
+	strategy: Extract<VerificationStrategy, { kind: "user_confirmation" }>,
+	context: CollectionContext,
+): Promise<CollectedEvidence> {
+	if (!context.options.confirm) throw new Error("no interactive confirmation channel is available");
+	const confirmed = await context.options.confirm(strategy.prompt);
+	return baseEvidence(request, {
+		summary: confirmed ? "User confirmed the typed completion condition." : "User declined the typed completion condition.",
+		result: confirmed ? "supported" : "contradicted",
+		observed: confirmed,
+		expected: true,
+		value: { confirmed, prompt: strategy.prompt },
+		sourceType: "user",
+		source: "interactive confirmation",
+		provenance: "explicit_user_response",
+		trust: "user_instruction",
+		...(confirmed ? {} : { error: "user did not confirm" }),
+	});
+}
+
+function baseEvidence(
+	request: EvidenceRequest,
+	fields: Omit<CollectedEvidence, "requestId" | "requirementIds" | "type" | "freshnessClass">,
 ): CollectedEvidence {
 	return {
 		requestId: request.id,
 		requirementIds: request.requirementIds,
-		type: fields.type,
-		summary: fields.summary,
-		value: fields.value,
-		sourceType: fields.sourceType ?? "file",
-		source: fields.source,
-		trust: fields.trust ?? "runtime_evidence",
+		type: request.strategy.kind,
 		freshnessClass: request.freshnessClass,
-		ok: fields.ok,
-		...(fields.error ? { error: fields.error } : {}),
-		...(fields.validity ? { validity: fields.validity } : {}),
+		...fields,
 	};
+}
+
+function compareOutput(observed: string, expectation: { operator: string; value: string }): boolean {
+	switch (expectation.operator) {
+		case "equals":
+			return observed === expectation.value;
+		case "contains":
+			return observed.includes(expectation.value);
+		case "matches":
+			try {
+				return new RegExp(expectation.value, "u").test(observed);
+			} catch {
+				return false;
+			}
+		case "numeric_equals":
+			return Number(observed) === Number(expectation.value);
+		case "numeric_greater_than":
+			return Number(observed) > Number(expectation.value);
+		case "numeric_less_than":
+			return Number(observed) < Number(expectation.value);
+		default:
+			return false;
+	}
 }
 
 function anySignal(a: AbortSignal, b: AbortSignal): AbortSignal {
 	const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
 	if (typeof anyOf === "function") return anyOf([a, b]);
-
 	const controller = new AbortController();
 	const forward = () => controller.abort();
 	if (a.aborted || b.aborted) controller.abort();

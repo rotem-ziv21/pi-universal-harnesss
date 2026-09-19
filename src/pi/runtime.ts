@@ -266,6 +266,9 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 			collector: createEvidenceCollector({
 				...(deps.exec ? { exec: deps.exec } : {}),
 				reviewer: reviewerAdapter,
+				...(deps.confirmWithUser
+					? { confirm: (prompt: string) => deps.confirmWithUser?.("Harness: verification confirmation", prompt) ?? Promise.resolve(false) }
+					: {}),
 				logger,
 			}),
 			judge,

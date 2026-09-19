@@ -104,7 +104,9 @@ export function renderCompletionRejection(args: {
 		lines.push("Success conditions not yet verified:");
 		for (const condition of unsatisfied) {
 			lines.push(`  - ${condition.id}: ${condition.description}`);
-			if (condition.verificationHint) lines.push(`      verify by: ${condition.verificationHint}`);
+			if (condition.verification?.length) {
+				lines.push(`      typed verification: ${condition.verification.map((strategy) => strategy.kind).join(", ")}`);
+			}
 		}
 		lines.push("");
 	}

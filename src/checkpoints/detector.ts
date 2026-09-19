@@ -12,7 +12,10 @@ import {
 	irreversibleSignal,
 	isMutating,
 	matchConstraintToAction,
+	matchesActionSelector,
 	protectedPathSignals,
+	scopeViolationSignals,
+	unknownClassificationSignal,
 } from "./signals.ts";
 import {
 	type CheckpointDecision,
@@ -74,11 +77,11 @@ export function createCheckpointDetector(options: {
 		async evaluate({ contract, state, action, protectedPaths = [], signal }): Promise<CheckpointDecision> {
 			if (!isMutating(action)) return NO_GATE;
 
-			// Tier 1: direct, machine-readable policy violations never need a Judge.
+			// Tier 1: typed forbidden policies and protected scopes are deterministic.
 			const directSignals: CheckpointSignal[] = [];
 			for (const constraint of contract.constraints) {
-				if (constraint.priority !== "hard") continue;
-				const match = matchConstraintToAction(constraint.description, action);
+				if (constraint.priority !== "hard" || constraint.policy?.effect !== "forbid") continue;
+				const match = matchConstraintToAction(constraint, action);
 				if (!match.violates) continue;
 				directSignals.push({
 					type: "constraint_risk",
@@ -89,17 +92,17 @@ export function createCheckpointDetector(options: {
 				});
 			}
 			for (const forbidden of contract.forbiddenConditions) {
-				if (forbidden.priority !== "hard") continue;
-				const match = matchConstraintToAction(forbidden.description, action);
-				if (!match.relevant) continue;
+				if (forbidden.priority !== "hard" || !forbidden.policy) continue;
+				if (!matchesActionSelector(forbidden.policy.action, action)) continue;
 				directSignals.push({
 					type: "constraint_risk",
-					reason: `This action can directly create forbidden condition: "${forbidden.description}"`,
+					reason: `The action directly reaches typed forbidden condition: "${forbidden.description}"`,
 					origin: "contract",
 					weight: 1,
 					relatedItemIds: [forbidden.id],
 				});
 			}
+			directSignals.push(...scopeViolationSignals(action));
 			directSignals.push(...protectedPathSignals(protectedPaths, action));
 			if (directSignals.length > 0) {
 				return { ...decide(directSignals, false), policyDecision: "block" };
@@ -121,14 +124,14 @@ export function createCheckpointDetector(options: {
 				return decision;
 			}
 
-			// PLAN/BUILD/VERIFY allow reversible local work. Full completion evidence is
-			// intentionally not a prerequisite for constructing the thing being verified.
-			const phase = state.phase === "active" ? "build" : state.phase;
+			// Broad lifecycle phases govern reversibility, not task type.
+			const phase = state.phase === "active" || state.phase === "build" ? "execute" : state.phase;
 			if (
-				(phase === "plan" || phase === "build" || phase === "verify") &&
+				(phase === "plan" || phase === "execute" || phase === "verify") &&
+				action.actionSemantics.classification !== "unknown" &&
 				action.actionSemantics.reversibility === "high" &&
 				!action.actionSemantics.externalSideEffect &&
-				action.actionSemantics.targetOwnership !== "outside_scope"
+				action.actionSemantics.effects.every((effect) => effect.scope === "allowed" || effect.scope === "unknown")
 			) {
 				return {
 					...NO_GATE,
@@ -137,9 +140,12 @@ export function createCheckpointDetector(options: {
 			}
 
 			// Tier 3: generic high-risk side effects not anticipated by the contract.
-			const genericSignals = [externalMutationSignal(action), destructiveSignal(action), irreversibleSignal(action)].filter(
-				(item): item is CheckpointSignal => item !== undefined,
-			);
+			const genericSignals = [
+				externalMutationSignal(action),
+				destructiveSignal(action),
+				irreversibleSignal(action),
+				unknownClassificationSignal(action),
+			].filter((item): item is CheckpointSignal => item !== undefined);
 			const strongest = Math.max(0, ...genericSignals.map((item) => item.weight));
 			const total = genericSignals.reduce((sum, item) => sum + item.weight, 0);
 

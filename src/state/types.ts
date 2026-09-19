@@ -1,6 +1,7 @@
 import type { ContractRevision } from "../contract/revisions.ts";
 import type { TaskContract } from "../contract/schema.ts";
 import type { ActionSemantics, CheckpointSignal } from "../checkpoints/types.ts";
+import type { TaskWorkspaceState } from "../resources/types.ts";
 
 /**
  * Canonical state (§16) and the event vocabulary (§19).
@@ -15,13 +16,14 @@ export type TaskPhase =
 	| "reviewing"
 	| "awaiting_user"
 	| "plan"
-	| "build"
+	| "execute"
 	| "verify"
 	| "finalize"
 	| "completed"
 	| "abandoned"
-	/** Accepted when replaying task logs written by harness versions before phase-aware gating. */
+	/** Accepted when replaying logs written by older harness versions. */
 	| "active"
+	| "build"
 	| "gating"
 	| "blocked"
 	| "completing";
@@ -63,6 +65,10 @@ export interface EvidenceRef {
 	readonly supersededAt?: string;
 	/** For `until_change`: what invalidates this. For `expiring`: an ISO timestamp. */
 	readonly validity?: string;
+	/** Structured observation and expectation carried through from the typed strategy. */
+	readonly observed?: unknown;
+	readonly expected?: unknown;
+	readonly provenance?: string;
 	/** Full value, kept out of summaries so Judge payloads stay compact. */
 	readonly value?: unknown;
 }
@@ -200,6 +206,7 @@ export interface HarnessState {
 	readonly contractVersion: number;
 	readonly revisions: readonly ContractRevision[];
 
+	readonly workspace: TaskWorkspaceState;
 	readonly verifiedFacts: readonly VerifiedFact[];
 	readonly hypotheses: readonly Hypothesis[];
 	readonly evidence: readonly EvidenceRef[];

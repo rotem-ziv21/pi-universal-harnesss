@@ -360,6 +360,8 @@ function contractText(rt: HarnessRuntime): string {
 	lines.push(`Task ${contract.id} · contract v${contract.version} · ${task.state.getState().phase}`);
 	lines.push("");
 	lines.push(`Goal: ${contract.goal}`);
+	lines.push(`Workspace scopes: ${contract.workspace?.allowedScopes.join(", ") || contract.metadata.cwd || "(runtime cwd)"}`);
+	lines.push(`Protected resources: ${contract.workspace?.protectedResources.join(", ") || "(none)"}`);
 	lines.push("");
 	lines.push("Original request:");
 	lines.push(indent(clamp(contract.originalRequest, 1000)));
@@ -437,6 +439,20 @@ function stateText(rt: HarnessRuntime): string {
 	lines.push(`Verified facts:  ${s.verifiedFacts.filter((f) => !f.supersededBy).length} current, ${s.verifiedFacts.length} total`);
 	lines.push(`Hypotheses:      ${s.hypotheses.filter((h) => h.status === "open").length} open, ${s.hypotheses.length} total`);
 	lines.push(`Evidence:        ${s.evidence.filter((e) => !e.supersededBy).length} current, ${s.evidence.length} total`);
+	lines.push(`Resources:       ${s.workspace.resources.filter((resource) => resource.status === "active").length} active, ${s.workspace.resources.length} tracked`);
+	lines.push(`Workspace root:  ${s.workspace.initialWorkingDirectory}`);
+	lines.push(`Allowed scopes:  ${s.workspace.allowedScopes.join(", ")}`);
+	lines.push(`Protected:       ${s.workspace.protectedResources.join(", ") || "(none)"}`);
+
+	if (s.workspace.resources.length > 0) {
+		lines.push("", "Resource registry:");
+		for (const resource of s.workspace.resources.slice(-20)) {
+			lines.push(
+				`  [${resource.status}] ${resource.lastOperation} ${resource.uri} ` +
+					`(${resource.kind}; ${resource.provenance}; ${resource.scope}; action ${resource.lastActionId})`,
+			);
+		}
+	}
 
 	if (s.verifiedFacts.length > 0) {
 		lines.push("", "Verified facts (runtime evidence only):");
@@ -650,10 +666,14 @@ function checkpointDebugText(rt: HarnessRuntime, argument: string): string {
 		lines.push(`  action:        ${semantics.actionType}`);
 		lines.push(`  mutation:      ${semantics.mutationType}`);
 		lines.push(`  target:        ${semantics.target ?? "(none)"}`);
-		lines.push(`  ownership:     ${semantics.targetOwnership}`);
+		lines.push(`  provenance:    ${semantics.targetProvenance}`);
+		lines.push(`  scope:         ${semantics.targetScope}`);
 		lines.push(`  reversibility: ${semantics.reversibility}`);
 		lines.push(`  external:      ${semantics.externalSideEffect}`);
 		lines.push(`  capabilities:  ${semantics.capabilities.join(", ") || "(none)"}`);
+		for (const effect of semantics.effects) {
+			lines.push(`  effect:        ${effect.operation} ${effect.kind} ${effect.uri} [${effect.provenance}/${effect.scope}]`);
+		}
 		lines.push("  matched constraints/signals:");
 		for (const signal of checkpoint.signals) {
 			lines.push(`    - [${signal.origin}/${signal.type}] ${signal.reason}`);

@@ -33,6 +33,163 @@ export type ContractSource = Static<typeof SourceSchema>;
 export const PrioritySchema = Type.Union([Type.Literal("hard"), Type.Literal("soft")]);
 export type Priority = Static<typeof PrioritySchema>;
 
+const ResourceKindSchema = Type.Union([
+	Type.Literal("file"),
+	Type.Literal("directory"),
+	Type.Literal("vcs_ref"),
+	Type.Literal("api_object"),
+	Type.Literal("database_record"),
+	Type.Literal("deployment"),
+	Type.Literal("artifact"),
+	Type.Literal("remote_resource"),
+	Type.Literal("unknown"),
+]);
+
+const ResourceOperationSchema = Type.Union([
+	Type.Literal("read"),
+	Type.Literal("create"),
+	Type.Literal("modify"),
+	Type.Literal("delete"),
+	Type.Literal("move"),
+	Type.Literal("execute"),
+	Type.Literal("query"),
+	Type.Literal("publish"),
+	Type.Literal("deploy"),
+]);
+
+const ResourceProvenanceSchema = Type.Union([
+	Type.Literal("preexisting"),
+	Type.Literal("created_by_current_task"),
+	Type.Literal("created_by_harness"),
+	Type.Literal("external"),
+	Type.Literal("unknown"),
+]);
+
+const ResourceScopeSchema = Type.Union([
+	Type.Literal("allowed"),
+	Type.Literal("protected"),
+	Type.Literal("outside_allowed"),
+	Type.Literal("external"),
+	Type.Literal("unknown"),
+]);
+
+export const ActionCapabilitySchema = Type.Union([
+	Type.Literal("read_resource"),
+	Type.Literal("create_resource"),
+	Type.Literal("modify_resource"),
+	Type.Literal("delete_resource"),
+	Type.Literal("move_resource"),
+	Type.Literal("query_resource"),
+	Type.Literal("execute_code"),
+	Type.Literal("install_dependency"),
+	Type.Literal("commit"),
+	Type.Literal("mutate_remote"),
+	Type.Literal("publish"),
+	Type.Literal("deploy"),
+	Type.Literal("generate_artifact"),
+]);
+export type ContractActionCapability = Static<typeof ActionCapabilitySchema>;
+
+export const ActionSelectorSchema = Type.Object(
+	{
+		capabilities: Type.Optional(Type.Array(ActionCapabilitySchema)),
+		operations: Type.Optional(Type.Array(ResourceOperationSchema)),
+		resourceKinds: Type.Optional(Type.Array(ResourceKindSchema)),
+		provenances: Type.Optional(Type.Array(ResourceProvenanceSchema)),
+		scopes: Type.Optional(Type.Array(ResourceScopeSchema)),
+		externalSideEffect: Type.Optional(Type.Boolean()),
+		targetUriPrefix: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+export type ActionSelector = Static<typeof ActionSelectorSchema>;
+
+const OutputExpectationSchema = Type.Object(
+	{
+		operator: Type.Union([
+			Type.Literal("equals"),
+			Type.Literal("contains"),
+			Type.Literal("matches"),
+			Type.Literal("numeric_equals"),
+			Type.Literal("numeric_greater_than"),
+			Type.Literal("numeric_less_than"),
+		]),
+		value: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+
+export const VerificationStrategySchema = Type.Union([
+	Type.Object(
+		{
+			kind: Type.Literal("command_execution"),
+			program: Type.String({ minLength: 1 }),
+			args: Type.Array(Type.String(), { default: [] }),
+			cwd: Type.Optional(Type.String()),
+			expectExitCode: Type.Integer({ default: 0 }),
+			stdout: Type.Optional(OutputExpectationSchema),
+			stderr: Type.Optional(OutputExpectationSchema),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("resource_state"),
+			resource: Type.String({ minLength: 1 }),
+			condition: Type.Union([Type.Literal("exists"), Type.Literal("absent"), Type.Literal("hash_equals")]),
+			expectedHash: Type.Optional(Type.String()),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("event_log_assertion"),
+			action: ActionSelectorSchema,
+			operator: Type.Union([
+				Type.Literal("equals"),
+				Type.Literal("at_least"),
+				Type.Literal("at_most"),
+				Type.Literal("none"),
+			]),
+			count: Type.Integer({ minimum: 0, default: 0 }),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("semantic_evaluation"),
+			instructions: Type.String({ minLength: 1 }),
+			evidenceSources: Type.Array(Type.String(), { default: [] }),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("visual_evaluation"),
+			instructions: Type.String({ minLength: 1 }),
+			resources: Type.Array(Type.String(), { minItems: 1 }),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("user_confirmation"),
+			prompt: Type.String({ minLength: 1 }),
+		},
+		{ additionalProperties: false },
+	),
+]);
+export type VerificationStrategy = Static<typeof VerificationStrategySchema>;
+
+export const WorkspacePolicySchema = Type.Object(
+	{
+		allowedScopes: Type.Array(Type.String(), { default: [] }),
+		protectedResources: Type.Array(Type.String(), { default: [] }),
+	},
+	{ additionalProperties: false },
+);
+export type ContractWorkspacePolicy = Static<typeof WorkspacePolicySchema>;
+
 export const RequirementStatusSchema = Type.Union([
 	Type.Literal("pending"),
 	Type.Literal("satisfied"),
@@ -50,6 +207,8 @@ export const RequirementSchema = Type.Object(
 		status: Type.Union([...RequirementStatusSchema.anyOf], { default: "pending" }),
 		/** Verbatim user words this was derived from. Present only when source is "user". */
 		quote: Type.Optional(Type.String()),
+		/** Typed strategies only. Natural-language descriptions are never executed. */
+		verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 	},
 	{ additionalProperties: false },
 );
@@ -66,25 +225,17 @@ export const ConstraintSchema = Type.Object(
 		source: SourceSchema,
 		priority: PrioritySchema,
 		quote: Type.Optional(Type.String()),
-		/**
-		 * Optional machine-checkable form, when one exists. Free text is always the
-		 * authoritative statement; this is an optimization that lets the Evidence
-		 * Planner check some constraints without a model call.
-		 */
-		check: Type.Optional(
+		/** Deterministic policy, when the statement can be expressed structurally. */
+		policy: Type.Optional(
 			Type.Object(
 				{
-					kind: Type.Union([
-						Type.Literal("path_unmodified"),
-						Type.Literal("path_absent"),
-						Type.Literal("command_exit_zero"),
-						Type.Literal("hash_unchanged"),
-					]),
-					target: Type.String(),
+					effect: Type.Union([Type.Literal("forbid"), Type.Literal("require_review")]),
+					action: ActionSelectorSchema,
 				},
 				{ additionalProperties: false },
 			),
 		),
+		verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 	},
 	{ additionalProperties: false },
 );
@@ -97,12 +248,8 @@ export const SuccessConditionSchema = Type.Object(
 		description: Type.String({ minLength: 1 }),
 		source: SourceSchema,
 		priority: PrioritySchema,
-		/**
-		 * Free-text hint about what would prove this. The Evidence Planner uses it; it
-		 * is deliberately not a structured command, because that would reintroduce
-		 * task-specific assumptions into the schema.
-		 */
-		verificationHint: Type.Optional(Type.String()),
+		/** Typed strategies only. Descriptive prose is never parsed as a command. */
+		verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 		status: Type.Union([...RequirementStatusSchema.anyOf], { default: "pending" }),
 	},
 	{ additionalProperties: false },
@@ -116,6 +263,16 @@ export const ForbiddenConditionSchema = Type.Object(
 		description: Type.String({ minLength: 1 }),
 		source: SourceSchema,
 		priority: PrioritySchema,
+		policy: Type.Optional(
+			Type.Object(
+				{
+					effect: Type.Literal("forbid"),
+					action: ActionSelectorSchema,
+				},
+				{ additionalProperties: false },
+			),
+		),
+		verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 	},
 	{ additionalProperties: false },
 );
@@ -139,6 +296,8 @@ export const CriticalActionSchema = Type.Object(
 		reversible: Type.Union([Type.Literal("yes"), Type.Literal("no"), Type.Literal("unknown")], { default: "unknown" }),
 		/** Requirement/success-condition ids that must hold before this action may run. */
 		requiresVerificationOf: Type.Array(Type.String(), { default: [] }),
+		/** Structured action match. Without it, relevance is a Judge decision, never regex dispatch. */
+		action: Type.Optional(ActionSelectorSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -181,6 +340,7 @@ export const TaskContractSchema = Type.Object(
 		/** The user's words, unmodified. The ground truth every other field answers to. */
 		originalRequest: Type.String(),
 		goal: Type.String({ minLength: 1 }),
+		workspace: Type.Optional(WorkspacePolicySchema),
 
 		requirements: Type.Array(RequirementSchema, { default: [] }),
 		constraints: Type.Array(ConstraintSchema, { default: [] }),
@@ -225,6 +385,7 @@ export const CompiledContractSchema = Type.Object(
 				source: SourceSchema,
 				priority: PrioritySchema,
 				quote: Type.Optional(Type.String()),
+				verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 			}),
 			{ default: [] },
 		),
@@ -234,6 +395,16 @@ export const CompiledContractSchema = Type.Object(
 				source: SourceSchema,
 				priority: PrioritySchema,
 				quote: Type.Optional(Type.String()),
+				policy: Type.Optional(
+					Type.Object(
+						{
+							effect: Type.Union([Type.Literal("forbid"), Type.Literal("require_review")]),
+							action: ActionSelectorSchema,
+						},
+						{ additionalProperties: false },
+					),
+				),
+				verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 			}),
 			{ default: [] },
 		),
@@ -242,7 +413,7 @@ export const CompiledContractSchema = Type.Object(
 				description: Type.String({ minLength: 1 }),
 				source: SourceSchema,
 				priority: PrioritySchema,
-				verificationHint: Type.Optional(Type.String()),
+				verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 			}),
 			{ default: [] },
 		),
@@ -251,6 +422,16 @@ export const CompiledContractSchema = Type.Object(
 				description: Type.String({ minLength: 1 }),
 				source: SourceSchema,
 				priority: PrioritySchema,
+				policy: Type.Optional(
+					Type.Object(
+						{
+							effect: Type.Literal("forbid"),
+							action: ActionSelectorSchema,
+						},
+						{ additionalProperties: false },
+					),
+				),
+				verification: Type.Optional(Type.Array(VerificationStrategySchema)),
 			}),
 			{ default: [] },
 		),
@@ -260,6 +441,7 @@ export const CompiledContractSchema = Type.Object(
 				source: SourceSchema,
 				rationale: Type.Optional(Type.String()),
 				reversible: Type.Optional(Type.Union([Type.Literal("yes"), Type.Literal("no"), Type.Literal("unknown")])),
+				action: Type.Optional(ActionSelectorSchema),
 			}),
 			{ default: [] },
 		),
@@ -278,6 +460,7 @@ export const CompiledContractSchema = Type.Object(
 			}),
 			{ default: [] },
 		),
+		workspace: Type.Optional(WorkspacePolicySchema),
 	},
 	{ additionalProperties: false },
 );

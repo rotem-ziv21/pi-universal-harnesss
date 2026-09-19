@@ -177,7 +177,7 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			const contract = deps.state.getContract();
 			deps.state.requestCompletion();
 
-			const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState(), cwd });
+			const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
 			deps.state.recordCompletionEvaluation(evaluation);
 			const hardUnsatisfied = evaluation.conditions.filter(
 				(condition) => condition.priority === "hard" && condition.status === "UNSATISFIED",
@@ -207,11 +207,14 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 				input: {},
 				actionSemantics: {
 					actionType: "unknown",
-					targetOwnership: "unknown",
+					classification: "known",
 					mutationType: "none",
 					reversibility: "high",
 					externalSideEffect: false,
 					capabilities: [],
+					effects: [],
+					targetProvenance: "unknown",
+					targetScope: "unknown",
 					operationText: "completion",
 				},
 				summary: "Declare the task complete",
@@ -294,7 +297,7 @@ async function runGate(args: {
 	}
 
 	if (plan.evidenceRequests.length > 0) {
-		const result = await deps.collector.collect({ plan, cwd, ...(signal ? { signal } : {}) });
+		const result = await deps.collector.collect({ plan, cwd, state: deps.state.getState(), ...(signal ? { signal } : {}) });
 		const evidenceStateVersion = deps.state.getVersion() + result.collected.length;
 		for (const item of result.collected) {
 			const evidence: EvidenceRef = {
@@ -308,8 +311,11 @@ async function runGate(args: {
 				stateVersion: evidenceStateVersion,
 				freshnessClass: item.freshnessClass,
 				trust: item.trust,
-				result: item.ok ? "supported" : "contradicted",
+				result: item.result,
 				...(item.validity ? { validity: item.validity } : {}),
+				observed: item.observed,
+				...(item.expected === undefined ? {} : { expected: item.expected }),
+				provenance: item.provenance,
 				value: item.value,
 			};
 			deps.state.addEvidence(evidence);
@@ -322,7 +328,7 @@ async function runGate(args: {
 
 	let checkpointForJudge = checkpoint;
 	if (checkpoint.checkpointType === "completion_claim") {
-		const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState(), cwd });
+		const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
 		deps.state.recordCompletionEvaluation(evaluation);
 		const hardUnsatisfied = evaluation.conditions.filter(
 			(condition) => condition.priority === "hard" && condition.status === "UNSATISFIED",
@@ -491,57 +497,10 @@ function recordRuntimeToolEvidence(
 	summary: string,
 	isError: boolean,
 ): void {
+	// Tool outcomes update canonical action/resource state. They become completion
+	// evidence only through an explicit typed verification request collected by the
+	// Evidence Collector; filenames and prose are never used as implicit links.
 	deps.state.recordToolResult(actionId, summary, isError);
-	const state = deps.state.getState();
-	const action = state.actions.find((candidate) => candidate.id === actionId);
-	if (!action) return;
-
-	const items = [...state.contract.requirements, ...state.contract.successConditions];
-	const requirementIds: string[] = [];
-	const operation = `${action.actionSemantics.operationText} ${summary}`.toLowerCase();
-	for (const item of items) {
-		const description = item.description.toLowerCase();
-		if (action.actionSemantics.capabilities.includes("run_tests") && /\btests?\b/.test(description)) {
-			requirementIds.push(item.id);
-			continue;
-		}
-		if (
-			action.actionSemantics.capabilities.includes("read_file") &&
-			/readme/i.test(action.actionSemantics.target ?? "") &&
-			/\b(readme|usage|documentation)\b/.test(description)
-		) {
-			requirementIds.push(item.id);
-			continue;
-		}
-		const terms = description
-			.split(/[^a-z0-9]+/)
-			.filter((term) => term.length >= 4 && !["with", "from", "that", "this", "must", "should"].includes(term));
-		if (
-			action.actionSemantics.capabilities.includes("execute_local_code") &&
-			terms.filter((term) => operation.includes(term)).length >= 2
-		) {
-			requirementIds.push(item.id);
-		}
-	}
-	if (requirementIds.length === 0) return;
-
-	const deterministic =
-		action.actionSemantics.capabilities.includes("run_tests") ||
-		(action.actionSemantics.capabilities.includes("read_file") && /readme/i.test(action.actionSemantics.target ?? ""));
-	deps.state.addEvidence({
-		id: newEvidenceId(),
-		requirementIds: [...new Set(requirementIds)],
-		type: deterministic ? (action.actionSemantics.capabilities.includes("run_tests") ? "command_result" : "file_state") : "tool_result",
-		summary: `${isError ? "failed" : "succeeded"} — ${summary}`,
-		sourceType: "tool",
-		source: `${action.toolName}:${action.id}`,
-		observedAt: nowIso(),
-		stateVersion: deps.state.getVersion() + 1,
-		freshnessClass: "temporary",
-		trust: "runtime_evidence",
-		result: deterministic ? (isError ? "contradicted" : "supported") : "unknown",
-		value: { actionId, actionType: action.actionSemantics.actionType, summary, isError },
-	});
 }
 
 function completionConditionMessage(

@@ -1,6 +1,7 @@
 import type { ContractRevision } from "../contract/revisions.ts";
 import type { TaskContract } from "../contract/schema.ts";
 import { nowIso } from "../util/ids.ts";
+import { applyResourceEffects, createWorkspaceState } from "../resources/registry.ts";
 import { contradicts, supersede } from "./freshness.ts";
 import type {
 	CheckpointRecord,
@@ -46,6 +47,10 @@ export function initialState(taskId: string, contract: TaskContract): HarnessSta
 		contract,
 		contractVersion: contract.version,
 		revisions: [],
+		workspace: createWorkspaceState(contract.metadata.cwd ?? process.cwd(), {
+			allowedScopes: contract.workspace?.allowedScopes,
+			protectedResources: contract.workspace?.protectedResources,
+		}),
 		verifiedFacts: [],
 		hypotheses: [],
 		evidence: [],
@@ -175,8 +180,13 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 			return {
 				...state,
 				phase: action && !failed ? nextPhaseForAction(state.phase, action) : state.phase,
+				workspace:
+					action && !failed
+						? applyResourceEffects(state.workspace, action.actionSemantics.effects, action.id, event.at)
+						: state.workspace,
 				actions: updateAction(state.actions, p.actionId as string, {
 					outcome: failed ? "failed" : "succeeded",
+					stateVersion: state.stateVersion + 1,
 					...(typeof p.summary === "string" ? { resultSummary: p.summary } : {}),
 				}),
 			};
@@ -191,7 +201,8 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 			 */
 			const superseded = new Set(state.evidence.filter((e) => contradicts(e, added)).map((e) => e.id));
 			const evidence = supersede(state.evidence, superseded, added.id, added.observedAt);
-			return { ...state, evidence: [...evidence, added] };
+			const phase = state.phase === "completed" || state.phase === "abandoned" ? state.phase : "verify";
+			return { ...state, phase, evidence: [...evidence, added] };
 		}
 
 		case "evidence_superseded": {
@@ -326,21 +337,9 @@ function updateCheckpoint(
 
 function nextPhaseForAction(current: TaskPhase, action: RecordedAction): TaskPhase {
 	if (current === "completed" || current === "abandoned" || current === "finalize") return current;
-	if (!action.actionSemantics) {
-		return current === "active" || current === "gating" || current === "blocked" || current === "completing" ? "build" : current;
+	if (current === "compiling" || current === "reviewing" || current === "awaiting_user") return current;
+	if (action.actionSemantics.mutationType === "read" || action.actionSemantics.mutationType === "none") {
+		return current === "active" || current === "gating" || current === "blocked" || current === "completing" ? "plan" : current;
 	}
-	if (action.actionSemantics.capabilities.includes("run_tests")) return "verify";
-	if (
-		action.actionSemantics.capabilities.some(
-			(capability) =>
-				capability === "write_file" ||
-				capability === "delete_file" ||
-				capability === "move_file" ||
-				capability === "create_directory" ||
-				capability === "change_dependencies",
-		)
-	) {
-		return "build";
-	}
-	return current === "active" || current === "gating" || current === "blocked" || current === "completing" ? "build" : current;
+	return "execute";
 }

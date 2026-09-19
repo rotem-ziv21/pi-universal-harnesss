@@ -1,6 +1,19 @@
 import { existsSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, resolve } from "node:path";
 import type { TaskContract } from "../contract/schema.ts";
+import {
+	createWorkspaceState,
+	materializeResourceEffect,
+	registeredResource,
+	resourcePath,
+	resourceUri,
+} from "../resources/registry.ts";
+import type {
+	ResourceEffect,
+	ResourceKind,
+	ResourceOperation,
+	TaskWorkspaceState,
+} from "../resources/types.ts";
 import type { HarnessState } from "../state/types.ts";
 import type { ActionCapability, ActionSemantics, ActionType, ProposedAction } from "./types.ts";
 
@@ -10,31 +23,75 @@ export interface ActionSemanticContext {
 	readonly state?: HarnessState;
 }
 
+interface DraftEffect {
+	reference: string;
+	cwd: string;
+	kind: ResourceKind;
+	operation: ResourceOperation;
+	reversible: boolean;
+	external?: boolean;
+	metadata?: Readonly<Record<string, unknown>>;
+}
+
 interface Operation {
 	actionType: ActionType;
+	classification: ActionSemantics["classification"];
 	mutationType: ActionSemantics["mutationType"];
 	reversibility: ActionSemantics["reversibility"];
 	externalSideEffect: boolean;
 	capabilities: ActionCapability[];
 	operationText: string;
-	target?: string;
+	effects: DraftEffect[];
 }
 
-const PAYLOAD_KEYS: Record<string, true> = {
-	content: true,
-	newText: true,
-	oldText: true,
-	edits: true,
-	data: true,
-	body: true,
-	patch: true,
-	replacement: true,
+interface ShellSegment {
+	words: string[];
+	connector?: ";" | "&&" | "||" | "|";
+}
+
+interface DeclaredSemantics {
+	capabilities?: unknown;
+	effects?: unknown;
+	reversibility?: unknown;
+	externalSideEffect?: unknown;
+	operationText?: unknown;
+}
+
+const FILE_TOOL_NAMES: Record<string, "read" | "write" | "edit"> = {
+	read: "read",
+	read_file: "read",
+	write: "write",
+	create_file: "write",
+	write_file: "write",
+	edit: "edit",
+	apply_patch: "edit",
+	patch: "edit",
 };
 
-/**
- * Normalize a tool call by what the tool will do, not by words inside data it carries.
- * File contents, patches, request bodies and replacement text never enter classification.
- */
+const SHELL_TOOL_NAMES: Record<string, true> = {
+	bash: true,
+	shell: true,
+	sh: true,
+	zsh: true,
+	powershell: true,
+	exec: true,
+	command: true,
+};
+
+const MUTATING_CAPABILITIES: Partial<Record<ActionCapability, true>> = {
+	create_resource: true,
+	modify_resource: true,
+	delete_resource: true,
+	move_resource: true,
+	install_dependency: true,
+	commit: true,
+	mutate_remote: true,
+	publish: true,
+	deploy: true,
+	generate_artifact: true,
+};
+
+/** Normalize a tool call by adapter semantics, never by words inside payload data. */
 export function withActionSemantics(action: ProposedAction, context: ActionSemanticContext = {}): ProposedAction {
 	return { ...action, actionSemantics: classifyAction(action.toolName, action.input, context) };
 }
@@ -44,357 +101,472 @@ export function classifyAction(
 	input: Record<string, unknown>,
 	context: ActionSemanticContext = {},
 ): ActionSemantics {
+	const cwd = resolve(context.cwd ?? context.contract?.metadata.cwd ?? process.cwd());
+	const workspace =
+		context.state?.workspace ??
+		createWorkspaceState(cwd, {
+			allowedScopes: context.contract?.workspace?.allowedScopes,
+			protectedResources: context.contract?.workspace?.protectedResources,
+		});
 	const leaf = toolName.toLowerCase().split(/[.:/]/).at(-1) ?? toolName.toLowerCase();
-	const command = firstString(input, ["command", "cmd", "script"]);
+	const declared = declaredOperation(input, cwd, workspace);
 	let operation: Operation;
 
-	if (command && /^(bash|shell|sh|zsh|powershell|exec|command)$/.test(leaf)) {
-		operation = classifyShell(command);
-	} else if (/^(write|create_file|write_file)$/.test(leaf) || hasPayload(input, ["content", "newText", "replacement"])) {
-		const target = firstString(input, ["path", "file", "filePath", "target", "destination"]);
-		const absolute = resolveTarget(target, context.cwd);
-		const exists = absolute ? existsSync(absolute) : false;
-		operation = {
-			actionType: "file_write",
-			mutationType: exists ? "modify" : "create",
-			reversibility: "high",
-			externalSideEffect: false,
-			capabilities: ["write_file"],
-			operationText: `file_write${target ? ` ${target}` : ""}`,
-			...(target ? { target } : {}),
-		};
-	} else if (/^(edit|apply_patch|patch)$/.test(leaf) || hasPayload(input, ["edits", "patch", "oldText"])) {
-		const target = firstString(input, ["path", "file", "filePath", "target"]);
-		operation = {
-			actionType: "file_write",
-			mutationType: "modify",
-			reversibility: "high",
-			externalSideEffect: false,
-			capabilities: ["write_file"],
-			operationText: `file_write modify${target ? ` ${target}` : ""}`,
-			...(target ? { target } : {}),
-		};
-	} else if (/^(read|cat|read_file)$/.test(leaf)) {
-		const target = firstString(input, ["path", "file", "filePath", "target"]);
-		operation = readOperation(target);
+	if (declared) {
+		operation = declared;
+	} else if (SHELL_TOOL_NAMES[leaf]) {
+		const command = firstString(input, ["command", "cmd", "script"]);
+		operation = command ? classifyShell(command, cwd, workspace) : unknownOperation(`${leaf} missing command`);
+	} else if (FILE_TOOL_NAMES[leaf]) {
+		operation = classifyFileTool(FILE_TOOL_NAMES[leaf], input, cwd, workspace);
 	} else {
-		operation = classifyStructuredTool(leaf, input);
+		operation = unknownOperation(leaf.replace(/[-_]/g, " "));
 	}
 
-	const pathTarget = ["file_read", "file_write", "file_delete", "file_move", "directory_create", "local_command", "execute_local_code"].includes(
-		operation.actionType,
-	);
-	const normalizedTarget = pathTarget ? resolveTarget(operation.target, context.cwd) : operation.target;
-	const mutationType =
-		operation.actionType === "file_write" && normalizedTarget
-			? existsSync(normalizedTarget)
-				? "modify"
-				: "create"
-			: operation.mutationType;
-	const targetOwnership = operation.externalSideEffect ? "unknown" : ownershipOf(normalizedTarget, mutationType, context);
+	const effects = operation.effects.map((effect) => materializeResourceEffect({ ...effect, workspace }));
+	const primary = [...effects].sort((a, b) => effectRisk(b) - effectRisk(a))[0];
 	return {
-		...operation,
-		mutationType,
-		...(normalizedTarget ? { target: normalizedTarget } : {}),
-		targetOwnership,
+		actionType: operation.actionType,
+		classification: operation.classification,
+		mutationType: operation.mutationType,
 		reversibility:
-			operation.actionType === "file_delete" && targetOwnership === "task_created" ? "high" : operation.reversibility,
+			primary?.operation === "delete" && primary.provenance === "created_by_current_task"
+				? "high"
+				: operation.reversibility,
+		externalSideEffect: operation.externalSideEffect || effects.some((effect) => effect.external),
+		capabilities: unique(operation.capabilities),
+		effects,
+		...(primary ? { target: primary.uri } : {}),
+		targetProvenance: primary?.provenance ?? "unknown",
+		targetScope: primary?.scope ?? "unknown",
+		operationText: operation.operationText,
 	};
 }
 
-/** Safe text for contract matching. It contains active operations but no payload data. */
+/** Safe text for model prompts. It contains active operations but no payload data. */
 export function semanticActionText(action: ProposedAction): string {
 	const semantics = action.actionSemantics;
-	return [
-		semantics.actionType,
-		...semantics.capabilities,
-		semantics.operationText,
-		semantics.target ? basename(semantics.target) : "",
-	]
+	const path = semantics.target ? resourcePath(semantics.target) : undefined;
+	return [semantics.actionType, ...semantics.capabilities, semantics.operationText, path ? basename(path) : semantics.target ?? ""]
 		.filter(Boolean)
 		.join(" ")
 		.toLowerCase();
 }
 
 export function isSemanticMutation(action: ProposedAction): boolean {
-	return action.actionSemantics.mutationType !== "read" && action.actionSemantics.mutationType !== "none";
+	return action.actionSemantics.capabilities.some((capability) => MUTATING_CAPABILITIES[capability]);
 }
 
-function classifyStructuredTool(leaf: string, input: Record<string, unknown>): Operation {
+function classifyFileTool(
+	kind: "read" | "write" | "edit",
+	input: Record<string, unknown>,
+	cwd: string,
+	workspace: TaskWorkspaceState,
+): Operation {
 	const target = firstString(input, ["path", "file", "filePath", "target", "destination"]);
-	const safeArgs = Object.entries(input)
-		.filter(([key, value]) => !(key in PAYLOAD_KEYS) && typeof value === "string")
-		.map(([, value]) => String(value))
-		.join(" ");
-	const name = leaf.replace(/[-_]/g, " ");
+	if (!target) return unknownOperation(`${kind} missing resource`);
+	if (kind === "read") {
+		return resourceOperation("read", target, cwd, workspace, "file", "read_resource", true, `resource_read ${target}`);
+	}
+	const operation = kind === "edit" ? "modify" : writeOperation(target, cwd, workspace);
+	return resourceOperation(
+		operation,
+		target,
+		cwd,
+		workspace,
+		"file",
+		operation === "create" ? "create_resource" : "modify_resource",
+		true,
+		`resource_${operation} ${target}`,
+	);
+}
 
-	if (/\b(delete|remove|unlink|truncate)\b/.test(name)) {
-		return destructiveOperation(target, `${name}${target ? ` ${target}` : ""}`);
+function declaredOperation(input: Record<string, unknown>, cwd: string, workspace: TaskWorkspaceState): Operation | undefined {
+	const raw = input.harnessSemantics;
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const declaration = raw as DeclaredSemantics;
+	const capabilities = Array.isArray(declaration.capabilities)
+		? declaration.capabilities.filter(isActionCapability)
+		: [];
+	const effects: DraftEffect[] = [];
+	if (Array.isArray(declaration.effects)) {
+		for (const item of declaration.effects) {
+			if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+			const effect = item as Record<string, unknown>;
+			if (typeof effect.uri !== "string" || !isResourceOperation(effect.operation) || !isResourceKind(effect.kind)) continue;
+			effects.push({
+				reference: effect.uri,
+				cwd,
+				kind: effect.kind,
+				operation: effect.operation,
+				reversible: effect.reversible !== false,
+				external: effect.external === true,
+			});
+		}
 	}
-	if (/\b(push|publish|upload|send|submit|post)\b/.test(name)) {
-		return remoteOperation(`${name} ${safeArgs}`.trim(), target);
-	}
-	if (/\b(deploy|release)\b/.test(name)) {
-		return deploymentOperation(`${name} ${safeArgs}`.trim(), target);
-	}
-	if (/\b(install|dependency|package)\b/.test(name)) {
-		return dependencyOperation(`${name} ${safeArgs}`.trim(), target);
-	}
-	if (/\b(read|get|list|search|find|glob|inspect)\b/.test(name)) return readOperation(target);
+	const mutationType = mutationFromEffects(effects);
+	return {
+		actionType: effects.some((effect) => effect.external) ? "external_mutation" : effects.length > 0 ? "resource_mutation" : "local_execution",
+		classification: "declared",
+		mutationType,
+		reversibility: isReversibility(declaration.reversibility) ? declaration.reversibility : "medium",
+		externalSideEffect: declaration.externalSideEffect === true || effects.some((effect) => effect.external),
+		capabilities,
+		operationText: typeof declaration.operationText === "string" ? declaration.operationText : "declared tool operation",
+		effects,
+	};
+}
 
+function classifyShell(command: string, initialCwd: string, workspace: TaskWorkspaceState): Operation {
+	const segments = shellSegments(command);
+	const operations: Operation[] = [];
+	let cwd = initialCwd;
+	for (const segment of segments) {
+		const commandWords = commandWordsWithoutRedirections(segment.words);
+		const program = executableName(commandWords);
+		if (program === "cd") {
+			const destination = commandWords[1];
+			if (destination && destination !== "-" && (segment.connector === "&&" || segment.connector === ";")) {
+				cwd = resolve(cwd, destination);
+			}
+			continue;
+		}
+		operations.push(classifyCommandSegment(segment.words, cwd, workspace));
+	}
+	if (operations.length === 0) return localExecution("shell command");
+	const primary = [...operations].sort((a, b) => operationRisk(b) - operationRisk(a))[0]!;
+	return {
+		...primary,
+		classification: operations.some((operation) => operation.classification === "unknown") ? "unknown" : "known",
+		externalSideEffect: operations.some((operation) => operation.externalSideEffect),
+		capabilities: unique(operations.flatMap((operation) => operation.capabilities)),
+		effects: operations.flatMap((operation) => operation.effects),
+		operationText: operations.map((operation) => operation.operationText).join("; "),
+	};
+}
+
+function classifyCommandSegment(words: string[], cwd: string, workspace: TaskWorkspaceState): Operation {
+	const redirections = redirectionOperations(words, cwd, workspace);
+	const clean = commandWordsWithoutRedirections(words);
+	if (clean.length === 0) return combineOperation(localExecution("shell redirection"), redirections);
+	let cursor = 0;
+	while (["sudo", "command", "env"].includes(clean[cursor] ?? "")) cursor++;
+	const program = basename(clean[cursor] ?? "").toLowerCase();
+	const args = clean.slice(cursor + 1);
+	let operation: Operation;
+
+	if (["bash", "sh", "zsh"].includes(program) && args[0] === "-c" && args[1]) {
+		operation = classifyShell(args[1], cwd, workspace);
+	} else if (["rm", "rmdir", "unlink", "shred", "srm"].includes(program) || (program === "find" && args.includes("-delete"))) {
+		const targets = program === "find" ? [args.find((arg) => !arg.startsWith("-"))].filter(isString) : pathArguments(args);
+		operation = multiResourceOperation("delete", targets, cwd, workspace, "file", "delete_resource", false, `${program} delete`);
+	} else if (program === "mkdir") {
+		operation = multiResourceOperation("create", pathArguments(args), cwd, workspace, "directory", "create_resource", true, "directory create");
+	} else if (program === "touch") {
+		const targets = pathArguments(args);
+		operation = multiWriteOperation(targets, cwd, workspace, "file", "touch");
+	} else if (program === "tee") {
+		const targets = pathArguments(args);
+		operation = multiWriteOperation(targets, cwd, workspace, "file", "tee output");
+	} else if (program === "mv" || program === "cp") {
+		const targets = pathArguments(args);
+		const destination = targets.at(-1);
+		operation = destination
+			? resourceOperation(
+				writeOperation(destination, cwd, workspace),
+				destination,
+				cwd,
+				workspace,
+				"file",
+				program === "mv" ? "move_resource" : "create_resource",
+				program === "cp",
+				program === "mv" ? "resource move" : "resource copy",
+			)
+			: unknownOperation(`${program} missing destination`);
+	} else if (program === "git" && args[0] === "prune") {
+		operation = resourceOperation(
+			"delete",
+			"vcs:unreachable-objects",
+			cwd,
+			workspace,
+			"vcs_ref",
+			"delete_resource",
+			false,
+			"version-control prune",
+		);
+	} else if (program === "docker" && args[0] === "system" && args[1] === "prune") {
+		operation = resourceOperation(
+			"delete",
+			"runtime:unused-container-resources",
+			cwd,
+			workspace,
+			"remote_resource",
+			"delete_resource",
+			false,
+			"container-runtime prune",
+		);
+	} else if (program === "git" && args[0] === "push") {
+		operation = externalOperation("publish", "git push", ["mutate_remote", "publish"]);
+	} else if (program === "git" && args[0] === "commit") {
+		operation = localExecution("version-control commit", ["commit"], "medium");
+	} else if (isDependencyCommand(program, args)) {
+		operation = localExecution("dependency installation", ["install_dependency"], "medium");
+	} else if (isDeployCommand(program, args)) {
+		operation = externalOperation("deploy", `${program} deployment`, ["deploy", "mutate_remote"]);
+	} else if (program === "curl" || program === "wget") {
+		const endpoint = args.find((arg) => /^https?:\/\//i.test(arg));
+		const mutating =
+			args.some((arg, index) => /^(?:-x|--request)$/i.test(arg) && /^(?:post|put|patch|delete)$/i.test(args[index + 1] ?? "")) ||
+			args.some((arg) => /^(?:--data|-d|--upload-file|-t)$/i.test(arg));
+		operation = mutating
+			? externalOperation("modify", `${program} remote mutation`, ["mutate_remote"], endpoint)
+			: endpoint
+				? resourceOperation("read", endpoint, cwd, workspace, "remote_resource", "query_resource", true, `${program} remote query`)
+				: localExecution(`${program} request`, ["query_resource"]);
+	} else if (["cat", "head", "tail", "less", "more", "stat", "wc", "grep", "rg", "find"].includes(program)) {
+		const target = pathArguments(args).at(-1);
+		operation = target
+			? resourceOperation("read", target, cwd, workspace, "file", "read_resource", true, `${program} resource read`)
+			: localExecution(`${program} query`, ["query_resource"]);
+	} else {
+		operation = localExecution(`execute ${program || "command"}`);
+	}
+	return combineOperation(operation, redirections);
+}
+
+function redirectionOperations(words: string[], cwd: string, workspace: TaskWorkspaceState): Operation[] {
+	const operations: Operation[] = [];
+	for (let index = 0; index < words.length; index++) {
+		const token = words[index]!;
+		const match = /^(\d*)(>>?|<)(?:&(\d+|-))?$/.exec(token);
+		if (!match) continue;
+		if (match[3] !== undefined) continue;
+		const target = words[index + 1];
+		if (!target || isControlToken(target) || isRedirectionToken(target)) continue;
+		const input = match[2] === "<";
+		if (input) {
+			operations.push(resourceOperation("read", target, cwd, workspace, "file", "read_resource", true, "input redirection"));
+		} else {
+			const write = writeOperation(target, cwd, workspace);
+			operations.push(
+				resourceOperation(
+					write,
+					target,
+					cwd,
+					workspace,
+					"file",
+					write === "create" ? "create_resource" : "modify_resource",
+					true,
+					"output redirection",
+				),
+			);
+		}
+	}
+	return operations;
+}
+
+function commandWordsWithoutRedirections(words: string[]): string[] {
+	const clean: string[] = [];
+	for (let index = 0; index < words.length; index++) {
+		const token = words[index]!;
+		if (!isRedirectionToken(token)) {
+			clean.push(token);
+			continue;
+		}
+		if (!/^(\d*)(>>?|<)&(\d+|-)$/.test(token)) index++;
+	}
+	return clean;
+}
+
+function resourceOperation(
+	operation: ResourceOperation,
+	reference: string,
+	cwd: string,
+	_workspace: TaskWorkspaceState,
+	kind: ResourceKind,
+	capability: ActionCapability,
+	reversible: boolean,
+	operationText: string,
+	external = false,
+): Operation {
+	return {
+		actionType: external ? "external_mutation" : operation === "read" || operation === "query" ? "resource_read" : "resource_mutation",
+		classification: "known",
+		mutationType: mutationTypeFor(operation),
+		reversibility: reversible ? "high" : "low",
+		externalSideEffect: external,
+		capabilities: [capability],
+		operationText,
+		effects: [{ reference, cwd, kind, operation, reversible, external }],
+	};
+}
+
+function multiResourceOperation(
+	operation: ResourceOperation,
+	targets: string[],
+	cwd: string,
+	workspace: TaskWorkspaceState,
+	kind: ResourceKind,
+	capability: ActionCapability,
+	reversible: boolean,
+	operationText: string,
+): Operation {
+	if (targets.length === 0) return unknownOperation(`${operationText} missing target`);
+	const first = resourceOperation(operation, targets[0]!, cwd, workspace, kind, capability, reversible, operationText);
+	return {
+		...first,
+		effects: targets.map((reference) => ({ reference, cwd, kind, operation, reversible })),
+		operationText: `${operationText} ${targets.join(" ")}`,
+	};
+}
+
+function multiWriteOperation(
+	targets: string[],
+	cwd: string,
+	workspace: TaskWorkspaceState,
+	kind: ResourceKind,
+	operationText: string,
+): Operation {
+	if (targets.length === 0) return unknownOperation(`${operationText} missing target`);
+	const effects = targets.map((reference) => {
+		const operation = writeOperation(reference, cwd, workspace);
+		return { reference, cwd, kind, operation, reversible: true } satisfies DraftEffect;
+	});
+	return {
+		actionType: "resource_mutation",
+		classification: "known",
+		mutationType: effects.some((effect) => effect.operation === "modify") ? "modify" : "create",
+		reversibility: "high",
+		externalSideEffect: false,
+		capabilities: unique(
+			effects.map((effect) => (effect.operation === "create" ? "create_resource" : "modify_resource")),
+		),
+		operationText,
+		effects,
+	};
+}
+
+function externalOperation(
+	operation: "modify" | "publish" | "deploy",
+	operationText: string,
+	capabilities: ActionCapability[],
+	target = `external:${operationText.replace(/\s+/g, "-")}`,
+): Operation {
+	return {
+		actionType: "external_mutation",
+		classification: "known",
+		mutationType: "modify",
+		reversibility: "low",
+		externalSideEffect: true,
+		capabilities,
+		operationText,
+		effects: [{ reference: target, cwd: process.cwd(), kind: operation === "deploy" ? "deployment" : "remote_resource", operation, reversible: false, external: true }],
+	};
+}
+
+function localExecution(
+	operationText: string,
+	capabilities: ActionCapability[] = ["execute_code"],
+	reversibility: ActionSemantics["reversibility"] = "high",
+): Operation {
+	return {
+		actionType: "local_execution",
+		classification: "known",
+		mutationType: "execute",
+		reversibility,
+		externalSideEffect: false,
+		capabilities,
+		operationText,
+		effects: [],
+	};
+}
+
+function unknownOperation(operationText: string): Operation {
 	return {
 		actionType: "unknown",
+		classification: "unknown",
 		mutationType: "none",
 		reversibility: "medium",
 		externalSideEffect: false,
 		capabilities: [],
-		operationText: `${name}${target ? ` ${target}` : ""}`,
-		...(target ? { target } : {}),
-	};
-}
-
-function classifyShell(command: string): Operation {
-	const segments = shellSegments(command);
-	const operations = segments.map(classifyCommandSegment);
-	if (operations.length === 0) return localCommand("shell command");
-	operations.sort((a, b) => riskRank(b) - riskRank(a));
-	const primary = operations[0]!;
-	const capabilities = [...new Set(operations.flatMap((item) => item.capabilities))];
-	return {
-		...primary,
-		capabilities,
-		externalSideEffect: operations.some((item) => item.externalSideEffect),
-		operationText: operations.map((item) => item.operationText).join("; "),
-	};
-}
-
-function classifyCommandSegment(words: string[]): Operation {
-	if (words.length === 0) return localCommand("shell command");
-	let cursor = 0;
-	while (words[cursor] === "sudo" || words[cursor] === "command" || words[cursor] === "env") cursor++;
-	const program = basename(words[cursor] ?? "").toLowerCase();
-	const args = words.slice(cursor + 1);
-
-	if ((program === "bash" || program === "sh" || program === "zsh") && args[0] === "-c" && args[1]) {
-		return classifyShell(args[1]);
-	}
-	if (["rm", "rmdir", "unlink", "shred", "srm"].includes(program) || (program === "find" && args.includes("-delete"))) {
-		const target = lastTarget(args);
-		return destructiveOperation(target, `${program} delete${target ? ` ${target}` : ""}`);
-	}
-	if ((program === "git" && args[0] === "prune") || (program === "docker" && args[0] === "system" && args[1] === "prune")) {
-		return destructiveOperation(undefined, `${program} destructive prune`);
-	}
-	if (program === "git" && args[0] === "push") return remoteOperation("git push", args.at(-1));
-	if (program === "git" && args[0] === "commit") {
-		return {
-			actionType: "git_commit",
-			mutationType: "modify",
-			reversibility: "medium",
-			externalSideEffect: false,
-			capabilities: ["commit_git"],
-			operationText: "git commit",
-		};
-	}
-	if (isDependencyCommand(program, args)) return dependencyOperation(`${program} ${args[0] ?? "install"}`, dependencyTarget(args));
-	if (isDeployCommand(program, args)) return deploymentOperation(`${program} ${args.slice(0, 2).join(" ")}`.trim());
-	if (isDatabaseMutation(program, args)) {
-		return {
-			actionType: "database_mutation",
-			mutationType: "modify",
-			reversibility: "low",
-			externalSideEffect: true,
-			capabilities: ["mutate_database"],
-			operationText: `${program} database mutation`,
-		};
-	}
-	if (program === "curl" || program === "wget") {
-		const mutating = args.some((arg, index) => /^(-x|--request)$/i.test(arg) && /^(post|put|patch|delete)$/i.test(args[index + 1] ?? "")) ||
-			args.some((arg) => /^(--data|-d|--upload-file|-t)$/i.test(arg));
-		return mutating ? remoteOperation(`${program} remote mutation`, args.find((arg) => /^https?:\/\//i.test(arg))) : readOperation(args.find((arg) => /^https?:\/\//i.test(arg)));
-	}
-	if (["touch", "tee"].includes(program) || words.includes(">") || words.includes(">>")) {
-		const redirection = words.findIndex((word) => word === ">" || word === ">>");
-		const target = redirection >= 0 ? words[redirection + 1] : lastTarget(args);
-		return {
-			actionType: "file_write",
-			mutationType: "modify",
-			reversibility: "high",
-			externalSideEffect: false,
-			capabilities: ["write_file"],
-			operationText: `file_write${target ? ` ${target}` : ""}`,
-			...(target ? { target } : {}),
-		};
-	}
-	if (["cat", "head", "tail", "less", "more", "stat", "wc", "grep", "rg", "ls", "find"].includes(program)) {
-		return readOperation(lastTarget(args));
-	}
-	if (program === "mkdir") {
-		const target = lastTarget(args);
-		return {
-			actionType: "directory_create",
-			mutationType: "create",
-			reversibility: "high",
-			externalSideEffect: false,
-			capabilities: ["create_directory"],
-			operationText: `directory_create${target ? ` ${target}` : ""}`,
-			...(target ? { target } : {}),
-		};
-	}
-	if (["mv", "cp"].includes(program)) {
-		const target = lastTarget(args);
-		return {
-			actionType: "file_move",
-			mutationType: "modify",
-			reversibility: "medium",
-			externalSideEffect: false,
-			capabilities: [program === "mv" ? "move_file" : "write_file"],
-			operationText: `${program === "mv" ? "file_move" : "file_write"}${target ? ` ${target}` : ""}`,
-			...(target ? { target } : {}),
-		};
-	}
-
-	const tests = isTestCommand(program, args);
-	return {
-		actionType: "execute_local_code",
-		mutationType: "execute",
-		reversibility: "high",
-		externalSideEffect: false,
-		capabilities: tests ? ["execute_local_code", "run_tests"] : ["execute_local_code"],
-		operationText: `${tests ? "run_tests" : "execute_local_code"} ${program}${lastTarget(args) ? ` ${lastTarget(args)}` : ""}`,
-		...(lastTarget(args) ? { target: lastTarget(args) } : {}),
-	};
-}
-
-function ownershipOf(
-	target: string | undefined,
-	mutationType: ActionSemantics["mutationType"],
-	context: ActionSemanticContext,
-): ActionSemantics["targetOwnership"] {
-	if (!target) return "unknown";
-	const cwd = context.cwd ? resolve(context.cwd) : undefined;
-	if (cwd && isOutside(target, cwd)) return "outside_scope";
-
-	const roots = taskOwnedRoots(context.state, cwd);
-	if (roots.some((root) => !isOutside(target, root))) return "task_created";
-	if (requiresSingleTaskFolder(context.contract) && roots.length > 0) return "outside_scope";
-	if (existsSync(target)) return "preexisting";
-	if (mutationType === "create" || mutationType === "modify") return "task_created";
-	return "unknown";
-}
-
-function taskOwnedRoots(state: HarnessState | undefined, cwd: string | undefined): string[] {
-	if (!state) return [];
-	const roots = new Set<string>();
-	for (const action of state.actions) {
-		const semantics = action.actionSemantics;
-		if (action.outcome !== "succeeded" || !semantics?.target || semantics.targetOwnership !== "task_created") continue;
-		const target = semantics.actionType === "directory_create" ? semantics.target : dirname(semantics.target);
-		if (!cwd || isOutside(target, cwd)) continue;
-		const rel = relative(cwd, target);
-		const first = rel.split(sep)[0];
-		if (first && first !== ".") roots.add(resolve(cwd, first));
-	}
-	return [...roots];
-}
-
-function requiresSingleTaskFolder(contract: TaskContract | undefined): boolean {
-	if (!contract) return false;
-	const text = [contract.originalRequest, ...contract.constraints.map((constraint) => constraint.description)].join(" ");
-	return /(?:outside|only (?:in|inside|within)).{0,50}(?:new |task[- ]owned )?(?:task )?(?:folder|directory)/i.test(text);
-}
-
-function resolveTarget(target: string | undefined, cwd: string | undefined): string | undefined {
-	if (!target || /^https?:\/\//i.test(target)) return target;
-	if (!cwd) return isAbsolute(target) ? resolve(target) : target;
-	return isAbsolute(target) ? resolve(target) : resolve(cwd, target);
-}
-
-function isOutside(target: string, root: string): boolean {
-	if (/^https?:\/\//i.test(target)) return false;
-	const rel = relative(root, target);
-	return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
-}
-
-function readOperation(target?: string): Operation {
-	return {
-		actionType: "file_read",
-		mutationType: "read",
-		reversibility: "high",
-		externalSideEffect: false,
-		capabilities: ["read_file"],
-		operationText: `file_read${target ? ` ${target}` : ""}`,
-		...(target ? { target } : {}),
-	};
-}
-
-function destructiveOperation(target: string | undefined, operationText: string): Operation {
-	return {
-		actionType: "file_delete",
-		mutationType: "delete",
-		reversibility: "low",
-		externalSideEffect: false,
-		capabilities: ["delete_file"],
 		operationText,
-		...(target ? { target } : {}),
+		effects: [],
 	};
 }
 
-function remoteOperation(operationText: string, target?: string): Operation {
+function combineOperation(primary: Operation, additions: Operation[]): Operation {
+	if (additions.length === 0) return primary;
+	const operations = [primary, ...additions];
+	const riskiest = [...operations].sort((a, b) => operationRisk(b) - operationRisk(a))[0]!;
 	return {
-		actionType: "remote_mutation",
-		mutationType: "modify",
-		reversibility: "low",
-		externalSideEffect: true,
-		capabilities: ["mutate_remote"],
-		operationText,
-		...(target ? { target } : {}),
+		...riskiest,
+		classification: operations.some((operation) => operation.classification === "unknown") ? "unknown" : "known",
+		externalSideEffect: operations.some((operation) => operation.externalSideEffect),
+		capabilities: unique(operations.flatMap((operation) => operation.capabilities)),
+		effects: operations.flatMap((operation) => operation.effects),
+		operationText: operations.map((operation) => operation.operationText).join("; "),
 	};
 }
 
-function deploymentOperation(operationText: string, target?: string): Operation {
-	return {
-		actionType: "deployment",
-		mutationType: "modify",
-		reversibility: "low",
-		externalSideEffect: true,
-		capabilities: ["deploy", "mutate_remote"],
-		operationText,
-		...(target ? { target } : {}),
-	};
+function writeOperation(reference: string, cwd: string, workspace: TaskWorkspaceState): "create" | "modify" {
+	const uri = resourceUri(reference, cwd);
+	const registered = registeredResource(uri, workspace);
+	if (registered?.status === "active") return "modify";
+	const path = resourcePath(uri);
+	return path && existsSync(path) ? "modify" : "create";
 }
 
-function dependencyOperation(operationText: string, target?: string): Operation {
-	return {
-		actionType: "dependency_change",
-		mutationType: "modify",
-		reversibility: "medium",
-		externalSideEffect: false,
-		capabilities: ["change_dependencies"],
-		operationText,
-		...(target ? { target } : {}),
-	};
+function effectRisk(effect: ResourceEffect): number {
+	if (effect.external) return 100;
+	if (effect.scope === "protected") return 95;
+	if (effect.scope === "outside_allowed") return 90;
+	if (effect.operation === "delete" && effect.provenance === "preexisting") return 85;
+	if (effect.operation === "delete") return 60;
+	if (["create", "modify", "move"].includes(effect.operation)) return 40;
+	return 10;
 }
 
-function localCommand(operationText: string): Operation {
-	return {
-		actionType: "local_command",
-		mutationType: "execute",
-		reversibility: "high",
-		externalSideEffect: false,
-		capabilities: ["execute_local_code"],
-		operationText,
-	};
-}
-
-function riskRank(operation: Operation): number {
+function operationRisk(operation: Operation): number {
 	if (operation.externalSideEffect) return 100;
-	if (operation.actionType === "file_delete") return 90;
-	if (operation.actionType === "git_commit") return 80;
-	if (operation.actionType === "dependency_change") return 70;
+	if (operation.capabilities.includes("delete_resource")) return 90;
+	if (operation.reversibility === "low") return 80;
 	if (operation.mutationType === "modify" || operation.mutationType === "create") return 60;
 	if (operation.mutationType === "execute") return 30;
 	return 10;
+}
+
+function mutationTypeFor(operation: ResourceOperation): ActionSemantics["mutationType"] {
+	if (operation === "create") return "create";
+	if (operation === "delete") return "delete";
+	if (operation === "read" || operation === "query") return "read";
+	if (operation === "execute") return "execute";
+	return "modify";
+}
+
+function mutationFromEffects(effects: DraftEffect[]): ActionSemantics["mutationType"] {
+	if (effects.some((effect) => effect.operation === "delete")) return "delete";
+	if (effects.some((effect) => effect.operation === "modify" || effect.operation === "move" || effect.operation === "publish" || effect.operation === "deploy")) return "modify";
+	if (effects.some((effect) => effect.operation === "create")) return "create";
+	if (effects.some((effect) => effect.operation === "read" || effect.operation === "query")) return "read";
+	return "none";
+}
+
+function pathArguments(args: string[]): string[] {
+	return args.filter((arg) => arg.length > 0 && !arg.startsWith("-") && !isControlToken(arg) && !isRedirectionToken(arg));
+}
+
+function executableName(words: string[]): string {
+	let cursor = 0;
+	while (["sudo", "command", "env"].includes(words[cursor] ?? "")) cursor++;
+	return basename(words[cursor] ?? "").toLowerCase();
+}
+
+function firstString(input: Record<string, unknown>, keys: readonly string[]): string | undefined {
+	for (const key of keys) {
+		const value = input[key];
+		if (typeof value === "string" && value.trim()) return value.trim();
+	}
+	return undefined;
 }
 
 function isDependencyCommand(program: string, args: string[]): boolean {
@@ -407,47 +579,15 @@ function isDependencyCommand(program: string, args: string[]): boolean {
 	);
 }
 
-function dependencyTarget(args: string[]): string | undefined {
-	return args.find((arg, index) => index > 0 && !arg.startsWith("-"));
-}
-
 function isDeployCommand(program: string, args: string[]): boolean {
-	return ["deploy", "vercel", "netlify", "flyctl", "kubectl", "helm", "terraform"].includes(program) ||
-		(program === "npm" && ["publish"].includes(args[0] ?? "")) ||
-		(program === "git" && ["tag"].includes(args[0] ?? ""));
+	return (
+		["deploy", "vercel", "netlify", "flyctl", "kubectl", "helm", "terraform"].includes(program) ||
+		(program === "npm" && args[0] === "publish")
+	);
 }
 
-function isDatabaseMutation(program: string, args: string[]): boolean {
-	if (!["psql", "mysql", "sqlite3", "mongosh", "redis-cli"].includes(program)) return false;
-	return args.some((arg) => /\b(insert|update|delete|drop|alter|truncate|create|set|del|flush)\b/i.test(arg));
-}
-
-function isTestCommand(program: string, args: string[]): boolean {
-	if (/^(pytest|jest|vitest|mocha|ava)$/.test(program)) return true;
-	if (["npm", "pnpm", "yarn", "bun"].includes(program) && args.some((arg) => /^(test|check)$/.test(arg))) return true;
-	if (/^(python|python3)$/.test(program) && (args.includes("-m") && args.some((arg) => /^(unittest|pytest)$/.test(arg)))) return true;
-	return args.some((arg) => /(^|[/_.-])(tests?|spec)([/_.-]|$)/i.test(arg));
-}
-
-function lastTarget(args: string[]): string | undefined {
-	return [...args].reverse().find((arg) => arg && !arg.startsWith("-") && !/^(2?>|&&|\|\||\|)$/.test(arg));
-}
-
-function firstString(input: Record<string, unknown>, keys: readonly string[]): string | undefined {
-	for (const key of keys) {
-		const value = input[key];
-		if (typeof value === "string" && value.trim()) return value.trim();
-	}
-	return undefined;
-}
-
-function hasPayload(input: Record<string, unknown>, keys: readonly string[]): boolean {
-	return keys.some((key) => key in input && input[key] !== undefined);
-}
-
-/** Small shell lexer: enough to identify active programs without interpreting payload strings. */
-function shellSegments(command: string): string[][] {
-	const segments: string[][] = [];
+function shellSegments(command: string): ShellSegment[] {
+	const segments: ShellSegment[] = [];
 	let words: string[] = [];
 	let current = "";
 	let quote: "'" | '"' | undefined;
@@ -456,14 +596,14 @@ function shellSegments(command: string): string[][] {
 		if (current) words.push(current);
 		current = "";
 	};
-	const flushSegment = () => {
+	const flushSegment = (connector?: ShellSegment["connector"]) => {
 		flushWord();
-		if (words.length > 0) segments.push(words);
+		if (words.length > 0) segments.push({ words, ...(connector ? { connector } : {}) });
 		words = [];
 	};
 
-	for (let i = 0; i < command.length; i++) {
-		const char = command[i]!;
+	for (let index = 0; index < command.length; index++) {
+		const char = command[index]!;
 		if (escaped) {
 			current += char;
 			escaped = false;
@@ -486,26 +626,93 @@ function shellSegments(command: string): string[][] {
 			flushWord();
 			continue;
 		}
-		const pair = command.slice(i, i + 2);
+		const pair = command.slice(index, index + 2);
 		if (pair === "&&" || pair === "||") {
-			flushSegment();
-			i++;
+			flushSegment(pair);
+			index++;
 			continue;
 		}
 		if (char === ";" || char === "|") {
-			flushSegment();
+			flushSegment(char);
 			continue;
 		}
-		if (char === ">") {
-			flushWord();
-			if (command[i + 1] === ">") {
-				words.push(">>");
-				i++;
-			} else words.push(">");
+		if (char === ">" || char === "<") {
+			let prefix = "";
+			if (/^\d+$/.test(current)) {
+				prefix = current;
+				current = "";
+			} else {
+				flushWord();
+			}
+			let operator = `${prefix}${char}`;
+			if (char === ">" && command[index + 1] === ">") {
+				operator += ">";
+				index++;
+			}
+			if (command[index + 1] === "&") {
+				operator += "&";
+				index++;
+				while (/\d|-/.test(command[index + 1] ?? "")) {
+					operator += command[++index];
+				}
+			}
+			words.push(operator);
 			continue;
 		}
 		current += char;
 	}
 	flushSegment();
 	return segments;
+}
+
+function isRedirectionToken(token: string): boolean {
+	return /^(\d*)(>>?|<)(?:&(\d+|-))?$/.test(token);
+}
+
+function isControlToken(token: string): boolean {
+	return token === ";" || token === "&&" || token === "||" || token === "|";
+}
+
+function isString(value: string | undefined): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function unique<T>(values: readonly T[]): T[] {
+	return [...new Set(values)];
+}
+
+function isReversibility(value: unknown): value is ActionSemantics["reversibility"] {
+	return value === "high" || value === "medium" || value === "low";
+}
+
+function isActionCapability(value: unknown): value is ActionCapability {
+	return (
+		typeof value === "string" &&
+		[
+			"read_resource",
+			"create_resource",
+			"modify_resource",
+			"delete_resource",
+			"move_resource",
+			"query_resource",
+			"execute_code",
+			"install_dependency",
+			"commit",
+			"mutate_remote",
+			"publish",
+			"deploy",
+			"generate_artifact",
+		].includes(value)
+	);
+}
+
+function isResourceOperation(value: unknown): value is ResourceOperation {
+	return typeof value === "string" && ["read", "create", "modify", "delete", "move", "execute", "query", "publish", "deploy"].includes(value);
+}
+
+function isResourceKind(value: unknown): value is ResourceKind {
+	return (
+		typeof value === "string" &&
+		["file", "directory", "vcs_ref", "api_object", "database_record", "deployment", "artifact", "remote_resource", "unknown"].includes(value)
+	);
 }
