@@ -127,18 +127,56 @@ if [ "$(uname -s)" = "Linux" ] && { [ -f /.dockerenv ] || [ -f /run/.containeren
 fi
 
 # --- secrets ------------------------------------------------------------------
+#
+# The key is resolved the same way the harness resolves it at runtime: Pi's own
+# credential store first (what /login writes), then the environment, then the
+# harness's local store. An earlier version of this script only knew about the last
+# two and reported a confident FAIL while /login had the key all along.
+#
+# Nothing here ever prints the key.
+
 SECRETS_FILE="$HARNESS_STATE_DIR/secrets.json"
+PI_AUTH_FILE="$AGENT_DIR/auth.json"
 KEY_SOURCE="none"
-if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-  KEY_SOURCE="env"
-  pass "OpenRouter API key" "set in the environment (${OPENROUTER_API_KEY:0:5}…${OPENROUTER_API_KEY: -4})"
-elif [ -f "$SECRETS_FILE" ]; then
-  KEY_SOURCE="store"
-  pass "OpenRouter API key" "present in the local secret store"
-else
-  fail "OpenRouter API key" "not configured"
-  fix "export OPENROUTER_API_KEY=\"sk-or-v1-…\"  or run /harness setup inside Pi."
+OPENROUTER_KEY=""
+
+# 1. Pi's own credential store.
+if [ -f "$PI_AUTH_FILE" ] && command -v node >/dev/null 2>&1; then
+  OPENROUTER_KEY="$(node -e '
+    try {
+      const a = require(process.argv[1]).openrouter;
+      if (!a) process.exit(0);
+      // API-key providers store the key; OAuth ones store an access token.
+      const k = a.key || a.apiKey || a.access || (typeof a === "string" ? a : "");
+      process.stdout.write(typeof k === "string" ? k : "");
+    } catch {}
+  ' "$PI_AUTH_FILE" 2>/dev/null || true)"
+  [ -n "$OPENROUTER_KEY" ] && KEY_SOURCE="pi"
 fi
+
+# 2. The environment.
+if [ -z "$OPENROUTER_KEY" ] && [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  OPENROUTER_KEY="$OPENROUTER_API_KEY"
+  KEY_SOURCE="env"
+fi
+
+# 3. The harness's own store.
+if [ -z "$OPENROUTER_KEY" ] && [ -f "$SECRETS_FILE" ] && command -v node >/dev/null 2>&1; then
+  OPENROUTER_KEY="$(node -e '
+    try { process.stdout.write(require(process.argv[1])?.secrets?.OPENROUTER_API_KEY || ""); } catch {}
+  ' "$SECRETS_FILE" 2>/dev/null || true)"
+  [ -n "$OPENROUTER_KEY" ] && KEY_SOURCE="store"
+fi
+
+case "$KEY_SOURCE" in
+  pi)    pass "OpenRouter API key" "configured in Pi's own credentials (/login)" ;;
+  env)   pass "OpenRouter API key" "set in the environment" ;;
+  store) pass "OpenRouter API key" "present in the harness secret store" ;;
+  none)
+    fail "OpenRouter API key" "not configured in Pi, the environment, or the harness store"
+    fix "Run /login inside Pi and choose OpenRouter. The harness reads the key Pi stores."
+    fix "Alternatives: export OPENROUTER_API_KEY, or run /harness setup." ;;
+esac
 
 if [ -f "$SECRETS_FILE" ]; then
   if [ "$(uname -s)" != "Darwin" ] && [ "$(uname -s)" != "Linux" ]; then
@@ -192,11 +230,11 @@ fi
 
 ENDPOINT="${BASE_URL%/}$DECISIONS_PATH"
 
-if [ "$KEY_SOURCE" = "env" ] && command -v curl >/dev/null 2>&1; then
+if [ -n "$OPENROUTER_KEY" ] && command -v curl >/dev/null 2>&1; then
   # A real decisions round trip. Jev is a decisions model, so hitting /v1/models
   # would prove nothing about whether the path we actually use works.
   RESPONSE="$(curl -s -m 20 -w '\n%{http_code}' -X POST "$ENDPOINT" \
-    -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+    -H "Authorization: Bearer $OPENROUTER_KEY" \
     -H "Content-Type: application/json" \
     -H "X-Title: Pi Universal Harness (doctor)" \
     -d "{\"model\":\"$MODEL\",\"state\":\"connectivity self-test\",\"questions\":{\"healthcheck\":{\"type\":\"noul\",\"instructions\":\"Is this a self-test message?\"}}}" 2>/dev/null)"
@@ -226,9 +264,6 @@ if [ "$KEY_SOURCE" = "env" ] && command -v curl >/dev/null 2>&1; then
     *)
       fail "Judge connectivity" "HTTP $STATUS from $ENDPOINT" ;;
   esac
-elif [ "$KEY_SOURCE" = "store" ]; then
-  warn "Judge connectivity" "the key is in the local store; this script does not read it"
-  fix "Run /harness doctor inside Pi for a full connectivity check."
 else
   warn "Judge connectivity" "skipped — no API key available to this shell"
 fi
