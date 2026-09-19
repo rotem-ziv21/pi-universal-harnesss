@@ -6,9 +6,13 @@ secrets.json
 !.env.example
 
 # --- Local harness state (machine-local, never shared) ---
-state/
-.harness-state/
-*.jsonl
+# Anchored with a leading slash so these match ONLY at the repository root.
+# An unanchored `state/` also matches `src/state/`, which silently excluded the
+# entire canonical-state module from the repo: it worked locally, where the files
+# exist, and every fresh clone failed to load the extension.
+/state/
+/.harness-state/
+/*.jsonl
 
 # --- Node ---
 node_modules/
