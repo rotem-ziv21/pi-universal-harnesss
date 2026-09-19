@@ -66,6 +66,13 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 		...(request.example !== undefined ? ["", "A valid example:", JSON.stringify(request.example, null, 2)] : []),
 	].join("\n");
 
+	log?.debug("structured output: request", {
+		model: adapter.id,
+		systemPromptChars: systemPrompt.length,
+		userPromptChars: request.userPrompt.length,
+		userPrompt: clamp(request.userPrompt, 2000),
+	});
+
 	let userPrompt = request.userPrompt;
 	let lastError = "";
 	let totalUsage: { input?: number; output?: number } | undefined;
@@ -81,6 +88,7 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 		 * still cancels immediately while a stalled model cannot hold the session open
 		 * forever.
 		 */
+		const attemptStarted = Date.now();
 		const timeout = new AbortController();
 		const timer = setTimeout(() => timeout.abort(), request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
@@ -110,6 +118,23 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 		}
 
 		totalUsage = mergeUsage(totalUsage, response.usage);
+
+		/**
+		 * At debug level, record what the model actually said.
+		 *
+		 * Pi's extension API returns a completed message rather than a token stream, and
+		 * Pi's TUI only renders its own agent loop — so a nested harness call is invisible
+		 * while it runs. The log is the only window into what a compiler or reviewer
+		 * model produced, which matters most precisely when the output is disappointing.
+		 */
+		log?.debug("structured output: raw response", {
+			attempt,
+			model: response.model,
+			ms: Date.now() - attemptStarted,
+			chars: response.text.length,
+			...(response.usage ? { usage: response.usage } : {}),
+			text: clamp(response.text, 4000),
+		});
 
 		const extracted = extractJson<unknown>(response.text);
 		if (!extracted.ok) {

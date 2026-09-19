@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { displayPath, isWritable } from "../config/paths.ts";
 import { updateConfig } from "../config/loader.ts";
 import { runDoctor } from "./doctor.ts";
@@ -26,7 +27,7 @@ export interface CommandDeps {
 
 const SUBCOMMANDS = [
 	"status", "model", "setup", "doctor", "contract", "state", "events",
-	"evidence", "decision", "judge", "enable", "disable", "abandon", "help",
+	"evidence", "decision", "judge", "log", "enable", "disable", "abandon", "help",
 ] as const;
 
 export function registerCommands(pi: PiExtensionAPI, deps: CommandDeps): void {
@@ -91,6 +92,9 @@ async function dispatch(sub: string, argument: string, rt: HarnessRuntime, ctx: 
 
 		case "judge":
 			return show(ctx, pi, judgeText(rt));
+
+		case "log":
+			return show(ctx, pi, logText(rt, argument));
 
 		case "enable":
 		case "disable": {
@@ -550,6 +554,56 @@ function judgeText(rt: HarnessRuntime): string {
 	return lines.join("\n");
 }
 
+/**
+ * `/harness log` — the only window into nested model calls.
+ *
+ * Pi returns a completed message rather than a token stream to extensions, and its TUI
+ * renders only its own agent loop, so a compiler or reviewer call is invisible while it
+ * runs. At debug level the log holds the prompt and the raw reply, which is what you
+ * need when a contract comes out wrong and you want to know whether the model or the
+ * prompt was at fault.
+ */
+function logText(rt: HarnessRuntime, argument: string): string {
+	const limit = Number.parseInt(argument, 10);
+	const count = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 200) : 25;
+
+	let raw: string;
+	try {
+		raw = readFileSync(rt.paths.logFile, "utf8");
+	} catch {
+		return `No log yet at ${displayPath(rt.paths.logFile)}.`;
+	}
+
+	const lines = raw.split("\n").filter(Boolean).slice(-count);
+	if (lines.length === 0) return "The log is empty.";
+
+	const out: string[] = [`Last ${lines.length} log line(s) — ${displayPath(rt.paths.logFile)}`, ""];
+
+	for (const line of lines) {
+		try {
+			const entry = JSON.parse(line) as { ts?: string; level?: string; scope?: string; msg?: string; data?: Record<string, unknown> };
+			out.push(`${(entry.ts ?? "").slice(11, 19)} ${(entry.level ?? "").padEnd(5)} ${entry.scope ?? ""} — ${entry.msg ?? ""}`);
+
+			const text = entry.data?.text ?? entry.data?.userPrompt;
+			if (typeof text === "string") {
+				for (const l of clamp(text, 1200).split("\n")) out.push(`        ${l}`);
+			}
+		} catch {
+			out.push(line);
+		}
+	}
+
+	if (rt.config.logging.level !== "debug") {
+		out.push(
+			"",
+			`Log level is "${rt.config.logging.level}", so model prompts and replies are not recorded.`,
+			'Set logging.level to "debug" in the harness config and /reload to capture them.',
+		);
+	}
+
+	return out.join("\n");
+}
+
 function helpText(): string {
 	return [
 		"/harness <subcommand>",
@@ -564,6 +618,7 @@ function helpText(): string {
 		"  evidence    Collected evidence with provenance, trust level and freshness",
 		"  decision [id]  Judge decisions in full, including ones that were not applied",
 		"  judge       Judge configuration and usage accounting",
+		"  log [n]     Recent harness log lines; at debug level, model prompts and replies",
 		"  enable      Enable the harness (persisted; needs /reload)",
 		"  disable     Disable the harness (persisted; needs /reload)",
 		"  abandon [reason]  End the current task without completing it",
