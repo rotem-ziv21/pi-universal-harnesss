@@ -4,6 +4,7 @@ import { nowIso } from "../util/ids.ts";
 import { contradicts, supersede } from "./freshness.ts";
 import type {
 	CheckpointRecord,
+	CompletionEvaluation,
 	Counters,
 	EvidenceRef,
 	HarnessEvent,
@@ -65,10 +66,19 @@ export function initialState(taskId: string, contract: TaskContract): HarnessSta
  */
 const NON_MUTATING: ReadonlySet<HarnessEvent["type"]> = new Set([
 	"tool_proposed",
+	"checkpoint_detected",
 	"evidence_requested",
 	"judge_requested",
+	"judge_decision",
+	"stale_decision_rejected",
+	"judge_unavailable",
+	"tool_allowed",
+	"tool_blocked",
 	"progress_observation",
 	"completion_requested",
+	"completion_evaluated",
+	"completion_rejected",
+	"branch_stopped",
 ]);
 
 export function bumpsVersion(type: HarnessEvent["type"]): boolean {
@@ -97,7 +107,7 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 
 		case "contract_locked": {
 			const contract = p.contract as TaskContract | undefined;
-			return contract ? { ...state, contract, contractVersion: contract.version, phase: "active" } : state;
+			return contract ? { ...state, contract, contractVersion: contract.version, phase: "plan" } : state;
 		}
 
 		case "contract_revised": {
@@ -132,23 +142,23 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 			return {
 				...state,
 				checkpoints: [...state.checkpoints, checkpoint],
-				phase: "gating",
 				counters: { ...state.counters, checkpoints: state.counters.checkpoints + 1 },
 			};
 		}
 
-		case "tool_allowed":
+		case "tool_allowed": {
+			const action = state.actions.find((item) => item.id === p.actionId);
 			return {
 				...state,
-				phase: state.phase === "gating" ? "active" : state.phase,
+				phase: action ? nextPhaseForAction(state.phase, action) : state.phase,
 				actions: updateAction(state.actions, p.actionId as string, { outcome: "allowed" }),
 				checkpoints: updateCheckpoint(state.checkpoints, p.checkpointId as string | undefined, { outcome: "allowed" }),
 			};
+		}
 
 		case "tool_blocked":
 			return {
 				...state,
-				phase: "blocked",
 				actions: updateAction(state.actions, p.actionId as string, { outcome: "blocked" }),
 				checkpoints: updateCheckpoint(state.checkpoints, p.checkpointId as string | undefined, {
 					outcome: (p.userDecision as CheckpointRecord["outcome"]) ?? "blocked",
@@ -157,16 +167,20 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 			};
 
 		case "tool_executed":
-			return { ...state, phase: state.phase === "gating" ? "active" : state.phase };
+			return state;
 
-		case "tool_result":
+		case "tool_result": {
+			const action = state.actions.find((item) => item.id === p.actionId);
+			const failed = Boolean(p.isError);
 			return {
 				...state,
+				phase: action && !failed ? nextPhaseForAction(state.phase, action) : state.phase,
 				actions: updateAction(state.actions, p.actionId as string, {
-					outcome: p.isError ? "failed" : "succeeded",
+					outcome: failed ? "failed" : "succeeded",
 					...(typeof p.summary === "string" ? { resultSummary: p.summary } : {}),
 				}),
 			};
+		}
 
 		case "evidence_added": {
 			const added = p.evidence as EvidenceRef | undefined;
@@ -240,7 +254,7 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 		}
 
 		case "branch_stopped":
-			return { ...state, phase: "blocked" };
+			return state;
 
 		case "user_intervention":
 			return { ...state, phase: (p.phase as TaskPhase) ?? state.phase };
@@ -248,15 +262,21 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 		case "completion_requested":
 			return {
 				...state,
-				phase: "completing",
+				phase: "finalize",
 				counters: { ...state.counters, completionAttempts: state.counters.completionAttempts + 1 },
 			};
 
 		case "completion_rejected":
 			return {
 				...state,
-				phase: "active",
+				phase: "verify",
 				...(typeof p.feedback === "string" ? { lastCompletionFeedback: p.feedback } : {}),
+			};
+
+		case "completion_evaluated":
+			return {
+				...state,
+				lastCompletionEvaluation: p.evaluation as CompletionEvaluation,
 			};
 
 		case "task_completed":
@@ -302,4 +322,25 @@ function updateCheckpoint(
 ): CheckpointRecord[] {
 	if (!id) return [...checkpoints];
 	return checkpoints.map((c) => (c.id === id ? { ...c, ...patch } : c));
+}
+
+function nextPhaseForAction(current: TaskPhase, action: RecordedAction): TaskPhase {
+	if (current === "completed" || current === "abandoned" || current === "finalize") return current;
+	if (!action.actionSemantics) {
+		return current === "active" || current === "gating" || current === "blocked" || current === "completing" ? "build" : current;
+	}
+	if (action.actionSemantics.capabilities.includes("run_tests")) return "verify";
+	if (
+		action.actionSemantics.capabilities.some(
+			(capability) =>
+				capability === "write_file" ||
+				capability === "delete_file" ||
+				capability === "move_file" ||
+				capability === "create_directory" ||
+				capability === "change_dependencies",
+		)
+	) {
+		return "build";
+	}
+	return current === "active" || current === "gating" || current === "blocked" || current === "completing" ? "build" : current;
 }

@@ -1,3 +1,6 @@
+import type { TaskContract } from "../contract/schema.ts";
+import type { HarnessState } from "../state/types.ts";
+import { classifyAction } from "../checkpoints/action-semantics.ts";
 import type { ProposedAction } from "../checkpoints/types.ts";
 import type { ExecFn, ExecResult } from "../evidence/collector.ts";
 import { clamp, hashValue } from "../util/json.ts";
@@ -25,11 +28,15 @@ export interface PiToolCallEvent {
  * and what a human reads in a block message, so it needs to say what the action *does*
  * rather than which tool does it.
  */
-export function toProposedAction(event: PiToolCallEvent): ProposedAction {
+export function toProposedAction(
+	event: PiToolCallEvent,
+	context: { cwd?: string; contract?: TaskContract; state?: HarnessState } = {},
+): ProposedAction {
 	return {
 		id: event.toolCallId || newId("act"),
 		toolName: event.toolName,
 		input: event.input ?? {},
+		actionSemantics: classifyAction(event.toolName, event.input ?? {}, context),
 		summary: summarize(event),
 		signature: signatureOf(event),
 	};

@@ -1,9 +1,12 @@
+import { withActionSemantics } from "../checkpoints/action-semantics.ts";
 import type { CheckpointDetector } from "../checkpoints/detector.ts";
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import type { HarnessPaths } from "../config/paths.ts";
 import type { HarnessConfig, ProjectConfig } from "../config/schema.ts";
 import type { TaskContract } from "../contract/schema.ts";
 import type { EvidenceCollector } from "../evidence/collector.ts";
+import { evaluateCompletionConditions } from "../evidence/completion.ts";
+import { analyzeGateDependency } from "../evidence/dependency.ts";
 import type { EvidencePlanner } from "../evidence/planner.ts";
 import type { EvidencePlan } from "../evidence/types.ts";
 import { isStale } from "../judges/judge.ts";
@@ -11,7 +14,7 @@ import { buildJudgeQuery, estimatePayloadTokens } from "../judges/payload.ts";
 import type { JudgeRouter, RoutedDecision } from "../judges/router.ts";
 import type { ProgressMonitor } from "../progress/monitor.ts";
 import type { StateManager } from "../state/state-manager.ts";
-import type { CheckpointRecord, EvidenceRef } from "../state/types.ts";
+import type { CheckpointRecord, CompletionConditionResult, EvidenceRef } from "../state/types.ts";
 import { newCheckpointId, newDecisionId, newEvidenceId, nowIso } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
 import { renderBlock, renderCompletionRejection } from "./render.ts";
@@ -80,25 +83,36 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 	return {
 		async gateAction({ action, cwd, agentAssessment, signal }): Promise<GateOutcome> {
 			const contract = deps.state.getContract();
+			const normalizedAction = withActionSemantics(action, {
+				cwd,
+				contract,
+				state: deps.state.getState(),
+			});
 			const state = deps.state.getState();
 
-			// Record the proposal first: the audit trail must show what was attempted,
-			// including actions that are then blocked.
 			deps.state.recordProposedAction({
-				id: action.id,
-				toolName: action.toolName,
-				summary: action.summary,
-				signature: action.signature,
+				id: normalizedAction.id,
+				toolName: normalizedAction.toolName,
+				summary: normalizedAction.summary,
+				signature: normalizedAction.signature,
+				actionSemantics: normalizedAction.actionSemantics,
 				at: nowIso(),
 				stateVersion: state.stateVersion,
 				outcome: "pending",
 			});
 
-			// Loop and user-limit checks come before any expensive work.
-			const progress = deps.progress.observeAction({ contract, state: deps.state.getState(), action });
+			const progress = deps.progress.observeAction({
+				contract,
+				state: deps.state.getState(),
+				action: normalizedAction,
+			});
 			if (progress.action === "STOP_BRANCH") {
-				deps.state.emit("branch_stopped", { reason: progress.reason, detail: progress.detail, actionId: action.id });
-				deps.state.recordBlocked(action.id, progress.reason);
+				deps.state.emit("branch_stopped", {
+					reason: progress.reason,
+					detail: progress.detail,
+					actionId: normalizedAction.id,
+				});
+				deps.state.recordBlocked(normalizedAction.id, progress.reason);
 				return {
 					allowed: false,
 					terminate: true,
@@ -106,25 +120,49 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 				};
 			}
 			if (progress.action === "CHANGE_STRATEGY") {
-				// Advice, not a block: the model is told, and the action proceeds.
-				deps.state.emit("progress_observation", { observation: progress, actionId: action.id });
+				deps.state.emit("progress_observation", { observation: progress, actionId: normalizedAction.id });
 				log.info("progress advice issued", { reason: progress.reason });
 			}
 
 			const checkpoint = await deps.detector.evaluate({
 				contract,
 				state: deps.state.getState(),
-				action,
+				action: normalizedAction,
 				protectedPaths: deps.projectConfig?.protectedPaths ?? [],
 				...(signal ? { signal } : {}),
 			});
 
 			if (!checkpoint.needsGate) {
-				deps.state.recordAllowed(action.id);
-				return { allowed: true };
+				deps.state.recordAllowed(normalizedAction.id);
+				return { allowed: true, checkpoint };
 			}
 
-			return runGate({ deps, log, action, checkpoint, contract, cwd, agentAssessment, signal });
+			if (checkpoint.policyDecision === "block") {
+				const checkpointId = recordCheckpoint(deps, normalizedAction, checkpoint);
+				const constraintId = checkpoint.relatedRequirements[0];
+				const message = [
+					"Action rejected: the normalized tool operation violates a hard constraint.",
+					"",
+					`Action: ${normalizedAction.actionSemantics.actionType}`,
+					...(normalizedAction.actionSemantics.target ? [`Path: ${normalizedAction.actionSemantics.target}`] : []),
+					...(constraintId ? [`Constraint: ${constraintId}`] : []),
+					`Reason: ${checkpoint.reason}`,
+				].join("\n");
+				deps.state.recordBlocked(normalizedAction.id, checkpoint.reason, checkpointId);
+				return { allowed: false, message, checkpoint };
+			}
+
+			const retry = deps.progress.observeCheckpoint({
+				state: deps.state.getState(),
+				action: normalizedAction,
+				checkpoint,
+			});
+			if (retry.action === "NO_PROGRESS") {
+				deps.state.recordBlocked(normalizedAction.id, retry.reason);
+				return { allowed: false, message: `NO_PROGRESS\n\nReason: ${retry.reason}`, checkpoint };
+			}
+
+			return runGate({ deps, log, action: normalizedAction, checkpoint, contract, cwd, agentAssessment, signal });
 		},
 
 		/**
@@ -139,17 +177,43 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			const contract = deps.state.getContract();
 			deps.state.requestCompletion();
 
-			const checkpoint = deps.detector.evaluateCompletion({ contract, state: deps.state.getState() });
+			const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState(), cwd });
+			deps.state.recordCompletionEvaluation(evaluation);
+			const hardUnsatisfied = evaluation.conditions.filter(
+				(condition) => condition.priority === "hard" && condition.status === "UNSATISFIED",
+			);
+			const hardUnknown = evaluation.conditions.filter(
+				(condition) => condition.priority === "hard" && condition.status === "UNKNOWN",
+			);
 
-			if (!checkpoint.needsGate) {
+			if (hardUnsatisfied.length > 0) {
+				const message = completionConditionMessage("UNSATISFIED", hardUnsatisfied);
+				deps.state.rejectCompletion(message);
+				return { allowed: false, message };
+			}
+			if (hardUnknown.length === 0) {
 				deps.state.completeTask();
 				return { allowed: true };
 			}
 
+			const detected = deps.detector.evaluateCompletion({ contract, state: deps.state.getState() });
+			const checkpoint: CheckpointDecision = {
+				...detected,
+				relatedRequirements: hardUnknown.map((condition) => condition.id),
+			};
 			const action: ProposedAction = {
 				id: `completion-${deps.state.getVersion()}`,
 				toolName: "(completion)",
 				input: {},
+				actionSemantics: {
+					actionType: "unknown",
+					targetOwnership: "unknown",
+					mutationType: "none",
+					reversibility: "high",
+					externalSideEffect: false,
+					capabilities: [],
+					operationText: "completion",
+				},
 				summary: "Declare the task complete",
 				signature: "completion",
 			};
@@ -172,12 +236,11 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			} else {
 				deps.state.rejectCompletion(outcome.message ?? "Completion was rejected.");
 			}
-
 			return outcome;
 		},
 
 		recordToolResult({ actionId, summary, isError }): void {
-			deps.state.recordToolResult(actionId, summary, isError);
+			recordRuntimeToolEvidence(deps, actionId, summary, isError);
 		},
 
 		observeTurn(): void {
@@ -209,19 +272,6 @@ async function runGate(args: {
 	const { deps, log, action, checkpoint, contract, cwd, agentAssessment, signal } = args;
 
 	const checkpointId = newCheckpointId();
-	const record: CheckpointRecord = {
-		id: checkpointId,
-		type: checkpoint.checkpointType ?? "unspecified",
-		reason: checkpoint.reason,
-		actionId: action.id,
-		relatedRequirements: checkpoint.relatedRequirements,
-		severity: checkpoint.severity,
-		at: nowIso(),
-		stateVersion: deps.state.getVersion(),
-	};
-	deps.state.recordCheckpoint(record);
-
-	// --- plan ---
 	const plan = deps.planner.plan({
 		contract,
 		state: deps.state.getState(),
@@ -230,12 +280,22 @@ async function runGate(args: {
 		action,
 		projectConfig: deps.projectConfig,
 	});
-	deps.state.emit("evidence_requested", { checkpointId, plan });
+	const dependency = analyzeGateDependency(plan, action, contract);
+	recordCheckpoint(deps, action, checkpoint, checkpointId, dependency);
+	deps.state.emit("evidence_requested", { checkpointId, plan, dependency });
 
-	// --- collect ---
+	if (dependency.dependsOnBlockedAction) {
+		deps.state.recordAllowed(action.id, checkpointId);
+		log.info("checkpoint bypassed to avoid circular evidence dependency", {
+			checkpointId,
+			requirements: dependency.requirementIds,
+		});
+		return { allowed: true, checkpoint, plan };
+	}
+
 	if (plan.evidenceRequests.length > 0) {
 		const result = await deps.collector.collect({ plan, cwd, ...(signal ? { signal } : {}) });
-
+		const evidenceStateVersion = deps.state.getVersion() + result.collected.length;
 		for (const item of result.collected) {
 			const evidence: EvidenceRef = {
 				id: newEvidenceId(),
@@ -245,9 +305,10 @@ async function runGate(args: {
 				sourceType: item.sourceType,
 				source: item.source,
 				observedAt: nowIso(),
-				stateVersion: deps.state.getVersion() + 1,
+				stateVersion: evidenceStateVersion,
 				freshnessClass: item.freshnessClass,
 				trust: item.trust,
+				result: item.ok ? "supported" : "contradicted",
 				...(item.validity ? { validity: item.validity } : {}),
 				value: item.value,
 			};
@@ -259,6 +320,28 @@ async function runGate(args: {
 		}
 	}
 
+	let checkpointForJudge = checkpoint;
+	if (checkpoint.checkpointType === "completion_claim") {
+		const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState(), cwd });
+		deps.state.recordCompletionEvaluation(evaluation);
+		const hardUnsatisfied = evaluation.conditions.filter(
+			(condition) => condition.priority === "hard" && condition.status === "UNSATISFIED",
+		);
+		if (hardUnsatisfied.length > 0) {
+			const message = completionConditionMessage("UNSATISFIED", hardUnsatisfied);
+			deps.state.recordBlocked(action.id, "deterministic completion failure", checkpointId);
+			return { allowed: false, message, checkpoint, plan };
+		}
+		const hardUnknown = evaluation.conditions.filter(
+			(condition) => condition.priority === "hard" && condition.status === "UNKNOWN",
+		);
+		if (hardUnknown.length === 0) {
+			deps.state.recordAllowed(action.id, checkpointId);
+			return { allowed: true, checkpoint, plan };
+		}
+		checkpointForJudge = { ...checkpoint, relatedRequirements: hardUnknown.map((condition) => condition.id) };
+	}
+
 	// --- judge ---
 	// The version is captured *after* evidence collection, because collecting evidence
 	// advances state. A decision must reference the state it actually saw (§20).
@@ -267,7 +350,7 @@ async function runGate(args: {
 	const query = buildJudgeQuery({
 		contract,
 		state: deps.state.getState(),
-		checkpoint,
+		checkpoint: checkpointForJudge,
 		action,
 		...(agentAssessment ? { agentAssessment } : {}),
 		...(signal ? { signal } : {}),
@@ -281,7 +364,7 @@ async function runGate(args: {
 		estimatedTokens: estimatePayloadTokens(query),
 	});
 
-	const decision = await deps.judge.evaluate(query, checkpoint.severity);
+	const decision = await deps.judge.evaluate(query, checkpointForJudge.severity);
 	const decisionId = newDecisionId();
 
 	/**
@@ -304,6 +387,8 @@ async function runGate(args: {
 		missingEvidence: decision.missingEvidence,
 		stateVersion: stateVersionAtQuery,
 		at: nowIso(),
+		...(decision.detail ? { detail: decision.detail } : {}),
+		...(decision.debug ? { debug: decision.debug } : {}),
 		...(decision.latencyMs !== undefined ? { latencyMs: decision.latencyMs } : {}),
 		applied: !stale,
 		...(stale ? { staleReason: `computed against v${stateVersionAtQuery}, state is now v${currentVersion}` } : {}),
@@ -373,4 +458,105 @@ async function runGate(args: {
 		// A FAIL means the approach is wrong; retrying it unchanged wastes a turn.
 		terminate: decision.decision === "FAIL",
 	};
+}
+
+function recordCheckpoint(
+	deps: HarnessCoreDeps,
+	action: ProposedAction,
+	checkpoint: CheckpointDecision,
+	checkpointId = newCheckpointId(),
+	dependencyAnalysis?: CheckpointRecord["dependencyAnalysis"],
+): string {
+	deps.state.recordCheckpoint({
+		id: checkpointId,
+		type: checkpoint.checkpointType ?? "unspecified",
+		reason: checkpoint.reason,
+		actionId: action.id,
+		relatedRequirements: checkpoint.relatedRequirements,
+		severity: checkpoint.severity,
+		at: nowIso(),
+		stateVersion: deps.state.getVersion(),
+		phase: deps.state.getState().phase,
+		actionSemantics: action.actionSemantics,
+		signals: checkpoint.signals,
+		policyDecision: checkpoint.policyDecision ?? "gate",
+		...(dependencyAnalysis ? { dependencyAnalysis } : {}),
+	});
+	return checkpointId;
+}
+
+function recordRuntimeToolEvidence(
+	deps: HarnessCoreDeps,
+	actionId: string,
+	summary: string,
+	isError: boolean,
+): void {
+	deps.state.recordToolResult(actionId, summary, isError);
+	const state = deps.state.getState();
+	const action = state.actions.find((candidate) => candidate.id === actionId);
+	if (!action) return;
+
+	const items = [...state.contract.requirements, ...state.contract.successConditions];
+	const requirementIds: string[] = [];
+	const operation = `${action.actionSemantics.operationText} ${summary}`.toLowerCase();
+	for (const item of items) {
+		const description = item.description.toLowerCase();
+		if (action.actionSemantics.capabilities.includes("run_tests") && /\btests?\b/.test(description)) {
+			requirementIds.push(item.id);
+			continue;
+		}
+		if (
+			action.actionSemantics.capabilities.includes("read_file") &&
+			/readme/i.test(action.actionSemantics.target ?? "") &&
+			/\b(readme|usage|documentation)\b/.test(description)
+		) {
+			requirementIds.push(item.id);
+			continue;
+		}
+		const terms = description
+			.split(/[^a-z0-9]+/)
+			.filter((term) => term.length >= 4 && !["with", "from", "that", "this", "must", "should"].includes(term));
+		if (
+			action.actionSemantics.capabilities.includes("execute_local_code") &&
+			terms.filter((term) => operation.includes(term)).length >= 2
+		) {
+			requirementIds.push(item.id);
+		}
+	}
+	if (requirementIds.length === 0) return;
+
+	const deterministic =
+		action.actionSemantics.capabilities.includes("run_tests") ||
+		(action.actionSemantics.capabilities.includes("read_file") && /readme/i.test(action.actionSemantics.target ?? ""));
+	deps.state.addEvidence({
+		id: newEvidenceId(),
+		requirementIds: [...new Set(requirementIds)],
+		type: deterministic ? (action.actionSemantics.capabilities.includes("run_tests") ? "command_result" : "file_state") : "tool_result",
+		summary: `${isError ? "failed" : "succeeded"} — ${summary}`,
+		sourceType: "tool",
+		source: `${action.toolName}:${action.id}`,
+		observedAt: nowIso(),
+		stateVersion: deps.state.getVersion() + 1,
+		freshnessClass: "temporary",
+		trust: "runtime_evidence",
+		result: deterministic ? (isError ? "contradicted" : "supported") : "unknown",
+		value: { actionId, actionType: action.actionSemantics.actionType, summary, isError },
+	});
+}
+
+function completionConditionMessage(
+	status: "UNSATISFIED" | "UNKNOWN",
+	conditions: readonly CompletionConditionResult[],
+): string {
+	const heading = status === "UNSATISFIED" ? "COMPLETION REJECTED — deterministic checks failed." : "COMPLETION REJECTED — evidence is incomplete.";
+	return [
+		heading,
+		"",
+		...conditions.flatMap((condition) => [
+			`${condition.id} [${condition.status}] ${condition.description}`,
+			`  ${condition.reason}`,
+		]),
+		"",
+		"Continue the task and address the conditions above.",
+	].join("\n");
 }

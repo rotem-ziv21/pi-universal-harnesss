@@ -144,22 +144,32 @@ async function collectCommand(
 		});
 
 		const exitCode = result.exitCode ?? -1;
-		const ok = exitCode === 0;
+		const expected = typeof request.parameters.expectedOutput === "string" ? request.parameters.expectedOutput : undefined;
+		const observed = result.stdout.trim();
+		const comparable =
+			request.parameters.outputComparison === "first_token"
+				? observed.split(/\s+/)[0] ?? ""
+				: observed;
+		const matchesExpected = expected === undefined || comparable === expected;
+		const ok = exitCode === 0 && matchesExpected;
 		const output = redact(`${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`.trim());
 
 		return {
 			requestId: request.id,
 			requirementIds: request.requirementIds,
-			type: "command_result",
+			type: expected === undefined ? "command_result" : "exact_output",
 			// The summary is what reaches the Judge, so it leads with the decisive fact.
-			summary: `exit ${exitCode} — ${clamp(output || "(no output)", 300)}`,
-			value: { command, exitCode, output: clamp(output, ctx.maxOutput) },
+			summary:
+				expected === undefined
+					? `exit ${exitCode} — ${clamp(output || "(no output)", 300)}`
+					: `exit ${exitCode}; observed ${JSON.stringify(comparable)}; expected ${JSON.stringify(expected)} — ${matchesExpected ? "match" : "MISMATCH"}`,
+			value: { command, exitCode, output: clamp(output, ctx.maxOutput), ...(expected === undefined ? {} : { expected, observed: comparable }) },
 			sourceType: "command",
 			source: command,
 			trust: "runtime_evidence",
 			freshnessClass: request.freshnessClass,
 			ok,
-			...(ok ? {} : { error: `command exited with ${exitCode}` }),
+			...(ok ? {} : { error: exitCode === 0 ? "command output did not match the expected value" : `command exited with ${exitCode}` }),
 		};
 	} finally {
 		clearTimeout(timer);

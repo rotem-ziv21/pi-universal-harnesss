@@ -2,6 +2,8 @@ import type { JudgeConfig } from "../config/schema.ts";
 import { HarnessError, TRANSIENT_JUDGE_CODES } from "../util/errors.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
+import { redactValue } from "../security/redact.ts";
+import { hashValue } from "../util/json.ts";
 import type { AssessQuery, Judge, JudgeDecision, JudgeQuery, JudgeStats } from "./judge.ts";
 import { emptyStats } from "./judge.ts";
 import { normalizeDecision, type TypedAnswers } from "./normalize.ts";
@@ -119,7 +121,11 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 	};
 
 	/** One request, with bounded retry on transient failures only. */
-	async function post(body: DecisionsRequest, signal: AbortSignal | undefined): Promise<{ response: DecisionsResponse; latencyMs: number }> {
+	async function post(
+		body: DecisionsRequest,
+		signal: AbortSignal | undefined,
+		validate?: (response: DecisionsResponse) => void,
+	): Promise<{ response: DecisionsResponse; latencyMs: number }> {
 		const apiKey = await options.getApiKey();
 		if (!apiKey) {
 			throw new HarnessError(
@@ -170,6 +176,7 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 						details: { endpoint },
 					});
 				}
+				validate?.(parsed);
 
 				record({
 					calls: 1,
@@ -181,7 +188,7 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 			} catch (e) {
 				lastError = toHarnessError(e, endpoint, signal);
 				log.warn("judge request failed", { attempt, code: lastError.code, message: lastError.message });
-				if (!TRANSIENT_JUDGE_CODES.has(lastError.code)) break;
+				if (!TRANSIENT_JUDGE_CODES.has(lastError.code) && lastError.code !== "JUDGE_BAD_RESPONSE") break;
 			} finally {
 				clearTimeout(timer);
 			}
@@ -214,12 +221,12 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 				questions[`${REQUIREMENT_PREFIX}${requirement.id}`] = {
 					type: "noul",
 					instructions: str(
-						`Is this requirement sufficiently supported by the runtime evidence in the state? ` +
-							`Requirement ${requirement.id}: ${requirement.description}`,
+						`Does the requirement-specific evidence bundle for ${requirement.id} sufficiently support this requirement? ` +
+							`Requirement: ${requirement.description}`,
 					),
 					criteria: {
-						true: "The evidence in the state directly demonstrates this requirement holds.",
-						false: "The evidence is absent, indirect, stale, or only asserted by the agent rather than observed.",
+						true: "The selected evidence in this requirement's bundle directly demonstrates it holds.",
+						false: "Its bundle is empty, contradictory, indirect, stale, or contains only an agent assertion.",
 					},
 				};
 			}
@@ -238,12 +245,11 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 				};
 			}
 
-			const { response, latencyMs } = await post(
-				{ model: config.model, state: query.state, questions },
-				query.signal,
+			const request: DecisionsRequest = { model: config.model, state: query.state, questions };
+			const { response, latencyMs } = await post(request, query.signal, (candidate) =>
+				validateDecisionResponse(candidate, query),
 			);
-
-			return normalizeDecision({
+			const decision = normalizeDecision({
 				answers: collectAnswers(response, query),
 				query,
 				config,
@@ -254,6 +260,16 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 					output: response.usage?.output_tokens ?? 0,
 				},
 			});
+			return {
+				...decision,
+				debug: {
+					requestHash: hashValue(request),
+					semanticHash: hashValue(withoutVolatileFields(request)),
+					evidenceIds: query.state.evidenceBundles?.flatMap((bundle) => bundle.selected.map((item) => item.id)) ?? [],
+					request: redactValue(request),
+					response: redactValue(response),
+				},
+			};
 		},
 
 		async assess(query: AssessQuery): Promise<number> {
@@ -263,10 +279,18 @@ export function createOpenRouterJevJudge(options: OpenRouterJevOptions): Judge {
 				...(query.criteria ? { criteria: { true: str(query.criteria.true), false: str(query.criteria.false) } } : {}),
 			};
 
-			const { response } = await post(
-				{ model: config.model, state: query.state, questions: { [ASSESS_QUESTION_ID]: question } },
-				query.signal,
-			);
+			const request: DecisionsRequest = {
+				model: config.model,
+				state: query.state,
+				questions: { [ASSESS_QUESTION_ID]: question },
+			};
+			const { response } = await post(request, query.signal, (candidate) => {
+				if (readNoul(candidate.answers?.[ASSESS_QUESTION_ID]) === undefined) {
+					throw new HarnessError("JUDGE_BAD_RESPONSE", "Decisions endpoint returned no usable noul answer.", {
+						retryable: true,
+					});
+				}
+			});
 
 			const answer = response.answers?.[ASSESS_QUESTION_ID];
 			const value = readNoul(answer);
@@ -326,6 +350,38 @@ function collectAnswers(response: DecisionsResponse, query: JudgeQuery): TypedAn
 	const verdict = readChoice(verdictAnswer);
 
 	return { ...(verdict ? { verdict } : {}), requirementSupport, constraintViolation };
+}
+
+function validateDecisionResponse(response: DecisionsResponse, query: JudgeQuery): void {
+	const answers = response.answers ?? {};
+	const missing: string[] = [];
+	const verdict = readChoice(answers[VERDICT_QUESTION_ID]);
+	if (!verdict || !["PASS", "FAIL", "MORE_EVIDENCE", "REVIEW"].includes(verdict.choice)) missing.push(VERDICT_QUESTION_ID);
+	for (const requirement of query.requirements) {
+		const id = `${REQUIREMENT_PREFIX}${requirement.id}`;
+		if (readNoul(answers[id]) === undefined) missing.push(id);
+	}
+	for (const constraint of query.constraints) {
+		const id = `${CONSTRAINT_PREFIX}${constraint.id}`;
+		if (readNoul(answers[id]) === undefined) missing.push(id);
+	}
+	if (missing.length > 0) {
+		throw new HarnessError("JUDGE_BAD_RESPONSE", `Decisions endpoint returned malformed or missing answers: ${missing.join(", ")}`, {
+			retryable: true,
+		});
+	}
+}
+
+/** Hash-equivalence view: ignores versions, timestamps and generated evidence ids. */
+function withoutVolatileFields(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutVolatileFields);
+	if (!value || typeof value !== "object") return value;
+	const result: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "stateVersion" || key === "observedAt" || key === "id") continue;
+		result[key] = withoutVolatileFields(item);
+	}
+	return result;
 }
 
 function readNoul(answer: DecisionAnswer | undefined): number | undefined {

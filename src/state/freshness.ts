@@ -1,4 +1,4 @@
-import type { EvidenceRef, FreshnessClass, VerifiedFact } from "./types.ts";
+import type { EvidenceRef, FreshnessClass, RecordedAction, VerifiedFact } from "./types.ts";
 
 /**
  * Evidence freshness and contradiction handling (§21, §22).
@@ -97,6 +97,26 @@ export function supersede<T extends { id: string; supersededBy?: string; superse
 /** Current, non-superseded evidence only. This is what the Judge payload is built from. */
 export function currentEvidence(evidence: readonly EvidenceRef[]): EvidenceRef[] {
 	return evidence.filter((e) => !e.supersededBy);
+}
+
+/** Targets changed by successful mutations at or after an evidence observation. */
+export function changedTargetsSince(actions: readonly RecordedAction[], stateVersion: number): ReadonlySet<string> {
+	const targets = new Set<string>();
+	for (const action of actions) {
+		const semantics = action.actionSemantics;
+		if (
+			action.outcome !== "succeeded" ||
+			action.stateVersion < stateVersion ||
+			!semantics?.target ||
+			semantics.mutationType === "read" ||
+			semantics.mutationType === "none" ||
+			semantics.mutationType === "execute"
+		) {
+			continue;
+		}
+		targets.add(semantics.target);
+	}
+	return targets;
 }
 
 export function currentFacts(facts: readonly VerifiedFact[]): VerifiedFact[] {

@@ -4,6 +4,7 @@ import { updateConfig } from "../config/loader.ts";
 import { runDoctor } from "./doctor.ts";
 import { checkPermissions, deleteSecret, describeSource, OPENROUTER_ENV_VAR, resolveOpenRouterKey, writeSecret } from "../security/secrets.ts";
 import { fingerprint } from "../security/redact.ts";
+import { redactValue } from "../security/redact.ts";
 import { clamp } from "../util/json.ts";
 import { errorMessage } from "../util/errors.ts";
 import type { HarnessRuntime } from "./runtime.ts";
@@ -27,7 +28,8 @@ export interface CommandDeps {
 
 const SUBCOMMANDS = [
 	"status", "model", "setup", "doctor", "contract", "state", "events",
-	"evidence", "decision", "judge", "log", "enable", "disable", "abandon", "help",
+	"evidence", "decision", "judge", "judge-debug", "checkpoint-debug", "log",
+	"enable", "disable", "abandon", "help",
 ] as const;
 
 export function registerCommands(pi: PiExtensionAPI, deps: CommandDeps): void {
@@ -93,6 +95,12 @@ async function dispatch(sub: string, argument: string, rt: HarnessRuntime, ctx: 
 		case "judge":
 			return show(ctx, pi, judgeText(rt));
 
+
+		case "judge-debug":
+			return show(ctx, pi, judgeDebugText(rt, argument));
+
+		case "checkpoint-debug":
+			return show(ctx, pi, checkpointDebugText(rt, argument));
 		case "log":
 			return show(ctx, pi, logText(rt, argument));
 
@@ -445,6 +453,14 @@ function stateText(rt: HarnessRuntime): string {
 		}
 	}
 
+	if (s.lastCompletionEvaluation) {
+		lines.push("", "Last completion evaluation:");
+		for (const condition of s.lastCompletionEvaluation.conditions) {
+			lines.push(`  [${condition.status}${condition.deterministic ? "/deterministic" : "/semantic"}] ${condition.id} ${condition.description}`);
+			lines.push(`    ${condition.reason}`);
+		}
+	}
+
 	if (s.lastCompletionFeedback) {
 		lines.push("", "Last completion rejection:");
 		lines.push(indent(clamp(s.lastCompletionFeedback, 800)));
@@ -480,7 +496,7 @@ function evidenceText(rt: HarnessRuntime): string {
 	const lines = [`${evidence.length} evidence item(s):`, ""];
 	for (const item of evidence.slice(-40)) {
 		const marker = item.supersededBy ? "[superseded]" : `[${item.trust}]`;
-		lines.push(`${item.id} ${marker} v${item.stateVersion} ${item.type} via ${item.source}`);
+		lines.push(`${item.id} ${marker} [${item.result}] v${item.stateVersion} ${item.type} via ${item.source}`);
 		lines.push(`    requirements: ${item.requirementIds.join(", ") || "(none)"}`);
 		lines.push(`    ${clamp(item.summary, 200)}`);
 		lines.push(`    freshness: ${item.freshnessClass}${item.validity ? ` (until ${item.validity} changes)` : ""}`);
@@ -554,6 +570,105 @@ function judgeText(rt: HarnessRuntime): string {
 	return lines.join("\n");
 }
 
+function judgeDebugText(rt: HarnessRuntime, argument: string): string {
+	const task = rt.getTask();
+	if (!task) return "No active task.";
+	const full = argument.split(/\s+/).includes("full");
+	const selector = argument.split(/\s+/).find((part) => part && part !== "full");
+	const decisions = task.state.getState().decisions.filter((decision) => decision.debug);
+	const selected = selector
+		? decisions.filter((decision) => decision.id === selector || decision.checkpointId === selector)
+		: decisions.slice(-10);
+	if (selected.length === 0) return "No captured Judge payloads match this request.";
+
+	const lines: string[] = [];
+	let previousSemanticHash: string | undefined;
+	for (const decision of selected) {
+		const debug = decision.debug!;
+		const request = debug.request as { questions?: Record<string, unknown> };
+		const requirementIds = Object.keys(request.questions ?? {})
+			.filter((id) => id.startsWith("req_"))
+			.map((id) => id.slice(4));
+		lines.push(`${decision.checkpointId} · ${decision.id}`);
+		lines.push(`  requirements: ${requirementIds.join(", ") || "(none)"}`);
+		lines.push(`  stateVersion: v${decision.stateVersion}`);
+		lines.push(`  evidence:     ${debug.evidenceIds.join(", ") || "(none)"}`);
+		lines.push(`  payload hash: ${debug.requestHash}`);
+		lines.push(`  semantic hash:${debug.semanticHash}`);
+		if (previousSemanticHash) {
+			lines.push(`  equivalent to previous: ${previousSemanticHash === debug.semanticHash ? "yes" : "no"}`);
+		}
+		lines.push(`  decision:     ${decision.decision}`);
+		lines.push(`  confidence:   ${decision.confidence.toFixed(2)}`);
+		if (decision.detail?.requirementSupport) {
+			lines.push(`  requirement support: ${JSON.stringify(decision.detail.requirementSupport)}`);
+		}
+		if (full) {
+			lines.push("  exact redacted request:");
+			lines.push(indent(JSON.stringify(redactValue(debug.request), null, 2)));
+			lines.push("  exact normalized response:");
+			lines.push(
+				indent(
+					JSON.stringify(
+						redactValue({
+							decision: decision.decision,
+							confidence: decision.confidence,
+							detail: decision.detail,
+							rawProviderResponse: debug.response,
+						}),
+						null,
+						2,
+					),
+				),
+			);
+		}
+		lines.push("");
+		previousSemanticHash = debug.semanticHash;
+	}
+	return lines.join("\n");
+}
+
+function checkpointDebugText(rt: HarnessRuntime, argument: string): string {
+	const task = rt.getTask();
+	if (!task) return "No active task.";
+	const checkpoints = task.state.getState().checkpoints;
+	const selected = argument
+		? checkpoints.filter((checkpoint) => checkpoint.id === argument || checkpoint.actionId === argument)
+		: checkpoints.slice(-5);
+	if (selected.length === 0) return `No checkpoint matching "${argument}".`;
+
+	const lines: string[] = [];
+	for (const checkpoint of selected) {
+		const semantics = checkpoint.actionSemantics;
+		lines.push(`${checkpoint.id} — ${checkpoint.type} → ${(checkpoint.policyDecision ?? "gate").toUpperCase()}`);
+		if (!semantics) {
+			lines.push("  normalized action: unavailable (legacy checkpoint record)", "");
+			continue;
+		}
+		lines.push(`  phase:         ${checkpoint.phase}`);
+		lines.push(`  risk:          ${checkpoint.severity}`);
+		lines.push(`  action:        ${semantics.actionType}`);
+		lines.push(`  mutation:      ${semantics.mutationType}`);
+		lines.push(`  target:        ${semantics.target ?? "(none)"}`);
+		lines.push(`  ownership:     ${semantics.targetOwnership}`);
+		lines.push(`  reversibility: ${semantics.reversibility}`);
+		lines.push(`  external:      ${semantics.externalSideEffect}`);
+		lines.push(`  capabilities:  ${semantics.capabilities.join(", ") || "(none)"}`);
+		lines.push("  matched constraints/signals:");
+		for (const signal of checkpoint.signals) {
+			lines.push(`    - [${signal.origin}/${signal.type}] ${signal.reason}`);
+		}
+		if (checkpoint.signals.length === 0) lines.push("    (none)");
+		if (checkpoint.dependencyAnalysis) {
+			lines.push(
+				`  evidence dependency: ${checkpoint.dependencyAnalysis.dependsOnBlockedAction ? "dependent" : "independent"} — ${checkpoint.dependencyAnalysis.reason}`,
+			);
+		}
+		lines.push(`  outcome:       ${checkpoint.outcome ?? "pending"}`, "");
+	}
+	return lines.join("\n");
+}
+
 /**
  * `/harness log` — the only window into nested model calls.
  *
@@ -618,6 +733,8 @@ function helpText(): string {
 		"  evidence    Collected evidence with provenance, trust level and freshness",
 		"  decision [id]  Judge decisions in full, including ones that were not applied",
 		"  judge       Judge configuration and usage accounting",
+		"  judge-debug [id] [full]  Payload hashes, evidence ids, normalized output; full is redacted",
+		"  checkpoint-debug [id]  Action semantics, capability matches, dependency and policy",
 		"  log [n]     Recent harness log lines; at debug level, model prompts and replies",
 		"  enable      Enable the harness (persisted; needs /reload)",
 		"  disable     Disable the harness (persisted; needs /reload)",

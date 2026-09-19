@@ -11,6 +11,7 @@ import {
 	externalMutationSignal,
 	irreversibleSignal,
 	isMutating,
+	matchConstraintToAction,
 	protectedPathSignals,
 } from "./signals.ts";
 import {
@@ -71,17 +72,45 @@ export function createCheckpointDetector(options: {
 
 	return {
 		async evaluate({ contract, state, action, protectedPaths = [], signal }): Promise<CheckpointDecision> {
-			// Fast path: observation cannot violate anything.
-			if (!isMutating(action)) {
-				return NO_GATE;
+			if (!isMutating(action)) return NO_GATE;
+
+			// Tier 1: direct, machine-readable policy violations never need a Judge.
+			const directSignals: CheckpointSignal[] = [];
+			for (const constraint of contract.constraints) {
+				if (constraint.priority !== "hard") continue;
+				const match = matchConstraintToAction(constraint.description, action);
+				if (!match.violates) continue;
+				directSignals.push({
+					type: "constraint_risk",
+					reason: match.reason,
+					origin: "contract",
+					weight: 1,
+					relatedItemIds: [constraint.id],
+				});
+			}
+			for (const forbidden of contract.forbiddenConditions) {
+				if (forbidden.priority !== "hard") continue;
+				const match = matchConstraintToAction(forbidden.description, action);
+				if (!match.relevant) continue;
+				directSignals.push({
+					type: "constraint_risk",
+					reason: `This action can directly create forbidden condition: "${forbidden.description}"`,
+					origin: "contract",
+					weight: 1,
+					relatedItemIds: [forbidden.id],
+				});
+			}
+			directSignals.push(...protectedPathSignals(protectedPaths, action));
+			if (directSignals.length > 0) {
+				return { ...decide(directSignals, false), policyDecision: "block" };
 			}
 
+			// Tier 2: capability-aware contract relevance. Conditional constraints gate;
+			// unrelated constraints are absent rather than being inferred from payload words.
 			const contractSignals = [
 				...contractCriticalActionSignals(contract, action),
 				...constraintRiskSignals(contract, action),
-				...protectedPathSignals(protectedPaths, action),
 			];
-
 			if (contractSignals.length > 0) {
 				const decision = decide(contractSignals, false);
 				log.info("checkpoint detected from contract", {
@@ -92,29 +121,33 @@ export function createCheckpointDetector(options: {
 				return decision;
 			}
 
-			const genericSignals = [externalMutationSignal(action), destructiveSignal(action), irreversibleSignal(action)].filter(
-				(s): s is CheckpointSignal => s !== undefined,
-			);
+			// PLAN/BUILD/VERIFY allow reversible local work. Full completion evidence is
+			// intentionally not a prerequisite for constructing the thing being verified.
+			const phase = state.phase === "active" ? "build" : state.phase;
+			if (
+				(phase === "plan" || phase === "build" || phase === "verify") &&
+				action.actionSemantics.reversibility === "high" &&
+				!action.actionSemantics.externalSideEffect &&
+				action.actionSemantics.targetOwnership !== "outside_scope"
+			) {
+				return {
+					...NO_GATE,
+					reason: `Allowed as reversible local work during ${phase.toUpperCase()}.`,
+				};
+			}
 
-			const strongest = Math.max(0, ...genericSignals.map((s) => s.weight));
-			const total = genericSignals.reduce((sum, s) => sum + s.weight, 0);
+			// Tier 3: generic high-risk side effects not anticipated by the contract.
+			const genericSignals = [externalMutationSignal(action), destructiveSignal(action), irreversibleSignal(action)].filter(
+				(item): item is CheckpointSignal => item !== undefined,
+			);
+			const strongest = Math.max(0, ...genericSignals.map((item) => item.weight));
+			const total = genericSignals.reduce((sum, item) => sum + item.weight, 0);
 
 			if (strongest >= STRONG_SIGNAL || total >= ACCUMULATED) {
-				const decision = decide(genericSignals, false);
-				log.info("checkpoint detected from generic signals", {
-					tool: action.toolName,
-					type: decision.checkpointType,
-					strongest,
-					total,
-				});
-				return decision;
+				return decide(genericSignals, false);
 			}
 
-			// Tier 3: ambiguous. Ask the Judge, but only if it is worth a call.
-			if (!options.config.checkpoints.escalateAmbiguous || !options.judge || total < ESCALATION_FLOOR) {
-				return NO_GATE;
-			}
-
+			if (!options.config.checkpoints.escalateAmbiguous || !options.judge || total < ESCALATION_FLOOR) return NO_GATE;
 			return escalate({ contract, state, action, genericSignals, judge: options.judge, config: options.config, log, signal });
 		},
 
@@ -128,6 +161,7 @@ export function createCheckpointDetector(options: {
 			const hasSomethingToVerify =
 				contract.successConditions.length > 0 ||
 				contract.requirements.some((r) => r.priority === "hard") ||
+				contract.constraints.some((constraint) => constraint.priority === "hard") ||
 				contract.forbiddenConditions.length > 0;
 
 			if (!hasSomethingToVerify && !options.config.checkpoints.alwaysGateCompletion) {
@@ -141,6 +175,7 @@ export function createCheckpointDetector(options: {
 					reason: "The worker declared the task complete. The contract defines no success conditions, so only a sanity check is performed.",
 					signals: [],
 					relatedRequirements: [],
+					policyDecision: "gate",
 					escalated: false,
 				};
 			}
@@ -163,7 +198,9 @@ export function createCheckpointDetector(options: {
 					...contract.successConditions.map((s) => s.id),
 					...contract.requirements.filter((r) => r.priority === "hard").map((r) => r.id),
 					...contract.forbiddenConditions.map((f) => f.id),
+					...contract.constraints.filter((constraint) => constraint.priority === "hard").map((constraint) => constraint.id),
 				],
+				policyDecision: "gate",
 				escalated: false,
 			};
 		},
@@ -189,6 +226,7 @@ function decide(signals: readonly CheckpointSignal[], escalated: boolean): Check
 		severity,
 		reason: primary.reason,
 		signals: ranked,
+		policyDecision: "gate",
 		relatedRequirements,
 		escalated,
 	};

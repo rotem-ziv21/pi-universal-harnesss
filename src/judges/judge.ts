@@ -37,6 +37,13 @@ export interface JudgeDecision {
 		readonly verdictProbabilities?: Readonly<Record<string, number>>;
 	};
 	readonly usage?: { input?: number; output?: number };
+	readonly debug?: {
+		readonly requestHash: string;
+		readonly semanticHash: string;
+		readonly evidenceIds: readonly string[];
+		readonly request: unknown;
+		readonly response: unknown;
+	};
 }
 
 /**
@@ -60,6 +67,16 @@ export interface JudgeQuery {
 
 /** Everything the Judge is told about the world. Deliberately small. */
 export interface JudgeState {
+	readonly phase: string;
+	readonly normalizedAction: Readonly<{
+		actionType: string;
+		target?: string;
+		targetOwnership: string;
+		mutationType: string;
+		reversibility: string;
+		externalSideEffect: boolean;
+		capabilities: readonly string[];
+	}>;
 	readonly goal: string;
 	readonly checkpoint: string;
 	readonly proposedAction: string;
@@ -70,6 +87,19 @@ export interface JudgeState {
 	readonly forbiddenConditions: readonly string[];
 	readonly verifiedFacts: readonly string[];
 	readonly evidence: ReadonlyArray<{ requirement: string; type: string; source: string; result: string; observedAt: string }>;
+	readonly evidenceBundles: ReadonlyArray<{
+		readonly requirementId: string;
+		readonly selected: ReadonlyArray<{
+			id: string;
+			type: string;
+			source: string;
+			result: string;
+			trust: string;
+			selectionReason: string;
+			observedAt: string;
+		}>;
+		readonly excluded: ReadonlyArray<{ id: string; reason: string }>;
+	}>;
 	readonly hypotheses: readonly string[];
 	readonly recentActions: readonly string[];
 	readonly counters: Readonly<Record<string, number>>;

@@ -215,11 +215,14 @@ export function activate(pi: PiExtensionAPI): void {
 				const task = rt?.getTask();
 				if (!rt || !task || !rt.config.enabled) return undefined;
 
-				const action = toProposedAction({
-					toolName: event.toolName,
-					toolCallId: event.toolCallId,
-					input: event.input ?? {},
-				});
+				const action = toProposedAction(
+					{
+						toolName: event.toolName,
+						toolCallId: event.toolCallId,
+						input: event.input ?? {},
+					},
+					{ cwd: ctx.cwd ?? process.cwd(), contract: task.contract, state: task.state.getState() },
+				);
 
 				if (ctx.hasUI) ctx.ui.setStatus("harness", `checking: ${clamp(action.summary, 40)}`);
 

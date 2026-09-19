@@ -1,6 +1,6 @@
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import { describeContractItem, type TaskContract } from "../contract/schema.ts";
-import { assessFreshness, currentEvidence, currentFacts } from "../state/freshness.ts";
+import { assessFreshness, changedTargetsSince, currentFacts } from "../state/freshness.ts";
 import type { HarnessState } from "../state/types.ts";
 import { clamp } from "../util/json.ts";
 import type { JudgeQuery, JudgeState } from "./judge.ts";
@@ -32,6 +32,17 @@ const LIMITS = {
 	actionArgumentChars: 1200,
 	agentAssessmentChars: 600,
 } as const;
+
+const PAYLOAD_ARGUMENTS: Record<string, true> = {
+	content: true,
+	newText: true,
+	oldText: true,
+	edits: true,
+	data: true,
+	body: true,
+	patch: true,
+	replacement: true,
+};
 
 export interface BuildPayloadArgs {
 	readonly contract: TaskContract;
@@ -78,19 +89,24 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 		}
 	}
 
-	// Nothing was linked and nothing matched: fall back to everything binding. If the
-	// contract could not say what this action threatens, assume it threatens anything hard.
-	if (requirements.length === 0) {
-		for (const r of contract.requirements) {
-			if (r.priority === "hard") requirements.push({ id: r.id, description: r.description, priority: r.priority });
+	// Only an unlinked generic risk falls back to all hard requirements. A checkpoint
+	// linked solely to a constraint must not suddenly require proof of task completion.
+	if (requirements.length === 0 && relevantIds.size === 0) {
+		for (const requirement of contract.requirements) {
+			if (requirement.priority === "hard") {
+				requirements.push({ id: requirement.id, description: requirement.description, priority: requirement.priority });
+			}
 		}
 	}
 
-	// Only hard constraints. Asking the Judge to adjudicate a stated preference wastes
-	// a question and invites it to block on something the user said was negotiable.
-	const constraints = contract.constraints
-		.filter((c) => c.priority === "hard")
-		.map((c) => ({ id: c.id, description: c.description }));
+	const constraints = [
+		...contract.constraints
+			.filter((constraint) => constraint.priority === "hard" && (isCompletion || relevantIds.has(constraint.id)))
+			.map((constraint) => ({ id: constraint.id, description: constraint.description })),
+		...contract.forbiddenConditions
+			.filter((condition) => condition.priority === "hard" && (isCompletion || relevantIds.has(condition.id)))
+			.map((condition) => ({ id: condition.id, description: condition.description })),
+	];
 
 	return {
 		state: buildState(args, requirements),
@@ -108,30 +124,65 @@ function buildState(
 ): JudgeState {
 	const { contract, state, checkpoint, action } = args;
 	const now = Date.now();
-	const requirementIds = new Set(requirements.map((r) => r.id));
+	const evidenceBundles = requirements.map((requirement) => {
+		const selected: Array<{
+			id: string;
+			type: string;
+			source: string;
+			result: string;
+			trust: string;
+			selectionReason: string;
+			observedAt: string;
+		}> = [];
+		const excluded: Array<{ id: string; reason: string }> = [];
+		const ordered = [...state.evidence].sort(
+			(a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt) || a.id.localeCompare(b.id),
+		);
 
-	/**
-	 * Evidence selection: relevant, current and fresh.
-	 *
-	 * Superseded items are excluded because §22 says the Judge receives current truth,
-	 * not the full contradiction history. Stale items are excluded for the same reason —
-	 * an observation taken three state versions ago may describe a world that no longer
-	 * exists, and "decisions from stale state" is one of the failures this exists to
-	 * prevent.
-	 */
-	const evidence = currentEvidence(state.evidence)
-		.filter((e) => e.requirementIds.some((id) => requirementIds.has(id)))
-		.filter((e) => assessFreshness(e, { now, currentStateVersion: state.stateVersion }).fresh)
-		.sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt))
-		.slice(0, LIMITS.evidenceItems)
-		.map((e) => ({
-			// Keyed by description so the Judge sees what it is about, not an opaque id.
-			requirement: e.requirementIds.map((id) => describeContractItem(contract, id)).join("; ") || e.requirementIds.join(","),
-			type: e.type,
-			source: e.source,
-			result: clamp(e.summary, LIMITS.evidenceResultChars),
-			observedAt: e.observedAt,
-		}));
+		for (const item of ordered) {
+			if (!item.requirementIds.includes(requirement.id)) {
+				excluded.push({ id: item.id, reason: "mapped to a different requirement" });
+				continue;
+			}
+			if (item.supersededBy) {
+				excluded.push({ id: item.id, reason: `superseded by ${item.supersededBy}` });
+				continue;
+			}
+			const freshness = assessFreshness(item, {
+				now,
+				currentStateVersion: state.stateVersion,
+				changedTargets: changedTargetsSince(state.actions, item.stateVersion),
+			});
+			if (!freshness.fresh) {
+				excluded.push({ id: item.id, reason: freshness.reason });
+				continue;
+			}
+			if (selected.length >= LIMITS.evidenceItems) {
+				excluded.push({ id: item.id, reason: `bundle limit ${LIMITS.evidenceItems} reached` });
+				continue;
+			}
+			selected.push({
+				id: item.id,
+				type: item.type,
+				source: item.source,
+				result: clamp(item.summary, LIMITS.evidenceResultChars),
+				trust: item.trust,
+				selectionReason: `direct requirementIds mapping; ${item.result}; fresh (${freshness.reason})`,
+				observedAt: item.observedAt,
+			});
+		}
+		return { requirementId: requirement.id, selected, excluded: excluded.slice(0, LIMITS.evidenceItems) };
+	});
+
+	const evidence = evidenceBundles.flatMap((bundle) =>
+		bundle.selected.map((item) => ({
+			requirement: describeContractItem(contract, bundle.requirementId),
+			type: item.type,
+			source: item.source,
+			result: item.result,
+			observedAt: item.observedAt,
+		})),
+	);
 
 	// Explicit user statements always travel with the payload; they outrank everything.
 	const userInstructions = [
@@ -142,20 +193,42 @@ function buildState(
 	];
 
 	return {
+		phase: state.phase,
+		normalizedAction: {
+			actionType: action.actionSemantics.actionType,
+			...(action.actionSemantics.target ? { target: action.actionSemantics.target } : {}),
+			targetOwnership: action.actionSemantics.targetOwnership,
+			mutationType: action.actionSemantics.mutationType,
+			reversibility: action.actionSemantics.reversibility,
+			externalSideEffect: action.actionSemantics.externalSideEffect,
+			capabilities: action.actionSemantics.capabilities,
+		},
 		goal: contract.goal,
 		checkpoint: checkpoint.reason,
 		proposedAction: action.summary,
 		proposedActionArguments: truncateArguments(action.input),
 		userInstructions,
-		relevantRequirements: requirements.map((r) => r.description),
-		hardConstraints: contract.constraints.filter((c) => c.priority === "hard").map((c) => c.description),
-		forbiddenConditions: contract.forbiddenConditions.map((f) => f.description),
+		relevantRequirements: requirements.map((requirement) => requirement.description),
+		hardConstraints: contract.constraints
+			.filter(
+				(constraint) =>
+					constraint.priority === "hard" &&
+					(checkpoint.checkpointType === "completion_claim" || checkpoint.relatedRequirements.includes(constraint.id)),
+			)
+			.map((constraint) => constraint.description),
+		forbiddenConditions: contract.forbiddenConditions
+			.filter(
+				(condition) =>
+					checkpoint.checkpointType === "completion_claim" || checkpoint.relatedRequirements.includes(condition.id),
+			)
+			.map((condition) => condition.description),
 
 		verifiedFacts: currentFacts(state.verifiedFacts)
 			.slice(-LIMITS.verifiedFacts)
 			.map((f) => f.statement),
 
 		evidence,
+		evidenceBundles,
 
 		// Sent explicitly as hypotheses so the Judge cannot mistake a belief for a fact (§18).
 		hypotheses: state.hypotheses
@@ -195,7 +268,10 @@ function buildState(
 function truncateArguments(input: Record<string, unknown>): unknown {
 	const out: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(input)) {
-		if (typeof value === "string") {
+		if (key in PAYLOAD_ARGUMENTS) {
+			const size = typeof value === "string" ? value.length : JSON.stringify(value)?.length ?? 0;
+			out[key] = `[payload omitted: ${size} chars]`;
+		} else if (typeof value === "string") {
 			out[key] = clamp(value, LIMITS.actionArgumentChars);
 		} else if (Array.isArray(value)) {
 			out[key] = value.length > 10 ? [...value.slice(0, 10), `…${value.length - 10} more items`] : value;

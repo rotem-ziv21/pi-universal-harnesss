@@ -1,4 +1,4 @@
-import type { ProposedAction } from "../checkpoints/types.ts";
+import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import type { HarnessConfig } from "../config/schema.ts";
 import type { TaskContract } from "../contract/schema.ts";
 import type { HarnessState } from "../state/types.ts";
@@ -18,7 +18,7 @@ import { nullLogger } from "../util/logger.ts";
  * `checkUserLimits` enforces it as a stop rather than a suggestion.
  */
 
-export type ProgressAction = "CONTINUE" | "CHANGE_STRATEGY" | "STOP_BRANCH" | "MORE_EVIDENCE" | "NEEDS_USER_INPUT";
+export type ProgressAction = "CONTINUE" | "CHANGE_STRATEGY" | "STOP_BRANCH" | "MORE_EVIDENCE" | "NEEDS_USER_INPUT" | "NO_PROGRESS";
 
 export interface ProgressObservation {
 	readonly action: ProgressAction;
@@ -33,6 +33,12 @@ export const CONTINUE: ProgressObservation = { action: "CONTINUE", reason: "Prog
 export interface ProgressMonitor {
 	/** Called before a tool runs. */
 	observeAction(args: { contract: TaskContract; state: HarnessState; action: ProposedAction }): ProgressObservation;
+	/** Called after checkpoint detection, before evidence collection or another Judge call. */
+	observeCheckpoint(args: {
+		state: HarnessState;
+		action: ProposedAction;
+		checkpoint: CheckpointDecision;
+	}): ProgressObservation;
 	/** Called at the end of each turn. */
 	observeTurn(args: { contract: TaskContract; state: HarnessState }): ProgressObservation;
 }
@@ -74,6 +80,35 @@ export function createProgressMonitor(options: { config: HarnessConfig; logger?:
 			return CONTINUE;
 		},
 
+		observeCheckpoint({ state, action, checkpoint }): ProgressObservation {
+			if (!progress.enabled || !checkpoint.needsGate) return CONTINUE;
+			const previous = [...state.checkpoints]
+				.reverse()
+				.find((item) => {
+					if (item.outcome !== "blocked" || item.type !== checkpoint.checkpointType) return false;
+					const priorAction = state.actions.find((candidate) => candidate.id === item.actionId);
+					return (
+						priorAction?.signature === action.signature &&
+						sameItems(item.relatedRequirements, checkpoint.relatedRequirements)
+					);
+				});
+			if (!previous) return CONTINUE;
+
+			const priorDecision = [...state.decisions].reverse().find((decision) => decision.checkpointId === previous.id);
+			if (!priorDecision || priorDecision.decision === "PASS") return CONTINUE;
+			const newEvidence = state.evidence.some((evidence) => evidence.stateVersion > priorDecision.stateVersion);
+			if (newEvidence) return CONTINUE;
+
+			return {
+				action: "NO_PROGRESS",
+				reason: "Same checkpoint failed with no new evidence. Do not retry this action unchanged.",
+				detail: {
+					checkpointId: previous.id,
+					actionType: action.actionSemantics.actionType,
+					previousResult: priorDecision.decision,
+				},
+			};
+		},
 		observeTurn({ contract, state }): ProgressObservation {
 			if (!progress.enabled) return CONTINUE;
 
@@ -187,4 +222,11 @@ function currentCountFor(unit: LimitUnit, state: HarnessState): number | undefin
 			return Math.max(0, ...bySignature.values());
 		}
 	}
+}
+
+
+function sameItems(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	const expected = new Set(a);
+	return b.every((item) => expected.has(item));
 }

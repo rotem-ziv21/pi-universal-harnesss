@@ -26,6 +26,49 @@ export type CheckpointType =
 
 export type CheckpointSeverity = "critical" | "noncritical";
 
+/** Normalized meaning of a tool call. Payload text is deliberately not inspected. */
+export type ActionType =
+	| "file_read"
+	| "file_write"
+	| "file_delete"
+	| "file_move"
+	| "directory_create"
+	| "dependency_change"
+	| "git_commit"
+	| "remote_mutation"
+	| "deployment"
+	| "database_mutation"
+	| "execute_local_code"
+	| "local_command"
+	| "unknown";
+
+export type ActionCapability =
+	| "read_file"
+	| "write_file"
+	| "delete_file"
+	| "move_file"
+	| "create_directory"
+	| "change_dependencies"
+	| "commit_git"
+	| "mutate_remote"
+	| "deploy"
+	| "mutate_database"
+	| "execute_local_code"
+	| "run_tests";
+
+export interface ActionSemantics {
+	readonly actionType: ActionType;
+	readonly target?: string;
+	readonly targetOwnership: "task_created" | "preexisting" | "outside_scope" | "unknown";
+	readonly mutationType: "create" | "modify" | "delete" | "read" | "execute" | "none";
+	/** High means readily reversible; low means irreversible or externally visible. */
+	readonly reversibility: "high" | "medium" | "low";
+	readonly externalSideEffect: boolean;
+	readonly capabilities: readonly ActionCapability[];
+	/** Active command tokens only. Never file content, request bodies, patches, or data. */
+	readonly operationText: string;
+}
+
 /** One reason the detector thinks a gate is needed, with its provenance. */
 export interface CheckpointSignal {
 	readonly type: CheckpointType;
@@ -42,6 +85,8 @@ export interface ProposedAction {
 	readonly id: string;
 	readonly toolName: string;
 	readonly input: Record<string, unknown>;
+	/** Capabilities and side effects inferred from the tool operation, never payload text. */
+	readonly actionSemantics: ActionSemantics;
 	/** One-line human description, used in prompts, logs and block messages. */
 	readonly summary: string;
 	/** Stable hash of the normalized input, for loop detection. */
@@ -56,6 +101,8 @@ export interface CheckpointDecision {
 	readonly signals: readonly CheckpointSignal[];
 	/** Contract item ids the gate should verify before allowing the action. */
 	readonly relatedRequirements: readonly string[];
+	/** Deterministic policy result when no probabilistic Judge is needed. */
+	readonly policyDecision?: "allow" | "block" | "gate";
 	/** True when deterministic signals were inconclusive and the Judge was consulted. */
 	readonly escalated: boolean;
 }
@@ -64,6 +111,7 @@ export const NO_GATE: CheckpointDecision = {
 	needsGate: false,
 	severity: "noncritical",
 	reason: "No checkpoint signals matched this action.",
+	policyDecision: "allow",
 	signals: [],
 	relatedRequirements: [],
 	escalated: false,

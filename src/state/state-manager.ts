@@ -13,6 +13,7 @@ import { createEventStore, createMemoryEventStore } from "./event-store.ts";
 import { initialState, reduce, replay } from "./reducer.ts";
 import type {
 	CheckpointRecord,
+	CompletionEvaluation,
 	EvidenceRef,
 	HarnessEvent,
 	HarnessEventType,
@@ -64,6 +65,7 @@ export interface StateManager {
 	recordJudgeUnavailable(judgeId: string, reason: string): void;
 
 	requestCompletion(): void;
+	recordCompletionEvaluation(evaluation: CompletionEvaluation): void;
 	rejectCompletion(feedback: string): void;
 	completeTask(): void;
 	abandonTask(reason: string): void;
@@ -231,6 +233,7 @@ export function createStateManager(taskId: string, contract: TaskContract, optio
 		recordJudgeUnavailable: (judgeId, reason) => void emit("judge_unavailable", { judgeId, reason }),
 
 		requestCompletion: () => void emit("completion_requested", {}),
+		recordCompletionEvaluation: (evaluation) => void emit("completion_evaluated", { evaluation }),
 		rejectCompletion: (feedback) => void emit("completion_rejected", { feedback }),
 
 		completeTask() {

@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { classifyAction } from "../src/checkpoints/action-semantics.ts";
 import type { ProposedAction } from "../src/checkpoints/types.ts";
 import { defaultConfig } from "../src/config/loader.ts";
 import type { HarnessPaths } from "../src/config/paths.ts";
@@ -40,6 +41,7 @@ export function action(toolName: string, input: Record<string, unknown>, summary
 		id: `act-${Math.random().toString(36).slice(2, 8)}`,
 		toolName,
 		input,
+		actionSemantics: classifyAction(toolName, input, { cwd: process.cwd() }),
 		summary: summary ?? `${toolName} ${JSON.stringify(input).slice(0, 80)}`,
 		signature: hashValue({ tool: toolName, input }),
 	};

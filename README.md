@@ -168,25 +168,31 @@ fact. "SQL injection" is a hypothesis, and it is stored as one.
 
 ### 5. Checkpoint detection
 
-Three tiers, cheapest first:
+Every tool call is first normalized into active semantics:
 
 ```
-Is the action mutating?  ──no──►  allowed, zero I/O, zero cost
-         │ yes
-         ▼
-Contract signals         ──hit──►  gate   (exact, free, decisive)
-         │ none
-         ▼
-Generic signals          ──strong──►  gate   (documented heuristics)
-         │ weak
-         ▼
-Judge escalation (one noul question, ~70–500ms)
+actionType · target · targetOwnership · mutationType · reversibility
+externalSideEffect · capabilities
 ```
 
-Contract signals come from the contract's own `criticalActions`, hard `constraints` and
-`forbiddenConditions`. Generic signals describe *effects on the world* — external
-mutation, destruction, irreversibility — never tool names. `external_mutation` covers
-`git push`, `curl -X POST`, an S3 upload and sending an email equally.
+Only operation fields are classified. File content, patches, replacement text and
+request bodies are data; words such as `unlink`, `rm -rf` or `git push` inside that data
+cannot become destructive-action signals.
+
+Checkpoint policy then runs cheapest-first:
+
+```
+Read-only?                       ──yes──► allow
+Direct hard-policy violation?   ──yes──► block without a Judge
+Relevant conditional contract? ──yes──► evidence gate
+Reversible local PLAN/BUILD?    ──yes──► allow construction
+Generic high-risk side effect?  ──yes──► evidence gate
+Ambiguous residual risk?        ──yes──► narrow Judge escalation
+```
+
+Constraint matching is capability-aware. A dependency constraint can match an actual
+package installation, but not a README write; a delete prohibition can match an actual
+delete operation, but not source code that mentions deletion.
 
 > A gap found during live testing: the contract named "delete the .log files" as
 > critical. `find … -delete` was correctly blocked three times, and the model then
@@ -199,18 +205,22 @@ mutation, destruction, irreversibility — never tool names. `external_mutation`
 ### 6. Evidence planning and collection
 
 Once a checkpoint fires, the planner asks: *what must be proven before this may proceed?*
+Planning happens before the final gate decision so the harness can detect circular
+dependencies: reversible task-local construction needed to create the proof is allowed
+during BUILD rather than being blocked for not already having that proof.
 
 The answer comes from the contract, not from a checklist:
 
-1. Skip requirements that fresh evidence already covers.
-2. Derive a check — from a machine-checkable `check`, from the success condition's own
-   `verificationHint`, or from project `preferredCommands`.
-3. Anything with no available route is reported as **unverifiable** rather than silently
-   dropped. The Judge is told a requirement could not be checked.
+1. Skip a requirement only when fresh, non-superseded evidence explicitly supports it.
+2. Derive a check from a machine-checkable `check`, the condition's
+   `verificationHint`, or project `preferredCommands`.
+3. Record failed checks as contradictory evidence, never as satisfaction.
+4. Report items with no route as **unverifiable** rather than silently dropping them.
 
-Requirements no command can settle — *"the image is thematically about Kubernetes"* —
-become reviewer requests, and reviewer output is recorded at trust level
-`model_interpretation`, not as runtime evidence.
+Judge payloads contain a stable evidence bundle per requirement. Each bundle names
+selected evidence and why it was selected, plus bounded exclusion reasons for stale,
+superseded or differently mapped evidence. Reviewer output remains
+`model_interpretation`, never runtime fact.
 
 ### 7. The Judge
 
@@ -264,9 +274,10 @@ answers — and when it does, the narrower questions win:
 ### 8. Compact payloads
 
 The full Pi context is never sent. A 262K window costs money, adds latency, and buries
-the three facts that matter. The payload carries only what bears on this checkpoint:
-relevant requirements, explicit user constraints, current fresh evidence, recent
-actions, counters, `stateVersion`.
+the facts that matter. The payload carries the current phase, normalized action
+semantics, only the requirements and constraints relevant to this checkpoint, and a
+requirement-specific evidence bundle. Source bodies, patches and request payloads are
+replaced with size-only omission markers.
 
 **The worker cannot write this object.** Its opinion may appear only as:
 
@@ -287,30 +298,26 @@ exists:
 Judge evaluated v41 → state is now v43 → decision recorded, NOT applied → re-evaluate
 ```
 
-### 10. The completion gate
+### 10. Phase-aware completion
+
+Task execution advances through `PLAN → BUILD → VERIFY → FINALIZE`. Reversible,
+task-local construction is allowed in PLAN and BUILD; irreversible and external actions
+remain gated. A rejected completion returns to VERIFY.
 
 The worker cannot declare "task completed" and bypass verification. The gate runs from
-Pi's `agent_settled` event, which fires when Pi will not continue on its own — that is
-the moment the worker has effectively declared it finished, whatever words it used.
+Pi's `agent_settled` event, which fires when Pi will not continue on its own.
+
+At FINALIZE every hard requirement, success condition, constraint and forbidden
+condition receives its own `SATISFIED`, `UNSATISFIED` or `UNKNOWN` result. The harness
+settles runtime-observable facts first: test exit status, exact command output, file
+existence/content, and the event-log absence or presence of forbidden actions.
+`UNSATISFIED` blocks directly; only `UNKNOWN` conditions reach the Judge. A single
+opaque verdict therefore cannot erase already-proven conditions.
 
 On rejection the harness pushes structured feedback back with `triggerTurn`, so the
-worker resumes with the gaps spelled out instead of the session ending on an unverified
-claim:
-
-```
-COMPLETION REJECTED — the task is not finished.
-
-Missing:
-  - s1: The test suite passes — no runtime evidence has been collected.
-
-Success conditions not yet verified:
-  - s1: The test suite passes
-      verify by: run `npm test`
-
-Judge: openrouter/~typesafe/jev-latest · MORE_EVIDENCE · confidence 0.94 · state v147
-
-Continue the task: gather the missing evidence, then declare completion again.
-```
+worker resumes with the exact remaining conditions instead of repeating the same
+action. Retrying an equivalent blocked checkpoint without new evidence returns
+`NO_PROGRESS` before another Judge call.
 
 ---
 
@@ -401,6 +408,8 @@ artifact to keep in sync.
 | `/harness evidence` | Evidence with provenance, trust level and freshness |
 | `/harness decision [id]` | Judge decisions in full, including ones not applied |
 | `/harness judge` | Judge configuration and usage accounting |
+| `/harness judge-debug [id] [full]` | Requirement ids, evidence ids, payload/semantic hashes, normalized decision; `full` prints redacted request/response |
+| `/harness checkpoint-debug [id]` | Normalized action, matched capabilities/constraints, phase, dependency analysis and final policy |
 | `/harness enable` / `disable` | Toggle the harness (persisted) |
 | `/harness abandon [reason]` | End the current task without completing it |
 
@@ -590,8 +599,8 @@ delete the explanation rather than keep the property.
 │   │                render · runtime
 │   ├── contract/    schema · compiler · reviewer · revisions
 │   ├── state/       types · event-store · reducer · state-manager · freshness
-│   ├── checkpoints/ types · detector · signals
-│   ├── evidence/    types · planner · collector
+│   ├── checkpoints/ types · action-semantics · detector · signals
+│   ├── evidence/    types · planner · collector · dependency · completion
 │   ├── judges/      judge · payload · normalize · openrouter-jev
 │   │                model-judge · deterministic · router
 │   ├── progress/    monitor

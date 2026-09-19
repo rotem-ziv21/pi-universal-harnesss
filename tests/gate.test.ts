@@ -224,7 +224,7 @@ describe("The completion gate (§44)", () => {
 			assert.ok(outcome.message?.includes("s1"));
 
 			const s = state.getState();
-			assert.equal(s.phase, "active", "a rejected completion returns to active, not completed");
+			assert.equal(s.phase, "verify", "a rejected completion returns to verification, not completed");
 			assert.equal(s.counters.completionAttempts, 1);
 			assert.ok(s.lastCompletionFeedback?.includes("COMPLETION REJECTED"));
 		} finally {

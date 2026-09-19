@@ -232,17 +232,22 @@ describe("Judge failures", () => {
 		assert.equal(calls, 3, "should attempt once plus two retries");
 	});
 
-	test("a malformed response is rejected rather than half-interpreted", async () => {
+	test("a malformed response is retried, then rejected rather than half-interpreted", async () => {
+		let calls = 0;
 		const judge = createOpenRouterJevJudge({
-			config: { ...config.judge, maxRetries: 0 },
+			config: { ...config.judge, maxRetries: 1 },
 			getApiKey: async () => "sk-or-v1-test",
-			fetchImpl: fakeFetch(() => ({ body: { model: "jev", nonsense: true } })),
+			fetchImpl: fakeFetch(() => {
+				calls++;
+				return { body: { model: "jev", nonsense: true } };
+			}),
 		});
 
 		await assert.rejects(
 			() => judge.evaluate({ state: {} as never, requirements: [], constraints: [], checkpointType: "x", stateVersion: 1 }),
 			(e: unknown) => e instanceof HarnessError && e.code === "JUDGE_BAD_RESPONSE",
 		);
+		assert.equal(calls, 2);
 	});
 
 	test("a critical checkpoint fails closed when every Judge is down and there is no UI", async () => {
@@ -423,7 +428,7 @@ describe("Judge decision normalization", () => {
 			body: { model: "jev", answers: { verdict: choiceAnswer("PASS", { PASS: 1 }, 0.99), req_r1: noulAnswer(0.9), con_c1: noulAnswer(0) } },
 		}));
 
-		await createOpenRouterJevJudge({ config: config.judge, getApiKey: async () => "sk-or-v1-test", fetchImpl }).evaluate(query);
+		const decision = await createOpenRouterJevJudge({ config: config.judge, getApiKey: async () => "sk-or-v1-test", fetchImpl }).evaluate(query);
 
 		const call = fetchImpl.calls[0]!;
 		assert.ok(call.url.endsWith("/alpha/decisions"), `expected the decisions endpoint, got ${call.url}`);
@@ -433,6 +438,12 @@ describe("Judge decision normalization", () => {
 		assert.equal(body.questions.verdict?.type, "choice");
 		assert.equal(body.questions.req_r1?.type, "noul");
 		assert.equal(body.questions.con_c1?.type, "noul");
+		assert.ok(decision.debug?.requestHash);
+		assert.ok(decision.debug?.semanticHash);
+		assert.deepEqual(decision.debug?.evidenceIds, []);
+		const debugRequest = decision.debug?.request;
+		assert.ok(debugRequest && typeof debugRequest === "object" && "questions" in debugRequest);
+		assert.deepEqual(debugRequest.questions, body.questions);
 
 		// OpenRouter rejects null choice criteria, so every option must carry a string.
 		const criteria = body.questions.verdict?.criteria as Record<string, unknown>;
@@ -456,6 +467,7 @@ describe("Evidence contradictions and freshness", () => {
 			source: "GET /health",
 			freshnessClass: "temporary" as const,
 			trust: "runtime_evidence" as const,
+			result: "unknown" as const,
 		};
 
 		state.addEvidence({ ...base, id: "evd-1", summary: "HTTPS unavailable", observedAt: "2026-01-01T00:00:00Z", stateVersion: 1 });
@@ -475,6 +487,7 @@ describe("Evidence contradictions and freshness", () => {
 			stateVersion: 1,
 			freshnessClass: "temporary" as const,
 			trust: "runtime_evidence" as const,
+			result: "unknown" as const,
 			sourceType: "api" as const,
 		};
 
@@ -568,6 +581,7 @@ describe("Progress and user-defined limits (§43)", () => {
 				toolName: "bash",
 				summary: "build",
 				signature: repeated.signature,
+				actionSemantics: repeated.actionSemantics,
 				at: new Date().toISOString(),
 				stateVersion: state.getVersion(),
 				outcome: "failed",
@@ -593,6 +607,7 @@ describe("Progress and user-defined limits (§43)", () => {
 				toolName: "bash",
 				summary: "build",
 				signature: repeated.signature,
+				actionSemantics: repeated.actionSemantics,
 				at: new Date().toISOString(),
 				stateVersion: state.getVersion(),
 				outcome: "failed",
@@ -616,6 +631,7 @@ describe("Progress and user-defined limits (§43)", () => {
 				toolName: "read",
 				summary: "read",
 				signature: repeated.signature,
+				actionSemantics: repeated.actionSemantics,
 				at: new Date().toISOString(),
 				stateVersion: state.getVersion(),
 				outcome: "succeeded",
@@ -644,6 +660,7 @@ describe("State persistence and recovery (§49)", () => {
 				stateVersion: first.getVersion(),
 				freshnessClass: "temporary",
 				trust: "runtime_evidence",
+				result: "supported",
 			});
 			const versionBefore = first.getVersion();
 			first.flush();

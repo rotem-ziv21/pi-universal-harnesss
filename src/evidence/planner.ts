@@ -1,7 +1,7 @@
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import type { ProjectConfig } from "../config/schema.ts";
 import type { TaskContract } from "../contract/schema.ts";
-import { assessFreshness, evidenceFor } from "../state/freshness.ts";
+import { assessFreshness, changedTargetsSince, evidenceFor } from "../state/freshness.ts";
 import type { HarnessState } from "../state/types.ts";
 import { newId } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
@@ -52,7 +52,14 @@ export function createEvidencePlanner(options: { logger?: Logger } = {}): Eviden
 			for (const target of targets) {
 				// Step 1 — is it already proven, freshly?
 				const existing = evidenceFor(state.evidence, target.id).filter(
-					(e) => assessFreshness(e, { now, currentStateVersion: state.stateVersion }).fresh,
+					(item) =>
+						item.result === "supported" &&
+						item.trust === "runtime_evidence" &&
+						assessFreshness(item, {
+							now,
+							currentStateVersion: state.stateVersion,
+							changedTargets: changedTargetsSince(state.actions, item.stateVersion),
+						}).fresh,
 				);
 				if (existing.length > 0) {
 					alreadySatisfied.push(target.id);
@@ -206,13 +213,14 @@ function deriveRequests(
 		if (!source) continue;
 		const command = extractCommand(source);
 		if (command) {
+			const expectation = expectedOutput(source, target.description, command);
 			return [
 				{
 					id: newId("evr"),
 					requirementIds,
 					kind: "command",
 					description: `Verify "${target.description}" by running: ${command}`,
-					parameters: { command },
+					parameters: { command, ...expectation },
 					necessity,
 					cost: "moderate",
 					freshnessClass: "temporary",
@@ -288,6 +296,20 @@ export function extractCommand(hint: string): string | undefined {
  * collection runs commands the harness derived, not commands a user reviewed, so the
  * bar for what may run is high.
  */
+function expectedOutput(
+	hint: string,
+	description: string,
+	command: string,
+): { expectedOutput?: string; outputComparison?: "exact" | "first_token" } {
+	const explicit =
+		/\b(?:returns?|outputs?|prints?|equals?|expected(?: output)?(?: is|:)?|must (?:be|equal))\s+[`"']?([^`"',.;\s]+)/i.exec(hint);
+	if (explicit?.[1]) return { expectedOutput: explicit[1].trim(), outputComparison: "exact" };
+	if (/^wc\s+-l\b/i.test(command) && /\b(empty|zero rows?|no rows?)\b/i.test(description)) {
+		return { expectedOutput: "0", outputComparison: "first_token" };
+	}
+	return {};
+}
+
 function looksRunnable(candidate: string): boolean {
 	const text = candidate.trim();
 	if (text.length < 2 || text.length > 200) return false;

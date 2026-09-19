@@ -1,5 +1,6 @@
 import type { ContractRevision } from "../contract/revisions.ts";
 import type { TaskContract } from "../contract/schema.ts";
+import type { ActionSemantics, CheckpointSignal } from "../checkpoints/types.ts";
 
 /**
  * Canonical state (§16) and the event vocabulary (§19).
@@ -13,12 +14,17 @@ export type TaskPhase =
 	| "compiling"
 	| "reviewing"
 	| "awaiting_user"
+	| "plan"
+	| "build"
+	| "verify"
+	| "finalize"
+	| "completed"
+	| "abandoned"
+	/** Accepted when replaying task logs written by harness versions before phase-aware gating. */
 	| "active"
 	| "gating"
 	| "blocked"
-	| "completing"
-	| "completed"
-	| "abandoned";
+	| "completing";
 
 /** §17 trust levels, as a type rather than a convention. */
 export type TrustLevel =
@@ -50,6 +56,8 @@ export interface EvidenceRef {
 	readonly stateVersion: number;
 	readonly freshnessClass: FreshnessClass;
 	readonly trust: TrustLevel;
+	/** Deterministic interpretation of the observation itself. */
+	readonly result: "supported" | "contradicted" | "unknown";
 	/** Set when superseded by a later, contradicting observation (§22). History is never deleted. */
 	readonly supersededBy?: string;
 	readonly supersededAt?: string;
@@ -98,6 +106,7 @@ export interface RecordedAction {
 	readonly signature: string;
 	readonly at: string;
 	readonly stateVersion: number;
+	readonly actionSemantics: ActionSemantics;
 	readonly outcome: "pending" | "allowed" | "blocked" | "succeeded" | "failed";
 	readonly resultSummary?: string;
 	readonly checkpointId?: string;
@@ -112,6 +121,15 @@ export interface CheckpointRecord {
 	readonly severity: "critical" | "noncritical";
 	readonly at: string;
 	readonly stateVersion: number;
+	readonly phase: TaskPhase;
+	readonly actionSemantics: ActionSemantics;
+	readonly signals: readonly CheckpointSignal[];
+	readonly policyDecision: "allow" | "block" | "gate";
+	readonly dependencyAnalysis?: {
+		readonly dependsOnBlockedAction: boolean;
+		readonly requirementIds: readonly string[];
+		readonly reason: string;
+	};
 	readonly outcome?: "allowed" | "blocked" | "user_approved" | "user_rejected";
 }
 
@@ -129,6 +147,18 @@ export interface JudgeDecisionRecord {
 	readonly latencyMs?: number;
 	readonly applied: boolean;
 	readonly staleReason?: string;
+	readonly detail?: {
+		readonly requirementSupport?: Readonly<Record<string, number>>;
+		readonly constraintViolation?: Readonly<Record<string, number>>;
+		readonly verdictProbabilities?: Readonly<Record<string, number>>;
+	};
+	readonly debug?: {
+		readonly requestHash: string;
+		readonly semanticHash: string;
+		readonly evidenceIds: readonly string[];
+		readonly request: unknown;
+		readonly response: unknown;
+	};
 }
 
 export interface Counters {
@@ -140,6 +170,25 @@ export interface Counters {
 	completionAttempts: number;
 	contractRevisions: number;
 	turns: number;
+}
+
+export type CompletionConditionStatus = "SATISFIED" | "UNSATISFIED" | "UNKNOWN";
+
+export interface CompletionConditionResult {
+	readonly id: string;
+	readonly description: string;
+	readonly priority: "hard" | "soft";
+	readonly kind: "requirement" | "success" | "constraint" | "forbidden";
+	readonly status: CompletionConditionStatus;
+	readonly reason: string;
+	readonly evidenceIds: readonly string[];
+	readonly deterministic: boolean;
+}
+
+export interface CompletionEvaluation {
+	readonly stateVersion: number;
+	readonly evaluatedAt: string;
+	readonly conditions: readonly CompletionConditionResult[];
 }
 
 export interface HarnessState {
@@ -164,6 +213,7 @@ export interface HarnessState {
 	readonly updatedAt: string;
 	/** Set when the completion gate refused, so the next attempt knows what was missing. */
 	readonly lastCompletionFeedback?: string;
+	readonly lastCompletionEvaluation?: CompletionEvaluation;
 }
 
 // --- events ---
@@ -198,6 +248,7 @@ export type HarnessEventType =
 	| "user_intervention"
 	| "completion_requested"
 	| "completion_rejected"
+	| "completion_evaluated"
 	| "task_completed"
 	| "task_abandoned";
 
