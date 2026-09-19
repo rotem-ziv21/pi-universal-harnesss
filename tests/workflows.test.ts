@@ -386,3 +386,58 @@ describe("Cross-workflow: the harness is genuinely task-agnostic", () => {
 		assert.equal(shapes[0], shapes[1]);
 	});
 });
+
+describe("Repository completeness", () => {
+	/**
+	 * Regression test for a bug that only appeared on other people's machines.
+	 *
+	 * `.gitignore` contained the unanchored pattern `state/`, which matched
+	 * `src/state/` as well as the intended local state directory. The whole
+	 * canonical-state module was therefore never committed. Everything worked where
+	 * it was authored — the files exist there, merely untracked — and every fresh
+	 * clone died at startup with "Cannot find module '../state/freshness.ts'".
+	 *
+	 * Type-checking and unit tests both passed throughout, because they read the
+	 * working tree rather than the repository. Only git knows the difference.
+	 */
+	test("every source file the harness imports is tracked in git", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { readdirSync, statSync } = await import("node:fs");
+		const { join, relative } = await import("node:path");
+
+		const root = new URL("..", import.meta.url).pathname;
+
+		let tracked: Set<string>;
+		try {
+			const output = execFileSync("git", ["ls-files", "src", "tests", "index.ts", "scripts"], {
+				cwd: root,
+				encoding: "utf8",
+			});
+			tracked = new Set(output.split("\n").filter(Boolean));
+		} catch {
+			return; // Not a git checkout (e.g. installed as a package copy); nothing to assert.
+		}
+
+		const onDisk: string[] = [];
+		const walk = (dir: string): void => {
+			for (const entry of readdirSync(dir)) {
+				if (entry === "node_modules" || entry.startsWith(".")) continue;
+				const full = join(dir, entry);
+				if (statSync(full).isDirectory()) walk(full);
+				else if (/\.(ts|sh)$/.test(entry)) onDisk.push(relative(root, full));
+			}
+		};
+		walk(join(root, "src"));
+		walk(join(root, "tests"));
+		walk(join(root, "scripts"));
+
+		const untracked = onDisk.filter((f) => !tracked.has(f));
+
+		assert.deepEqual(
+			untracked,
+			[],
+			`These source files exist on disk but are NOT in git, so a fresh clone would be broken:\n  ${untracked.join("\n  ")}\n` +
+				"Check .gitignore for an unanchored pattern.",
+		);
+	});
+});
