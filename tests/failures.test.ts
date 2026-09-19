@@ -9,7 +9,7 @@ import { createOpenRouterJevJudge } from "../src/judges/openrouter-jev.ts";
 import { resolveMountPoint } from "../src/pi/doctor.ts";
 import { createKeyResolver, OPENROUTER_ENV_VAR, writeSecret } from "../src/security/secrets.ts";
 import { createJudgeRouter } from "../src/judges/router.ts";
-import { createStubModelAdapter } from "../src/models/model-adapter.ts";
+import { createPinnedModelAdapter, createStubModelAdapter } from "../src/models/model-adapter.ts";
 import { completeStructured } from "../src/models/structured.ts";
 import { checkUserLimits, createProgressMonitor, parseNumericLimit } from "../src/progress/monitor.ts";
 import { createStateManager, restoreStateManager } from "../src/state/state-manager.ts";
@@ -911,6 +911,85 @@ describe("Credentials come from Pi itself (§/login)", () => {
 		await assert.rejects(
 			() => judge.evaluate({ state: {} as never, requirements: [], constraints: [], checkpointType: "x", stateVersion: 1 }),
 			(e: unknown) => e instanceof HarnessError && e.code === "JUDGE_AUTH_MISSING" && /\/login/.test(e.message),
+		);
+	});
+});
+
+describe("Pinning a specific model for the compiler or reviewer", () => {
+	/**
+	 * Regression test for a bug that only appears with a *real* registry.
+	 *
+	 * Pi's ModelRegistry is a class, so `complete` lives on the prototype. The pinned
+	 * adapter used to swap the model lookup by spreading the registry
+	 * (`{...registry, find: () => model}`), and object spread copies own properties
+	 * only — producing an object with no `complete` at all. Every pinned call threw
+	 * "registry.complete is not a function".
+	 *
+	 * A plain object literal as a test double would have hidden this completely, which
+	 * is why the fake below is a class.
+	 */
+	class FakeRegistry {
+		calls: unknown[] = [];
+		known: Record<string, unknown>;
+
+		constructor(known: Record<string, unknown>) {
+			this.known = known;
+		}
+
+		find(provider: string, modelId: string): unknown {
+			return this.known[`${provider}/${modelId}`];
+		}
+		hasConfiguredAuth(): boolean {
+			return false; // A locally served model has no credential.
+		}
+		getProvider(id: string): { baseUrl?: string } | undefined {
+			return id === "llama-cpp" ? { baseUrl: "http://127.0.0.1:8080/v1" } : { baseUrl: "https://api.example.com" };
+		}
+		async complete(model: unknown): Promise<{ content: Array<{ type: string; text?: string }> }> {
+			this.calls.push(model);
+			return { content: [{ type: "text", text: "pinned reply" }] };
+		}
+	}
+
+	test("a pinned model actually completes, rather than losing the registry's methods", async () => {
+		const localModel = { id: "qwen27b-local", provider: "llama-cpp" };
+		const registry = new FakeRegistry({ "llama-cpp/qwen27b-local": localModel });
+
+		const adapter = createPinnedModelAdapter(
+			{ modelRegistry: registry as never, model: undefined },
+			"llama-cpp",
+			"qwen27b-local",
+		);
+
+		const response = await adapter.complete({ systemPrompt: "s", userPrompt: "u" });
+
+		assert.equal(response.text, "pinned reply");
+		assert.equal(adapter.id, "llama-cpp/qwen27b-local");
+		assert.deepEqual(registry.calls[0], localModel, "the pinned model must be the one handed to the registry");
+	});
+
+	test("a locally served model counts as available despite having no credential", () => {
+		const registry = new FakeRegistry({ "llama-cpp/qwen27b-local": { id: "qwen27b-local", provider: "llama-cpp" } });
+		const adapter = createPinnedModelAdapter({ modelRegistry: registry as never, model: undefined }, "llama-cpp", "qwen27b-local");
+
+		assert.equal(adapter.available, true, "a local model needs no API key; refusing it would break local setups");
+	});
+
+	test("a remote model with no configured auth is reported unavailable", () => {
+		const registry = new FakeRegistry({ "openai/gpt-5.2": { id: "gpt-5.2", provider: "openai" } });
+		const adapter = createPinnedModelAdapter({ modelRegistry: registry as never, model: undefined }, "openai", "gpt-5.2");
+
+		assert.equal(adapter.available, false);
+	});
+
+	test("an unknown model id fails with a message that says how to find the right one", async () => {
+		const registry = new FakeRegistry({});
+		const adapter = createPinnedModelAdapter({ modelRegistry: registry as never, model: undefined }, "llama-cpp", "typo");
+
+		assert.equal(adapter.available, false);
+		await assert.rejects(
+			() => adapter.complete({ systemPrompt: "s", userPrompt: "u" }),
+			(e: unknown) => e instanceof HarnessError && e.code === "MODEL_UNAVAILABLE" && /\/model/.test(e.message),
 		);
 	});
 });

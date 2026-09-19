@@ -72,17 +72,41 @@ interface PiUsage {
  * borrows the session's model without ever naming it.
  */
 export function createCurrentModelAdapter(host: PiModelHost): ModelAdapter {
-	const registry = host.modelRegistry;
 	const model = host.model;
-	const id = model ? `${model.provider}/${model.id}` : "unknown";
-	const available = Boolean(registry && model);
+	return createAdapter({
+		registry: host.modelRegistry,
+		model,
+		id: model ? `${model.provider}/${model.id}` : "unknown",
+		available: Boolean(host.modelRegistry && model),
+		unavailableMessage: "No active Pi model is available for harness model calls.",
+	});
+}
+
+/**
+ * The single implementation both adapters share.
+ *
+ * `registry` and `model` are passed through untouched. An earlier version built the
+ * pinned adapter by spreading the registry (`{...registry, find: () => model}`) to
+ * swap the lookup — which silently produced an object with no `complete` method,
+ * because Pi's ModelRegistry is a class and spread copies only own properties, not
+ * the prototype. Pinning any model threw "registry.complete is not a function" on the
+ * first call. Passing the model alongside the registry avoids the whole problem.
+ */
+function createAdapter(args: {
+	registry: PiModelHost["modelRegistry"];
+	model: unknown;
+	id: string;
+	available: boolean;
+	unavailableMessage: string;
+}): ModelAdapter {
+	const { registry, model, id } = args;
 
 	return {
 		id,
-		available,
+		available: args.available,
 		async complete(request: ModelRequest): Promise<ModelResponse> {
 			if (!registry || !model) {
-				throw new HarnessError("MODEL_UNAVAILABLE", "No active Pi model is available for harness model calls.");
+				throw new HarnessError("MODEL_UNAVAILABLE", args.unavailableMessage, { details: { model: id } });
 			}
 			if (request.signal?.aborted) {
 				throw new HarnessError("ABORTED", "Model call aborted before it started.");
@@ -123,31 +147,42 @@ export function createCurrentModelAdapter(host: PiModelHost): ModelAdapter {
 }
 
 /**
- * Adapter pinned to a specific `provider/model`, for
- * `compiler.provider = "pinned"` with `compiler.model = "openai/gpt-5-mini"`.
- * Falls back to reporting itself unavailable rather than throwing at construction.
+ * Adapter pinned to a specific `provider/model`, so the compiler or reviewer can use
+ * a model other than the one the session happens to be on — a cheap local model, or a
+ * deliberately different one for the reviewer so it does not share the compiler's
+ * blind spots.
+ *
+ * Reports itself unavailable rather than throwing at construction, so a typo in the
+ * config surfaces in `/harness status` instead of breaking startup.
  */
 export function createPinnedModelAdapter(host: PiModelHost, provider: string, modelId: string): ModelAdapter {
 	const registry = host.modelRegistry;
-	const id = `${provider}/${modelId}`;
 	const model = registry?.find(provider, modelId);
-	const available = Boolean(registry && model && registry.hasConfiguredAuth(model));
 
-	return {
-		id,
+	/**
+	 * `hasConfiguredAuth` is a *reporting* signal, not a gate. A locally served model
+	 * needs no credential, and refusing to run one because Pi lists no auth for it
+	 * would break exactly the local-model case this exists to support.
+	 */
+	const available = Boolean(registry && model && (registry.hasConfiguredAuth(model) || isLocal(registry, provider)));
+
+	return createAdapter({
+		registry,
+		model,
+		id: `${provider}/${modelId}`,
 		available,
-		async complete(request: ModelRequest): Promise<ModelResponse> {
-			if (!registry || !model) {
-				throw new HarnessError("MODEL_UNAVAILABLE", `Model ${id} is not available or has no configured auth.`, {
-					details: { model: id },
-				});
-			}
-			return createCurrentModelAdapter({
-				model: { id: modelId, provider },
-				modelRegistry: { ...registry, find: () => model },
-			}).complete(request);
-		},
-	};
+		unavailableMessage: `Model ${provider}/${modelId} was not found in Pi's registry. Check the provider and model ids with /model.`,
+	});
+}
+
+/** A provider served from the loopback interface needs no API key. */
+function isLocal(registry: NonNullable<PiModelHost["modelRegistry"]>, provider: string): boolean {
+	try {
+		const base = (registry as { getProvider?(id: string): { baseUrl?: string } | undefined }).getProvider?.(provider)?.baseUrl;
+		return typeof base === "string" && /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i.test(base);
+	} catch {
+		return false;
+	}
 }
 
 /** Deterministic adapter for tests. */
