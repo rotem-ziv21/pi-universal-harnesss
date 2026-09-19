@@ -1027,6 +1027,9 @@ describe("Choosing the model for harness roles", () => {
 			host: { model: { id: "kimi", provider: "openrouter" }, modelRegistry: new Registry() as never },
 			cwd: paths.configDir,
 			projectTrusted: false,
+			// Hermetic: without this the runtime resolves the real user config and these
+			// tests would write settings onto the machine running them.
+			paths,
 		});
 
 	test("both roles follow Pi's model until they are pinned", () => {
@@ -1126,5 +1129,82 @@ describe("Choosing the model for harness roles", () => {
 		} finally {
 			paths.cleanup();
 		}
+	});
+});
+
+describe("Model calls cannot hang the session", () => {
+	/**
+	 * A local model on modest hardware can take minutes for one call, and the harness
+	 * had no budget at all for the compiler and reviewer — only the Judge did. A stalled
+	 * model held the whole Pi session open with nothing on screen but "Reviewing…".
+	 */
+	test("a model that never answers fails with a budget message instead of hanging", async () => {
+		const hung = {
+			id: "local/slow",
+			available: true,
+			complete: (request: { signal?: AbortSignal }) =>
+				new Promise<never>((_resolve, reject) => {
+					request.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				}),
+		};
+
+		await assert.rejects(
+			() =>
+				completeStructured(hung, {
+					systemPrompt: "s",
+					userPrompt: "u",
+					schema: Type.Object({ goal: Type.String() }),
+					timeoutMs: 60,
+					maxRepairAttempts: 0,
+				}),
+			(e: unknown) =>
+				e instanceof HarnessError && e.code === "MODEL_UNAVAILABLE" && /did not respond within/.test(e.message),
+		);
+	});
+
+	test("the caller's own abort is reported as an abort, not as a timeout", async () => {
+		const controller = new AbortController();
+		const hung = {
+			id: "local/slow",
+			available: true,
+			complete: (request: { signal?: AbortSignal }) =>
+				new Promise<never>((_resolve, reject) => {
+					request.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				}),
+		};
+
+		const pending = completeStructured(hung, {
+			systemPrompt: "s",
+			userPrompt: "u",
+			schema: Type.Object({ goal: Type.String() }),
+			timeoutMs: 60_000,
+			signal: controller.signal,
+		});
+
+		controller.abort();
+		await assert.rejects(pending, (e: unknown) => e instanceof HarnessError && e.code === "ABORTED");
+	});
+
+	test("progress is reported per attempt, so a slow model looks busy rather than stuck", async () => {
+		const attempts: Array<[number, number]> = [];
+		let call = 0;
+
+		const flaky = createStubModelAdapter(() => {
+			call++;
+			return call === 1 ? "not json at all" : '{"goal":"ok"}';
+		});
+
+		const result = await completeStructured<{ goal: string }>(flaky, {
+			systemPrompt: "s",
+			userPrompt: "u",
+			schema: Type.Object({ goal: Type.String() }),
+			onAttempt: (attempt, total) => attempts.push([attempt, total]),
+		});
+
+		assert.equal(result.value.goal, "ok");
+		assert.deepEqual(attempts, [
+			[1, 3],
+			[2, 3],
+		]);
 	});
 });

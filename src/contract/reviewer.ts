@@ -54,7 +54,12 @@ export type ContractReview = Static<typeof ContractReviewSchema>;
 
 export interface ContractReviewer {
 	readonly id: string;
-	review(args: { request: string; contract: TaskContract; signal?: AbortSignal | undefined }): Promise<ContractReview>;
+	review(args: {
+		request: string;
+		contract: TaskContract;
+		signal?: AbortSignal | undefined;
+		onAttempt?: ((attempt: number, total: number) => void) | undefined;
+	}): Promise<ContractReview>;
 }
 
 const SYSTEM_PROMPT = `You audit a proposed Task Contract against the user's original request.
@@ -105,12 +110,12 @@ Do not invent findings to appear useful. An empty findings array with PASS is a
 perfectly good and common result. Padding this list makes the harness worse,
 because a spurious REVISE burns a model call and can degrade a good contract.`;
 
-export function createModelContractReviewer(adapter: ModelAdapter, options: { logger?: Logger; maxRepairAttempts?: number } = {}): ContractReviewer {
+export function createModelContractReviewer(adapter: ModelAdapter, options: { logger?: Logger; maxRepairAttempts?: number; timeoutMs?: number } = {}): ContractReviewer {
 	const log = (options.logger ?? nullLogger).child("reviewer");
 
 	return {
 		id: `model:${adapter.id}`,
-		async review({ request, contract, signal }): Promise<ContractReview> {
+		async review({ request, contract, signal, onAttempt }): Promise<ContractReview> {
 			const started = Date.now();
 			const result = await completeStructured<ContractReview>(adapter, {
 				systemPrompt: SYSTEM_PROMPT,
@@ -139,6 +144,8 @@ export function createModelContractReviewer(adapter: ModelAdapter, options: { lo
 				},
 				...(signal ? { signal } : {}),
 				...(options.maxRepairAttempts !== undefined ? { maxRepairAttempts: options.maxRepairAttempts } : {}),
+				...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+				...(onAttempt ? { onAttempt } : {}),
 				logger: log,
 			});
 

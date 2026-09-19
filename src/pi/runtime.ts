@@ -107,6 +107,14 @@ export interface RuntimeDeps {
 	readonly confirmWithUser?: ((title: string, message: string) => Promise<boolean>) | undefined;
 	/** Overridable for tests. */
 	readonly fetchImpl?: typeof fetch | undefined;
+	/**
+	 * Override the resolved locations.
+	 *
+	 * Required for tests to be hermetic. Without it `createRuntime` always resolved the
+	 * real user config, so a test that changed a setting wrote to the developer's own
+	 * machine — which is exactly what happened before this existed.
+	 */
+	readonly paths?: HarnessPaths | undefined;
 }
 
 interface ActiveTaskPointer {
@@ -119,7 +127,7 @@ interface ActiveTaskPointer {
 export const FOLLOW_PI = "current-pi-model";
 
 export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
-	const paths = resolvePaths();
+	const paths = deps.paths ?? resolvePaths();
 	const warnings: string[] = [];
 
 	let config: HarnessConfig;
@@ -177,9 +185,17 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 	const rebindModels = (): void => {
 		modelAdapter = buildAdapter(host, compilerRef);
 		reviewerAdapter = buildAdapter(host, reviewerRef);
-		compiler = createTaskCompiler(modelAdapter, { logger, maxRepairAttempts: compilerRef.maxRepairAttempts ?? 2 });
+		compiler = createTaskCompiler(modelAdapter, {
+			logger,
+			maxRepairAttempts: compilerRef.maxRepairAttempts ?? 2,
+			timeoutMs: compilerRef.timeoutMs ?? config.compiler.timeoutMs,
+		});
 		reviewer = config.contractReviewer.enabled
-			? createModelContractReviewer(reviewerAdapter, { logger, maxRepairAttempts: reviewerRef.maxRepairAttempts ?? 2 })
+			? createModelContractReviewer(reviewerAdapter, {
+					logger,
+					maxRepairAttempts: reviewerRef.maxRepairAttempts ?? 2,
+					timeoutMs: reviewerRef.timeoutMs ?? config.contractReviewer.timeoutMs,
+				})
 			: noopContractReviewer;
 	};
 
@@ -322,19 +338,28 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 			const openQuestions: string[] = [];
 
 			try {
-				onProgress?.("Compiling the Task Contract…");
-				contract = await compiler.compile(compilerInput);
+				const progress = makeProgress(onProgress, modelAdapter.id);
+				contract = await compiler.compile({ ...compilerInput, onAttempt: progress("Compiling the Task Contract") });
 
 				if (config.contractReviewer.enabled) {
-					onProgress?.("Reviewing the Task Contract…");
-					const review = await reviewer.review({ request, contract, ...(signal ? { signal } : {}) });
+					const reviewProgress = makeProgress(onProgress, reviewerAdapter.id);
+					const review = await reviewer.review({
+						request,
+						contract,
+						...(signal ? { signal } : {}),
+						onAttempt: reviewProgress("Reviewing the Task Contract"),
+					});
 
 					if (review.verdict === "REVISE") {
 						reviewNotes.push(...findingLines(review));
-						onProgress?.("The reviewer found problems; recompiling…");
+						const retryProgress = makeProgress(onProgress, modelAdapter.id);
 
 						try {
-							contract = await compiler.compile({ ...compilerInput, reviewFindings: findingLines(review) });
+							contract = await compiler.compile({
+								...compilerInput,
+								reviewFindings: findingLines(review),
+								onAttempt: retryProgress("Recompiling after review"),
+							});
 						} catch (e) {
 							// Keep the first contract: an imperfect contract beats no contract.
 							logger.warn("recompilation failed; keeping the original contract", { error: errorMessage(e) });
@@ -491,6 +516,7 @@ interface ProviderRefLike {
 	provider: string;
 	model?: string | undefined;
 	maxRepairAttempts?: number | undefined;
+	timeoutMs?: number | undefined;
 }
 
 /** Build a model adapter from a `ProviderRef`, honouring an explicit pin. */
@@ -503,3 +529,38 @@ function buildAdapter(host: PiModelHost, ref: { provider: string; model?: string
 
 /** A stable task id for callers that need one before compilation. */
 export const provisionalTaskId = newTaskId;
+
+/**
+ * Progress messages that show elapsed time and which attempt is running.
+ *
+ * A local model can take minutes for one call, and a bare "Reviewing…" is
+ * indistinguishable from a hang. Showing the model, the attempt and a ticking counter
+ * is the difference between "it is working" and "something is broken".
+ */
+function makeProgress(
+	onProgress: ((message: string) => void) | undefined,
+	modelId: string,
+): (label: string) => ((attempt: number, total: number) => void) | undefined {
+	return (label: string) => {
+		if (!onProgress) return undefined;
+
+		return (attempt: number, total: number): void => {
+			const started = Date.now();
+			const suffix = total > 1 && attempt > 1 ? ` · retry ${attempt - 1}/${total - 1}` : "";
+
+			const tick = () => {
+				const seconds = Math.round((Date.now() - started) / 1000);
+				onProgress(`${label} · ${modelId} · ${seconds}s${suffix}`);
+			};
+			tick();
+
+			/**
+			 * Unref'd so a pending tick can never hold the process open at shutdown.
+			 * Cleared by the next attempt's tick or by the caller clearing the status.
+			 */
+			const timer = setInterval(tick, 1000);
+			if (typeof timer.unref === "function") timer.unref();
+			setTimeout(() => clearInterval(timer), 30 * 60_000).unref?.();
+		};
+	};
+}

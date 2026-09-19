@@ -31,6 +31,8 @@ export interface CompilerInput {
 	readonly signal?: AbortSignal | undefined;
 	/** Present when re-compiling after a REVISE verdict from the reviewer. */
 	readonly reviewFindings?: readonly string[] | undefined;
+	/** Progress callback so the UI can show which attempt is running. */
+	readonly onAttempt?: ((attempt: number, total: number) => void) | undefined;
 }
 
 export interface TaskCompiler {
@@ -133,7 +135,7 @@ const EXAMPLE_OUTPUT: CompiledContract = {
 	assumptions: [{ description: "Something you filled in that the user did not say", confidence: 0.6 }],
 };
 
-export function createTaskCompiler(adapter: ModelAdapter, options: { logger?: Logger; maxRepairAttempts?: number } = {}): TaskCompiler {
+export function createTaskCompiler(adapter: ModelAdapter, options: { logger?: Logger; maxRepairAttempts?: number; timeoutMs?: number } = {}): TaskCompiler {
 	const log = (options.logger ?? nullLogger).child("compiler");
 
 	return {
@@ -146,6 +148,8 @@ export function createTaskCompiler(adapter: ModelAdapter, options: { logger?: Lo
 				example: EXAMPLE_OUTPUT,
 				...(input.signal ? { signal: input.signal } : {}),
 				...(options.maxRepairAttempts !== undefined ? { maxRepairAttempts: options.maxRepairAttempts } : {}),
+				...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+				...(input.onAttempt ? { onAttempt: input.onAttempt } : {}),
 				logger: log,
 			});
 

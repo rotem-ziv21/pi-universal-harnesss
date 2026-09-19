@@ -26,6 +26,10 @@ export interface StructuredRequest {
 	readonly example?: unknown;
 	readonly signal?: AbortSignal;
 	readonly maxRepairAttempts?: number;
+	/** Per-attempt budget. Exceeding it aborts that attempt, not the whole call. */
+	readonly timeoutMs?: number;
+	/** Called before each attempt so the UI can say what is happening and for how long. */
+	readonly onAttempt?: (attempt: number, totalAttempts: number) => void;
 	readonly logger?: Logger;
 }
 
@@ -35,6 +39,9 @@ export interface StructuredResult<T> {
 	readonly model: string;
 	readonly usage?: { input?: number; output?: number };
 }
+
+/** Generous: a large local model on modest hardware is slow, not broken. */
+const DEFAULT_TIMEOUT_MS = 180_000;
 
 const JSON_DISCIPLINE = [
 	"OUTPUT FORMAT — this is not negotiable:",
@@ -63,15 +70,45 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 	let lastError = "";
 	let totalUsage: { input?: number; output?: number } | undefined;
 
-	for (let attempt = 1; attempt <= maxRepairs + 1; attempt++) {
-		if (request.signal?.aborted) throw new HarnessError("ABORTED", "Structured model call aborted.");
+	const totalAttempts = maxRepairs + 1;
 
-		const modelRequest: ModelRequest = {
-			systemPrompt,
-			userPrompt,
-			...(request.signal ? { signal: request.signal } : {}),
-		};
-		const response = await adapter.complete(modelRequest);
+	for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+		if (request.signal?.aborted) throw new HarnessError("ABORTED", "Structured model call aborted.");
+		request.onAttempt?.(attempt, totalAttempts);
+
+		/**
+		 * The timeout is per attempt and is combined with the caller's signal, so Esc
+		 * still cancels immediately while a stalled model cannot hold the session open
+		 * forever.
+		 */
+		const timeout = new AbortController();
+		const timer = setTimeout(() => timeout.abort(), request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+
+		let response: Awaited<ReturnType<typeof adapter.complete>>;
+		try {
+			const modelRequest: ModelRequest = {
+				systemPrompt,
+				userPrompt,
+				signal: combineSignals(request.signal, timeout.signal),
+			};
+			response = await adapter.complete(modelRequest);
+		} catch (e) {
+			if (request.signal?.aborted) throw new HarnessError("ABORTED", "Structured model call aborted.");
+			if (timeout.signal.aborted) {
+				const seconds = Math.round((request.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000);
+				throw new HarnessError(
+					"MODEL_UNAVAILABLE",
+					`Model ${adapter.id} did not respond within ${seconds}s. ` +
+						"If it is a local model, check the server is running and is not still loading weights. " +
+						"Raise the budget with the timeoutMs setting, or point this role at a different model with /harness model.",
+					{ details: { model: adapter.id, timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS }, cause: e },
+				);
+			}
+			throw e;
+		} finally {
+			clearTimeout(timer);
+		}
+
 		totalUsage = mergeUsage(totalUsage, response.usage);
 
 		const extracted = extractJson<unknown>(response.text);
@@ -134,4 +171,18 @@ function mergeUsage(
 	if (!a) return b;
 	if (!b) return a;
 	return { input: (a.input ?? 0) + (b.input ?? 0), output: (a.output ?? 0) + (b.output ?? 0) };
+}
+
+/** `AbortSignal.any` where available, with a manual fallback for older runtimes. */
+function combineSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+	if (!a) return b;
+	const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+	if (typeof anyOf === "function") return anyOf([a, b]);
+
+	const controller = new AbortController();
+	const forward = () => controller.abort();
+	if (a.aborted || b.aborted) controller.abort();
+	a.addEventListener("abort", forward, { once: true });
+	b.addEventListener("abort", forward, { once: true });
+	return controller.signal;
 }

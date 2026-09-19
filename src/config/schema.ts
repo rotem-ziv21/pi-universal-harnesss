@@ -83,6 +83,15 @@ const providerRefFields = {
 	provider: Type.String({ default: "current-pi-model" }),
 	model: Type.Optional(Type.String()),
 	maxRepairAttempts: Type.Integer({ default: 2, minimum: 0, maximum: 5 }),
+	/**
+	 * Budget for a single call, per attempt.
+	 *
+	 * Generous by default because a large local model on modest hardware is genuinely
+	 * slow, and cutting it off early would be worse than waiting. But unbounded is not
+	 * an option: without this, a stalled model stalls the whole Pi session with no way
+	 * out and nothing on screen explaining why.
+	 */
+	timeoutMs: Type.Integer({ default: 180_000, minimum: 5_000, maximum: 1_800_000 }),
 };
 
 export const ProviderRefSchema = Type.Object(providerRefFields, { default: {} });
