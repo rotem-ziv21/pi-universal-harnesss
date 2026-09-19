@@ -114,6 +114,9 @@ function stateChecks(args: DoctorArgs): Check[] {
 		...(writable ? {} : { fix: `Fix permissions: chmod u+rwx "${args.paths.harnessDir}"` }),
 	});
 
+	const ephemeral = ephemeralStateCheck(args);
+	if (ephemeral) checks.push(ephemeral);
+
 	checks.push({
 		name: "Persistence",
 		status: args.config.state.persist ? "PASS" : "WARN",
@@ -365,6 +368,98 @@ function findPiPackage(): { version: string; dir: string } | undefined {
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Warn when harness state sits on a container's throwaway filesystem.
+ *
+ * In a container, anything on the root overlay is destroyed when the container is
+ * recreated; only mounted volumes survive. A harness whose state lives on the overlay
+ * quietly loses every Task Contract, the whole audit log and the stored API key on the
+ * next restart — and nothing else in the diagnostic would hint at it, because the
+ * directory is present and writable right now.
+ *
+ * The check is deliberately generic: detect a container, then find the mount point the
+ * state directory falls under. If that mount point is the root filesystem, the state is
+ * on the overlay. No hosting provider is named or assumed anywhere.
+ *
+ * Returns undefined when the question does not apply, rather than emitting a passing
+ * check nobody needs to read.
+ */
+function ephemeralStateCheck(args: DoctorArgs): Check | undefined {
+	if (process.platform !== "linux") return undefined;
+	if (!isContainer()) return undefined;
+
+	const mountPoint = mountPointFor(args.paths.harnessDir);
+	if (mountPoint === undefined) return undefined;
+	if (mountPoint !== "/") {
+		return {
+			name: "State survives a restart",
+			status: "PASS",
+			detail: `State is on a mounted volume (${mountPoint}), so it persists across container restarts.`,
+		};
+	}
+
+	return {
+		name: "State survives a restart",
+		status: "WARN",
+		detail:
+			`This looks like a container, and ${displayPath(args.paths.harnessDir)} is on the root filesystem rather than ` +
+			"a mounted volume. Task contracts, the audit log and any stored API key will be lost when the container is recreated.",
+		fix:
+			"Point Pi and the harness at your persistent volume before starting Pi, e.g.:\n" +
+			'       export PI_CODING_AGENT_DIR="<volume>/.pi/agent"\n' +
+			'       export PI_HARNESS_HOME="<volume>/.pi/agent/harness"\n' +
+			"     then re-run scripts/install.sh. Put those exports somewhere that runs on login so they survive a restart.",
+	};
+}
+
+function isContainer(): boolean {
+	if (pathExists("/.dockerenv") || pathExists("/run/.containerenv")) return true;
+	try {
+		return /docker|containerd|kubepods|lxc|podman/i.test(readFileSync("/proc/1/cgroup", "utf8"));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The mount point a path falls under, from `/proc/mounts`.
+ *
+ * Returns undefined when `/proc/mounts` cannot be read, so the caller stays silent
+ * rather than guessing.
+ */
+function mountPointFor(path: string): string | undefined {
+	try {
+		return resolveMountPoint(path, readFileSync("/proc/mounts", "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Pure mount-point resolution, separated so it can be tested without a Linux host.
+ *
+ * The longest matching mount point wins, because mounts nest: `/workspace/data` is a
+ * better answer than `/workspace`, which is a better answer than `/`. Matching on a
+ * bare prefix would make `/workspacefoo` look like it sits under `/workspace`, so the
+ * comparison requires a path separator.
+ */
+export function resolveMountPoint(path: string, procMounts: string): string | undefined {
+	let best: string | undefined;
+
+	for (const line of procMounts.split("\n")) {
+		const point = line.split(/\s+/)[1];
+		if (!point) continue;
+
+		// Undo the octal escaping util-linux writes for spaces and similar characters.
+		const decoded = point.replace(/\\(\d{3})/g, (_m, o: string) => String.fromCharCode(Number.parseInt(o, 8)));
+
+		const matches = decoded === "/" ? path.startsWith("/") : path === decoded || path.startsWith(`${decoded}/`);
+		if (matches && (best === undefined || decoded.length > best.length)) best = decoded;
+	}
+
+	return best;
 }
 
 /** Built against the 0.85.x extension API; adjacent minors are a warning, not a failure. */

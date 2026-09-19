@@ -96,6 +96,36 @@ else
   fix "It is created by ./scripts/install.sh, or on the harness's first run."
 fi
 
+# --- does state survive a restart? --------------------------------------------
+#
+# In a container, anything on the root overlay is destroyed when the container is
+# recreated; only mounted volumes survive. Harness state on the overlay silently
+# loses every task contract, the audit log and the stored key on the next restart,
+# and nothing else here would hint at it: the directory is present and writable.
+#
+# Generic by construction — detect a container, then find the mount point the state
+# directory falls under. No hosting provider is named or assumed.
+
+if [ "$(uname -s)" = "Linux" ] && { [ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -qiE 'docker|containerd|kubepods|lxc|podman' /proc/1/cgroup 2>/dev/null; }; then
+  STATE_MOUNT=""
+  if [ -d "$HARNESS_STATE_DIR" ]; then
+    STATE_MOUNT="$(df -P "$HARNESS_STATE_DIR" 2>/dev/null | awk 'NR==2 {print $6}')"
+  else
+    STATE_MOUNT="$(df -P "$(dirname "$HARNESS_STATE_DIR")" 2>/dev/null | awk 'NR==2 {print $6}')"
+  fi
+
+  if [ -z "$STATE_MOUNT" ]; then
+    :
+  elif [ "$STATE_MOUNT" = "/" ]; then
+    warn "State survives a restart" "container detected, and state is on the root filesystem, not a mounted volume"
+    fix "Task contracts, the audit log and any stored key will be lost when the container is recreated."
+    fix "Before starting Pi:  export PI_CODING_AGENT_DIR=\"<volume>/.pi/agent\"  and  export PI_HARNESS_HOME=\"<volume>/.pi/agent/harness\""
+    fix "Then re-run ./scripts/install.sh, and put those exports somewhere that runs on login."
+  else
+    pass "State survives a restart" "state is on a mounted volume ($STATE_MOUNT)"
+  fi
+fi
+
 # --- secrets ------------------------------------------------------------------
 SECRETS_FILE="$HARNESS_STATE_DIR/secrets.json"
 KEY_SOURCE="none"

@@ -6,6 +6,7 @@ import { droppedHardUserItems, lock, revise } from "../src/contract/revisions.ts
 import { createDeterministicJudge } from "../src/judges/deterministic.ts";
 import { isStale } from "../src/judges/judge.ts";
 import { createOpenRouterJevJudge } from "../src/judges/openrouter-jev.ts";
+import { resolveMountPoint } from "../src/pi/doctor.ts";
 import { createJudgeRouter } from "../src/judges/router.ts";
 import { createStubModelAdapter } from "../src/models/model-adapter.ts";
 import { completeStructured } from "../src/models/structured.ts";
@@ -769,5 +770,50 @@ describe("Destructive-action detection cannot be defeated by rephrasing", () => 
 			});
 			assert.equal(decision.needsGate, false, `"${command}" must take the fast path`);
 		}
+	});
+});
+
+describe("Ephemeral state detection in containers", () => {
+	/**
+	 * State on a container's root overlay is destroyed when the container is recreated.
+	 * The directory looks perfectly healthy until the restart, so the diagnostic has to
+	 * reason about mount points rather than about whether the path is writable.
+	 */
+	const MOUNTS = [
+		"overlay / overlay rw,relatime 0 0",
+		"proc /proc proc rw,nosuid 0 0",
+		"/dev/sda1 /workspace ext4 rw,relatime 0 0",
+		"tmpfs /workspace/cache tmpfs rw 0 0",
+		"tmpfs /workspacefoo tmpfs rw 0 0",
+		"none /mnt/with\\040space ext4 rw 0 0",
+	].join("\n");
+
+	test("state on the container overlay resolves to the root filesystem", () => {
+		assert.equal(resolveMountPoint("/root/.pi/agent/harness", MOUNTS), "/");
+	});
+
+	test("state on a mounted volume resolves to that volume", () => {
+		assert.equal(resolveMountPoint("/workspace/.pi/agent/harness", MOUNTS), "/workspace");
+	});
+
+	test("the longest matching mount wins, because mounts nest", () => {
+		assert.equal(resolveMountPoint("/workspace/cache/thing", MOUNTS), "/workspace/cache");
+	});
+
+	test("a shared prefix is not a match without a separator", () => {
+		// /workspacefoo must not be attributed to /workspace.
+		assert.equal(resolveMountPoint("/workspacefoo/harness", MOUNTS), "/workspacefoo");
+	});
+
+	test("the mount point itself matches", () => {
+		assert.equal(resolveMountPoint("/workspace", MOUNTS), "/workspace");
+	});
+
+	test("octal-escaped mount points are decoded", () => {
+		assert.equal(resolveMountPoint("/mnt/with space/harness", MOUNTS), "/mnt/with space");
+	});
+
+	test("unparseable input yields no answer rather than a wrong one", () => {
+		assert.equal(resolveMountPoint("/root/x", ""), undefined);
 	});
 });
