@@ -1,5 +1,5 @@
 import { createCheckpointDetector } from "../checkpoints/detector.ts";
-import { loadConfig, loadProjectConfig } from "../config/loader.ts";
+import { loadConfig, loadProjectConfig, updateConfig } from "../config/loader.ts";
 import { ensureHarnessDirs, type HarnessPaths, isWritable, resolvePaths } from "../config/paths.ts";
 import type { HarnessConfig, ProjectConfig } from "../config/schema.ts";
 import { createTaskCompiler, degradedContract, looksSubstantive, type TaskCompiler } from "../contract/compiler.ts";
@@ -56,6 +56,27 @@ export interface HarnessRuntime {
 	shouldCompile(prompt: string): boolean;
 	readonly compilerId: string;
 	readonly reviewerId: string;
+
+	/** Which model each harness role currently uses, for display. */
+	describeRoles(): RoleDescription[];
+	/** Every model Pi can reach, for the picker. */
+	availableModels(): Array<{ provider: string; id: string; label: string }>;
+	/**
+	 * Point a role at a different model, persist it, and rebind immediately.
+	 * Passing undefined restores "follow whichever model Pi is on".
+	 */
+	setRoleModel(role: HarnessRole, ref: { provider: string; model: string } | undefined): RoleDescription;
+}
+
+export type HarnessRole = "compiler" | "reviewer";
+
+export interface RoleDescription {
+	readonly role: HarnessRole;
+	readonly label: string;
+	/** True when the role follows Pi's active model rather than a pinned one. */
+	readonly followsPi: boolean;
+	readonly modelId: string;
+	readonly available: boolean;
 }
 
 export interface ActiveTask {
@@ -93,6 +114,9 @@ interface ActiveTaskPointer {
 	cwd: string;
 	updatedAt: string;
 }
+
+/** The sentinel meaning "use whatever model Pi is currently on". */
+export const FOLLOW_PI = "current-pi-model";
 
 export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 	const paths = resolvePaths();
@@ -137,14 +161,29 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 	 */
 	let resolveKey: KeyResolver = createKeyResolver({ paths, host: deps.host.modelRegistry });
 
-	// --- model-dependent components, rebuilt on /model ---
+	// --- model-dependent components ---
+	//
+	// Rebuilt both when Pi's own model changes and when the user repoints a harness
+	// role with `/harness model`. Kept in one function so the two paths cannot drift.
 	let host = deps.host;
-	let modelAdapter: ModelAdapter = buildAdapter(host, config.compiler);
-	let reviewerAdapter: ModelAdapter = buildAdapter(host, config.contractReviewer);
-	let compiler: TaskCompiler = createTaskCompiler(modelAdapter, { logger, maxRepairAttempts: config.compiler.maxRepairAttempts });
-	let reviewer: ContractReviewer = config.contractReviewer.enabled
-		? createModelContractReviewer(reviewerAdapter, { logger, maxRepairAttempts: config.contractReviewer.maxRepairAttempts })
-		: noopContractReviewer;
+	let compilerRef: ProviderRefLike = { ...config.compiler };
+	let reviewerRef: ProviderRefLike = { ...config.contractReviewer };
+
+	let modelAdapter!: ModelAdapter;
+	let reviewerAdapter!: ModelAdapter;
+	let compiler!: TaskCompiler;
+	let reviewer!: ContractReviewer;
+
+	const rebindModels = (): void => {
+		modelAdapter = buildAdapter(host, compilerRef);
+		reviewerAdapter = buildAdapter(host, reviewerRef);
+		compiler = createTaskCompiler(modelAdapter, { logger, maxRepairAttempts: compilerRef.maxRepairAttempts ?? 2 });
+		reviewer = config.contractReviewer.enabled
+			? createModelContractReviewer(reviewerAdapter, { logger, maxRepairAttempts: reviewerRef.maxRepairAttempts ?? 2 })
+			: noopContractReviewer;
+	};
+
+	rebindModels();
 
 	/**
 	 * Judge chain. The primary is Jev over OpenRouter; fallbacks come from config and
@@ -249,12 +288,7 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 		refreshModel(nextHost: PiModelHost): void {
 			host = nextHost;
 			resolveKey = createKeyResolver({ paths, host: nextHost.modelRegistry });
-			modelAdapter = buildAdapter(host, config.compiler);
-			reviewerAdapter = buildAdapter(host, config.contractReviewer);
-			compiler = createTaskCompiler(modelAdapter, { logger, maxRepairAttempts: config.compiler.maxRepairAttempts });
-			reviewer = config.contractReviewer.enabled
-				? createModelContractReviewer(reviewerAdapter, { logger, maxRepairAttempts: config.contractReviewer.maxRepairAttempts })
-				: noopContractReviewer;
+			rebindModels();
 			fallbacks = buildFallbacks();
 			logger.info("model rebound", { model: modelAdapter.id });
 		},
@@ -376,6 +410,71 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 			return task;
 		},
 
+		describeRoles(): RoleDescription[] {
+			const describe = (role: HarnessRole, ref: ProviderRefLike, adapter: ModelAdapter): RoleDescription => {
+				const followsPi = ref.provider === FOLLOW_PI || !ref.model;
+				return {
+					role,
+					label: role === "compiler" ? "Task Compiler" : "Contract Reviewer",
+					followsPi,
+					modelId: adapter.id,
+					available: adapter.available,
+				};
+			};
+			return [
+				describe("compiler", compilerRef, modelAdapter),
+				describe("reviewer", reviewerRef, reviewerAdapter),
+			];
+		},
+
+		availableModels() {
+			const listed = host.modelRegistry?.getAvailable?.() ?? [];
+			const seen = new Set<string>();
+			const out: Array<{ provider: string; id: string; label: string }> = [];
+
+			for (const m of listed) {
+				const label = `${m.provider}/${m.id}`;
+				if (seen.has(label)) continue;
+				seen.add(label);
+				out.push({ provider: m.provider, id: m.id, label });
+			}
+
+			// Pi's active model may not appear in the catalogue (a provider registered by
+			// another extension, for instance). Never offer a list that omits it.
+			if (host.model) {
+				const label = `${host.model.provider}/${host.model.id}`;
+				if (!seen.has(label)) out.unshift({ provider: host.model.provider, id: host.model.id, label });
+			}
+
+			return out.sort((a, b) => a.label.localeCompare(b.label));
+		},
+
+		setRoleModel(role: HarnessRole, ref): RoleDescription {
+			const next: ProviderRefLike = ref
+				? { provider: ref.provider, model: ref.model }
+				: { provider: FOLLOW_PI, model: undefined };
+
+			const key = role === "compiler" ? "compiler" : "contractReviewer";
+
+			if (role === "compiler") compilerRef = { ...compilerRef, ...next };
+			else reviewerRef = { ...reviewerRef, ...next };
+
+			rebindModels();
+			fallbacks = buildFallbacks(); // The model fallback Judge follows the compiler.
+
+			// Persist so the choice survives a restart. A write failure must not undo the
+			// in-memory change the user just asked for, so it degrades to a warning.
+			try {
+				updateConfig(paths, { [key]: { provider: next.provider, model: next.model } } as never);
+			} catch (e) {
+				logger.warn("could not persist the role model change", { role, error: errorMessage(e) });
+			}
+
+			logger.info("harness role model changed", { role, model: next.model ?? FOLLOW_PI });
+			const described = this.describeRoles().find((r) => r.role === role);
+			return described!;
+		},
+
 		clearTask(): void {
 			task?.state.flush();
 			task = undefined;
@@ -388,8 +487,14 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 	};
 }
 
+interface ProviderRefLike {
+	provider: string;
+	model?: string | undefined;
+	maxRepairAttempts?: number | undefined;
+}
+
 /** Build a model adapter from a `ProviderRef`, honouring an explicit pin. */
-function buildAdapter(host: PiModelHost, ref: { provider: string; model?: string }): ModelAdapter {
+function buildAdapter(host: PiModelHost, ref: { provider: string; model?: string | undefined }): ModelAdapter {
 	if (ref.provider !== "current-pi-model" && ref.model) {
 		return createPinnedModelAdapter(host, ref.provider, ref.model);
 	}

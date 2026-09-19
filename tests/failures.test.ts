@@ -12,6 +12,7 @@ import { createJudgeRouter } from "../src/judges/router.ts";
 import { createPinnedModelAdapter, createStubModelAdapter } from "../src/models/model-adapter.ts";
 import { completeStructured } from "../src/models/structured.ts";
 import { checkUserLimits, createProgressMonitor, parseNumericLimit } from "../src/progress/monitor.ts";
+import { createRuntime } from "../src/pi/runtime.ts";
 import { createStateManager, restoreStateManager } from "../src/state/state-manager.ts";
 import { contradicts } from "../src/state/freshness.ts";
 import { HarnessError } from "../src/util/errors.ts";
@@ -991,5 +992,139 @@ describe("Pinning a specific model for the compiler or reviewer", () => {
 			() => adapter.complete({ systemPrompt: "s", userPrompt: "u" }),
 			(e: unknown) => e instanceof HarnessError && e.code === "MODEL_UNAVAILABLE" && /\/model/.test(e.message),
 		);
+	});
+});
+
+describe("Choosing the model for harness roles", () => {
+	/**
+	 * `/harness model` exists because editing config.json by hand is not control: it
+	 * needs a reload, it is easy to typo, and nothing validates the ids. These tests
+	 * pin the behaviour that makes the command worth having — the change takes effect
+	 * immediately, and it survives a restart.
+	 */
+	class Registry {
+		completed: unknown[] = [];
+		find(provider: string, modelId: string): unknown {
+			return { id: modelId, provider };
+		}
+		hasConfiguredAuth(): boolean {
+			return true;
+		}
+		getAvailable(): Array<{ id: string; provider: string }> {
+			return [
+				{ id: "qwen27b-local", provider: "llama-cpp" },
+				{ id: "moonshotai/kimi-k2.6", provider: "openrouter" },
+			];
+		}
+		async complete(model: unknown): Promise<{ content: Array<{ type: string; text?: string }> }> {
+			this.completed.push(model);
+			return { content: [{ type: "text", text: "{}" }] };
+		}
+	}
+
+	const makeRuntime = (paths: ReturnType<typeof tempPaths>) =>
+		createRuntime({
+			host: { model: { id: "kimi", provider: "openrouter" }, modelRegistry: new Registry() as never },
+			cwd: paths.configDir,
+			projectTrusted: false,
+		});
+
+	test("both roles follow Pi's model until they are pinned", () => {
+		const paths = tempPaths();
+		try {
+			const roles = makeRuntime(paths).describeRoles();
+			assert.equal(roles.length, 2);
+			assert.ok(roles.every((r) => r.followsPi), "the default must be to follow Pi, not to pin anything");
+			assert.ok(roles.every((r) => r.modelId === "openrouter/kimi"));
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("pinning takes effect immediately, with no reload", () => {
+		const paths = tempPaths();
+		try {
+			const rt = makeRuntime(paths);
+			const described = rt.setRoleModel("compiler", { provider: "llama-cpp", model: "qwen27b-local" });
+
+			assert.equal(described.modelId, "llama-cpp/qwen27b-local");
+			assert.equal(described.followsPi, false);
+
+			// And the live view agrees, rather than only the returned value.
+			const compiler = rt.describeRoles().find((r) => r.role === "compiler");
+			assert.equal(compiler?.modelId, "llama-cpp/qwen27b-local");
+
+			// The other role is untouched.
+			assert.equal(rt.describeRoles().find((r) => r.role === "reviewer")?.followsPi, true);
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the two roles can use different models", () => {
+		const paths = tempPaths();
+		try {
+			const rt = makeRuntime(paths);
+			rt.setRoleModel("compiler", { provider: "llama-cpp", model: "qwen27b-local" });
+			rt.setRoleModel("reviewer", { provider: "openrouter", model: "moonshotai/kimi-k2.6" });
+
+			const roles = rt.describeRoles();
+			assert.equal(roles.find((r) => r.role === "compiler")?.modelId, "llama-cpp/qwen27b-local");
+			assert.equal(roles.find((r) => r.role === "reviewer")?.modelId, "openrouter/moonshotai/kimi-k2.6");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("a model id containing slashes survives the round trip", () => {
+		const paths = tempPaths();
+		try {
+			const rt = makeRuntime(paths);
+			// Only the FIRST slash separates provider from model.
+			const described = rt.setRoleModel("reviewer", { provider: "openrouter", model: "moonshotai/kimi-k2.6" });
+			assert.equal(described.modelId, "openrouter/moonshotai/kimi-k2.6");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the choice is persisted, so it survives a restart", () => {
+		const paths = tempPaths();
+		try {
+			makeRuntime(paths).setRoleModel("compiler", { provider: "llama-cpp", model: "qwen27b-local" });
+
+			const reborn = makeRuntime(paths);
+			const compiler = reborn.describeRoles().find((r) => r.role === "compiler");
+			assert.equal(compiler?.modelId, "llama-cpp/qwen27b-local", "the pin must be read back from disk");
+			assert.equal(compiler?.followsPi, false);
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("resetting a role returns it to following Pi", () => {
+		const paths = tempPaths();
+		try {
+			const rt = makeRuntime(paths);
+			rt.setRoleModel("compiler", { provider: "llama-cpp", model: "qwen27b-local" });
+			const described = rt.setRoleModel("compiler", undefined);
+
+			assert.equal(described.followsPi, true);
+			assert.equal(described.modelId, "openrouter/kimi");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("the picker lists Pi's catalogue and always includes the active model", () => {
+		const paths = tempPaths();
+		try {
+			const labels = makeRuntime(paths).availableModels().map((m) => m.label);
+			assert.ok(labels.includes("llama-cpp/qwen27b-local"));
+			assert.ok(labels.includes("openrouter/moonshotai/kimi-k2.6"));
+			assert.ok(labels.includes("openrouter/kimi"), "the active model must be offered even if the catalogue omits it");
+		} finally {
+			paths.cleanup();
+		}
 	});
 });

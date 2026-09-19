@@ -48,6 +48,8 @@ export interface PiModelHost {
 		 * environment variable, so the harness never needs its own copy of a key.
 		 */
 		getApiKeyForProvider?(provider: string): Promise<string | undefined>;
+		/** Every model Pi can currently reach, for the `/harness model` picker. */
+		getAvailable?(): Array<{ id: string; provider: string }>;
 		complete(
 			model: unknown,
 			context: { systemPrompt?: string; messages: unknown[] },

@@ -195,6 +195,7 @@ export function renderStatus(args: {
 	lines.push(`Harness:            ${args.enabled ? "enabled" : "disabled"}`);
 	lines.push(`Task Compiler:      ${args.compiler}`);
 	lines.push(`Contract Reviewer:  ${args.reviewer}`);
+	lines.push("                    (change with /harness model)");
 	lines.push(`State Store:        ${args.stateHealthy ? "healthy" : "UNWRITABLE"} (${displayPath(args.statePath)})`);
 	lines.push(`Judge:              ${args.judgeEnabled ? (args.judgePrimary ?? "none configured") : "disabled"}`);
 	if (args.judgeFallbacks.length > 0) {

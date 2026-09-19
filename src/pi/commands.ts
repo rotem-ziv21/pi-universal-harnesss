@@ -25,7 +25,7 @@ export interface CommandDeps {
 }
 
 const SUBCOMMANDS = [
-	"status", "setup", "doctor", "contract", "state", "events",
+	"status", "model", "setup", "doctor", "contract", "state", "events",
 	"evidence", "decision", "judge", "enable", "disable", "abandon", "help",
 ] as const;
 
@@ -57,6 +57,9 @@ async function dispatch(sub: string, argument: string, rt: HarnessRuntime, ctx: 
 			const live = await rt.resolveKey();
 			return show(ctx, pi, statusText(rt, live));
 		}
+
+		case "model":
+			return chooseModel(rt, argument, ctx, pi);
 
 		case "setup":
 			return setup(rt, ctx, pi);
@@ -111,6 +114,113 @@ async function dispatch(sub: string, argument: string, rt: HarnessRuntime, ctx: 
 		default:
 			return show(ctx, pi, helpText());
 	}
+}
+
+// --- model selection ---
+
+/**
+ * `/harness model` — control which model runs the Task Compiler and Contract Reviewer.
+ *
+ * These are separate from Pi's own `/model`, and deliberately so. The compiler and
+ * reviewer do a narrow job — read a request faithfully and emit strict JSON — and the
+ * best model for that is often not the one you want writing code. It is also the job
+ * where a cheap local model is most defensible, since it runs twice per task.
+ *
+ * Changes apply immediately. Editing the config file by hand needs a reload; this does
+ * not, which is the entire reason the command exists.
+ */
+async function chooseModel(rt: HarnessRuntime, argument: string, ctx: any, pi: PiExtensionAPI): Promise<void> {
+	const [roleArg, ...rest] = argument.trim().split(/\s+/).filter(Boolean);
+	const target = rest.join(" ").trim();
+
+	if (!roleArg) return show(ctx, pi, rolesText(rt));
+
+	const role = roleArg === "compiler" ? "compiler" : roleArg === "reviewer" ? "reviewer" : undefined;
+	if (!role) {
+		return show(ctx, pi, `Unknown role "${roleArg}".\n\n${rolesText(rt)}`);
+	}
+
+	// Explicit target: /harness model compiler llama-cpp/qwen27b-local
+	if (target) {
+		if (target === "auto" || target === "pi") {
+			const described = rt.setRoleModel(role, undefined);
+			return show(ctx, pi, `${described.label} now follows Pi's active model (${described.modelId}).`);
+		}
+
+		const parsed = parseModelRef(target);
+		if (!parsed) {
+			return show(ctx, pi, `"${target}" is not a provider/model reference. Expected something like llama-cpp/qwen27b-local.`);
+		}
+
+		const described = rt.setRoleModel(role, parsed);
+		const warning = described.available
+			? ""
+			: "\n\nWarning: Pi does not list this model as reachable. Check /model for the exact ids.";
+		return show(ctx, pi, `${described.label} is now pinned to ${described.modelId}.${warning}`);
+	}
+
+	// No target: offer a picker.
+	if (!ctx.hasUI) {
+		return show(ctx, pi, `Specify a model: /harness model ${role} <provider/model>\n\n${rolesText(rt)}`);
+	}
+
+	const models = rt.availableModels();
+	if (models.length === 0) {
+		return show(ctx, pi, "Pi reports no available models. Run /login first.");
+	}
+
+	const FOLLOW = "· follow Pi's active model";
+	const choice = await ctx.ui.select(
+		`Model for the ${role === "compiler" ? "Task Compiler" : "Contract Reviewer"}`,
+		[FOLLOW, ...models.map((m) => m.label)],
+	);
+	if (!choice) return show(ctx, pi, "Cancelled; nothing changed.");
+
+	const described = rt.setRoleModel(role, choice === FOLLOW ? undefined : parseModelRef(choice));
+	return show(
+		ctx,
+		pi,
+		described.followsPi
+			? `${described.label} now follows Pi's active model (${described.modelId}).`
+			: `${described.label} is now pinned to ${described.modelId}.`,
+	);
+}
+
+function rolesText(rt: HarnessRuntime): string {
+	const lines: string[] = ["Harness model roles", ""];
+
+	for (const role of rt.describeRoles()) {
+		const how = role.followsPi ? "follows Pi's active model" : "pinned";
+		const health = role.available ? "" : "  ← Pi does not list this model as reachable";
+		lines.push(`  ${role.label.padEnd(18)} ${role.modelId}   (${how})${health}`);
+	}
+
+	lines.push(
+		"",
+		"These are separate from Pi's own /model. The compiler and reviewer read your",
+		"request and emit strict JSON; that is a different job from writing code, and it",
+		"runs twice per task rather than on every action.",
+		"",
+		"  /harness model compiler              pick from a list",
+		"  /harness model reviewer <prov/model> set directly",
+		"  /harness model compiler auto         go back to following Pi",
+		"",
+		"Changes apply immediately — no reload. Run /model to see valid ids.",
+		"",
+		"Worth knowing: giving the reviewer a different model from the compiler makes the",
+		"review worth more, because two models fail in different ways. A model reviewing",
+		"its own output shares its own blind spots.",
+	);
+
+	return lines.join("\n");
+}
+
+/** `provider/model`, where the model id may itself contain slashes. */
+function parseModelRef(text: string): { provider: string; model: string } | undefined {
+	const trimmed = text.trim();
+	const slash = trimmed.indexOf("/");
+	if (slash <= 0 || slash === trimmed.length - 1) return undefined;
+	return { provider: trimmed.slice(0, slash), model: trimmed.slice(slash + 1) };
 }
 
 // --- setup (§33, §35) ---
@@ -189,10 +299,18 @@ function statusText(rt: HarnessRuntime, live = rt.secret): string {
 	const stats = rt.judge.stats();
 	const described = rt.judge.describe();
 
+	const roles = rt.describeRoles();
+	const describeRole = (name: "compiler" | "reviewer", fallback: string): string => {
+		const role = roles.find((r) => r.role === name);
+		if (!role) return fallback;
+		const how = role.followsPi ? "follows Pi" : "pinned";
+		return `${role.modelId} (${how})${role.available ? "" : " — UNREACHABLE"}`;
+	};
+
 	return renderStatus({
 		enabled: rt.config.enabled,
-		compiler: rt.compilerId,
-		reviewer: rt.reviewerId,
+		compiler: describeRole("compiler", rt.compilerId),
+		reviewer: describeRole("reviewer", rt.reviewerId),
 		judgePrimary: described.primary,
 		judgeFallbacks: described.fallbacks,
 		judgeEnabled: described.enabled,
@@ -437,6 +555,7 @@ function helpText(): string {
 		"/harness <subcommand>",
 		"",
 		"  status      Configuration, current task, contract and state versions",
+		"  model       Choose the model for the Task Compiler / Contract Reviewer",
 		"  setup       Store the OpenRouter API key locally and verify connectivity",
 		"  doctor      Full diagnostic: Pi, config, state, secrets, Judge reachability",
 		"  contract    The current Task Contract, review findings and revision history",
