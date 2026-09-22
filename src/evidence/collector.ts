@@ -240,7 +240,7 @@ async function collectReviewer(
 	 * the named files and directories itself (runtime observation, redacted, capped)
 	 * and adds the worker's recent tool results, so the reviewer judges real content.
 	 */
-	const observed = await Promise.all(sources.map(async (source) => ({ source, content: await observeSource(source, context) })));
+	const observed = await observeSources(sources, context);
 	const recentResults = context.state.actions
 		.filter((a) => (a.outcome === "succeeded" || a.outcome === "failed") && a.resultSummary)
 		.slice(-8)
@@ -309,9 +309,35 @@ function baseEvidence(
 	};
 }
 
+/**
+ * The reviewer's sources are the task's product. The 4k tool-output cap is the wrong
+ * size for them: a 12k report cut at 4k left the contacts table hidden, and the
+ * reviewer rightly answered CANNOT_DETERMINE on every run. Files get a cap of their
+ * own, and one call is bounded as a whole so a task that produced six large files
+ * does not turn each review into a 100k-token prompt. Sources inside the working
+ * directory come first, because that is where the deliverable lives; scratch files
+ * elsewhere absorb the truncation.
+ */
+const REVIEW_SOURCE_MAX_CHARS = 48_000;
+const REVIEW_CALL_BUDGET_CHARS = 120_000;
+
+async function observeSources(sources: readonly string[], context: CollectionContext): Promise<Array<{ source: string; content: string }>> {
+	const inCwd = (source: string) => !/^https?:\/\//i.test(source) && (isAbsolute(source) ? source : resolve(context.cwd, source)).startsWith(context.cwd);
+	const ordered = [...sources].sort((a, b) => Number(inCwd(b)) - Number(inCwd(a)));
+	let remaining = REVIEW_CALL_BUDGET_CHARS;
+	const observed: Array<{ source: string; content: string }> = [];
+	for (const source of ordered) {
+		const limit = Math.max(Math.min(REVIEW_SOURCE_MAX_CHARS, remaining), context.maxOutput);
+		const content = await observeSource(source, context, limit);
+		remaining = Math.max(0, remaining - content.length);
+		observed.push({ source, content });
+	}
+	return observed;
+}
+
 /** What a named source currently contains: file text, a directory listing, a fetched page, or its absence. */
-async function observeSource(source: string, context: CollectionContext): Promise<string> {
-	if (/^https?:\/\//i.test(source)) return fetchSource(source, context);
+async function observeSource(source: string, context: CollectionContext, limit = context.maxOutput): Promise<string> {
+	if (/^https?:\/\//i.test(source)) return fetchSource(source, context, limit);
 	const path = isAbsolute(source) ? source : resolve(context.cwd, source);
 	try {
 		const stats = statSync(path);
@@ -321,7 +347,7 @@ async function observeSource(source: string, context: CollectionContext): Promis
 		if (!stats.isFile()) return `(exists, not a regular file, ${stats.size} bytes)`;
 		const buffer = readFileSync(path);
 		if (buffer.subarray(0, 512).includes(0)) return `(binary file, ${stats.size} bytes, sha256 ${createHash("sha256").update(buffer).digest("hex")})`;
-		return redact(clamp(buffer.toString("utf8"), context.maxOutput));
+		return redact(clamp(buffer.toString("utf8"), limit));
 	} catch {
 		return "(does not exist)";
 	}
@@ -332,7 +358,7 @@ async function observeSource(source: string, context: CollectionContext): Promis
  * content is judged on the content. Bounded in time and size; failure is reported
  * as an observation ("HTTP 403"), never guessed around.
  */
-async function fetchSource(url: string, context: CollectionContext): Promise<string> {
+async function fetchSource(url: string, context: CollectionContext, limit = context.maxOutput * 4): Promise<string> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 	try {
@@ -349,7 +375,7 @@ async function fetchSource(url: string, context: CollectionContext): Promise<str
 		});
 		const body = (await response.text()).slice(0, FETCH_MAX_CHARS);
 		const text = /<html/i.test(body) ? htmlToText(body) : body;
-		return `(HTTP ${response.status}, ${body.length}+ chars)\n${redact(clamp(text, context.maxOutput * 4))}`;
+		return `(HTTP ${response.status}, ${body.length}+ chars)\n${redact(clamp(text, limit))}`;
 	} catch (error) {
 		return `(fetch failed: ${error instanceof Error ? error.message : String(error)})`;
 	} finally {

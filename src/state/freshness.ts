@@ -21,7 +21,7 @@ export interface FreshnessAssessment {
 
 export function assessFreshness(
 	item: { observedAt: string; stateVersion: number; freshnessClass: FreshnessClass; validity?: string; supersededBy?: string },
-	context: { now: number; currentStateVersion: number; changedTargets?: ReadonlySet<string> },
+	context: { now: number; currentStateVersion: number; changedTargets?: ReadonlySet<string>; worldVersion?: number },
 ): FreshnessAssessment {
 	if (item.supersededBy) {
 		return { fresh: false, reason: `superseded by ${item.supersededBy}` };
@@ -55,10 +55,19 @@ export function assessFreshness(
 			 * current only while the state it was taken against still stands. Any state
 			 * advance means the world may have moved, which is exactly the "decisions from
 			 * stale state" failure this harness exists to prevent.
+			 *
+			 * "The world moved" means an action ran, not that the harness wrote another
+			 * line of bookkeeping. Evidence is collected in batches, and each item added
+			 * bumps the state version; measured against the raw version, every item but
+			 * the last in a batch was stale by the time the gate read it. Reviewer
+			 * verdicts vanished, the Judge was asked about conditions already settled, and
+			 * completion was rejected for "r2 missing" while r2 sat VERIFIED in the log.
+			 * Callers pass `worldVersion` (the last recorded action) for that reason.
 			 */
-			const stale = item.stateVersion < context.currentStateVersion;
+			const horizon = context.worldVersion ?? context.currentStateVersion;
+			const stale = item.stateVersion < horizon;
 			return stale
-				? { fresh: false, reason: `observed at state v${item.stateVersion}, now v${context.currentStateVersion}` }
+				? { fresh: false, reason: `observed at state v${item.stateVersion}, the world moved at v${horizon}` }
 				: { fresh: true, reason: `current as of state v${item.stateVersion}` };
 		}
 	}
@@ -110,6 +119,16 @@ export function changedTargetsSince(actions: readonly RecordedAction[], stateVer
 		}
 	}
 	return targets;
+}
+
+/**
+ * The state version of the most recent action outcome: the last point at which the
+ * workspace could have changed. Temporary evidence observed at or after it is current.
+ */
+export function worldVersion(actions: readonly RecordedAction[]): number {
+	let version = 0;
+	for (const action of actions) if (action.stateVersion > version) version = action.stateVersion;
+	return version;
 }
 
 export function currentFacts(facts: readonly VerifiedFact[]): VerifiedFact[] {

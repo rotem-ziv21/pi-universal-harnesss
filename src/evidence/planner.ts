@@ -1,7 +1,7 @@
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import type { ProjectConfig } from "../config/schema.ts";
 import type { TaskContract, VerificationStrategy } from "../contract/schema.ts";
-import { assessFreshness, changedTargetsSince, evidenceFor } from "../state/freshness.ts";
+import { assessFreshness, changedTargetsSince, evidenceFor, worldVersion } from "../state/freshness.ts";
 import type { FreshnessClass, HarnessState } from "../state/types.ts";
 import { resourcePath } from "../resources/registry.ts";
 import { newId } from "../util/ids.ts";
@@ -24,6 +24,7 @@ interface PlanTarget {
 	readonly id: string;
 	readonly description: string;
 	readonly priority: "hard" | "soft";
+	readonly kind: "requirement" | "success" | "constraint" | "forbidden";
 	readonly verification: readonly VerificationStrategy[];
 }
 
@@ -46,6 +47,7 @@ export function createEvidencePlanner(options: { logger?: Logger } = {}): Eviden
 							now,
 							currentStateVersion: state.stateVersion,
 							changedTargets: changedTargetsSince(state.actions, item.stateVersion),
+				worldVersion: worldVersion(state.actions),
 						}).fresh,
 				);
 				if (existing.length > 0) {
@@ -66,9 +68,7 @@ export function createEvidencePlanner(options: { logger?: Logger } = {}): Eviden
 						requests.push(
 							requestFor(target, {
 								kind: "semantic_evaluation",
-								instructions:
-									`Determine whether this condition of the task holds, judging only from the supplied sources and tool results: "${target.description}". ` +
-									"Answer VERIFIED only if the supplied material shows it; NOT_VERIFIED if it shows the opposite; CANNOT_DETERMINE if the material does not settle it.",
+								instructions: reviewerInstructions(target),
 								evidenceSources: producedResources(state),
 							}),
 						);
@@ -111,32 +111,59 @@ export function createEvidencePlanner(options: { logger?: Logger } = {}): Eviden
 function resolveTargets(contract: TaskContract, checkpoint: CheckpointDecision): PlanTarget[] {
 	const wanted = new Set(checkpoint.relatedRequirements);
 	const targets = new Map<string, PlanTarget>();
-	const add = (item: { id: string; description: string; priority: "hard" | "soft"; verification?: readonly VerificationStrategy[] }) =>
+	const add = (
+		kind: PlanTarget["kind"],
+		item: { id: string; description: string; priority: "hard" | "soft"; verification?: readonly VerificationStrategy[] },
+	) =>
 		targets.set(item.id, {
 			id: item.id,
 			description: item.description,
 			priority: item.priority,
+			kind,
 			verification: item.verification ?? [],
 		});
 
 	if (checkpoint.checkpointType === "completion_claim") {
-		for (const item of contract.requirements) if (item.priority === "hard") add(item);
-		for (const item of contract.successConditions) add(item);
-		for (const item of contract.constraints) if (item.priority === "hard") add(item);
-		for (const item of contract.forbiddenConditions) if (item.priority === "hard") add(item);
+		for (const item of contract.requirements) if (item.priority === "hard") add("requirement", item);
+		for (const item of contract.successConditions) add("success", item);
+		for (const item of contract.constraints) if (item.priority === "hard") add("constraint", item);
+		for (const item of contract.forbiddenConditions) if (item.priority === "hard") add("forbidden", item);
 		return [...targets.values()];
 	}
 
-	for (const item of contract.requirements) if (wanted.has(item.id)) add(item);
-	for (const item of contract.successConditions) if (wanted.has(item.id)) add(item);
-	for (const item of contract.constraints) if (wanted.has(item.id)) add(item);
-	for (const item of contract.forbiddenConditions) if (wanted.has(item.id)) add(item);
+	for (const item of contract.requirements) if (wanted.has(item.id)) add("requirement", item);
+	for (const item of contract.successConditions) if (wanted.has(item.id)) add("success", item);
+	for (const item of contract.constraints) if (wanted.has(item.id)) add("constraint", item);
+	for (const item of contract.forbiddenConditions) if (wanted.has(item.id)) add("forbidden", item);
 	// No fallback to "every hard item": an action gate verifies what it is linked to,
 	// nothing more. Unrelated requirements are the completion gate's business.
 	return [...targets.values()];
 }
 
 /** Files the task itself created or modified and that still exist, newest first. */
+/**
+ * A forbidden condition describes the outcome that must NOT have happened ("any
+ * file other than report.md is created"). Asked "does this hold?", a reviewer that
+ * finds only report.md answers NOT_VERIFIED — the event did not occur — and the
+ * harness read that as the prohibition being broken. Same facts, opposite labels
+ * on consecutive runs. The question is therefore put in terms of the prohibition
+ * being respected, so VERIFIED always means "the task is fine on this point".
+ */
+function reviewerInstructions(target: PlanTarget): string {
+	if (target.kind === "forbidden") {
+		return (
+			`This is a FORBIDDEN outcome of the task — it must not have happened: "${target.description}". ` +
+			"Judging only from the supplied sources and tool results, determine whether it occurred. " +
+			"Answer VERIFIED if the material shows it did NOT occur (the prohibition was respected); " +
+			"NOT_VERIFIED if the material shows it DID occur; CANNOT_DETERMINE if the material does not settle it."
+		);
+	}
+	return (
+		`Determine whether this condition of the task holds, judging only from the supplied sources and tool results: "${target.description}". ` +
+		"Answer VERIFIED only if the supplied material shows it; NOT_VERIFIED if it shows the opposite; CANNOT_DETERMINE if the material does not settle it."
+	);
+}
+
 function producedResources(state: HarnessState): string[] {
 	return [...state.workspace.resources]
 		.filter((r) => r.status === "active" && r.kind === "file" && r.provenance === "created_by_current_task")

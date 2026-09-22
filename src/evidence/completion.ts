@@ -1,6 +1,6 @@
 import type { ActionSelector, TaskContract } from "../contract/schema.ts";
 import { matchesActionSelector } from "../checkpoints/signals.ts";
-import { assessFreshness, changedTargetsSince, evidenceFor } from "../state/freshness.ts";
+import { assessFreshness, changedTargetsSince, evidenceFor, worldVersion } from "../state/freshness.ts";
 import type {
 	CompletionConditionResult,
 	CompletionEvaluation,
@@ -162,6 +162,7 @@ function freshEvidence(state: HarnessState, requirementId: string): EvidenceRef[
 			now,
 			currentStateVersion: state.stateVersion,
 			changedTargets: changedTargetsSince(state.actions, entry.stateVersion),
+			worldVersion: worldVersion(state.actions),
 		}).fresh,
 	);
 }

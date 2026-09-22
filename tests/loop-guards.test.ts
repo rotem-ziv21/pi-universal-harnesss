@@ -860,3 +860,106 @@ describe("Harness model calls do not deliberate", () => {
 		}
 	});
 });
+
+describe("Smoke run 13: evidence collected in one batch must all count", () => {
+	const completionCheckpoint = (ids: string[]) =>
+		({ needsGate: true, checkpointType: "completion_claim", severity: "critical", reason: "completion", signals: [], relatedRequirements: ids, escalated: false }) as const;
+
+	test("temporary evidence stays fresh while only bookkeeping advances the state; a new action makes it stale", async () => {
+		const { evaluateCompletionConditions } = await import("../src/evidence/completion.ts");
+		const c = contract({
+			requirements: [
+				{ id: "r1", description: "the page was fetched", source: "user", priority: "hard", status: "pending", verification: [] },
+				{ id: "r2", description: "the report names people", source: "user", priority: "hard", status: "pending", verification: [] },
+				{ id: "r3", description: "the report is in English", source: "user", priority: "hard", status: "pending", verification: [] },
+			],
+		});
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const write = action("write", { path: "report.md", content: "# Report" });
+		state.recordProposedAction({ ...write, at: new Date().toISOString(), stateVersion: state.getVersion(), outcome: "pending" });
+		state.recordAllowed(write.id);
+		state.recordToolResult(write.id, "written", false);
+
+		// Three reviewer verdicts, added one after another exactly as the collector does.
+		const version = state.getVersion();
+		for (const id of ["r1", "r2", "r3"]) {
+			state.addEvidence({
+				id: `evd-${id}`,
+				requirementIds: [id],
+				type: "semantic_evaluation",
+				summary: "VERIFIED — shown by the report",
+				sourceType: "model",
+				source: "reviewer:stub",
+				observedAt: new Date().toISOString(),
+				stateVersion: version,
+				freshnessClass: "temporary",
+				trust: "model_interpretation",
+				result: "supported",
+			});
+		}
+		const statuses = evaluateCompletionConditions({ contract: c, state: state.getState() }).conditions.map((x) => x.status);
+		assert.deepEqual(statuses, ["SATISFIED", "SATISFIED", "SATISFIED"], "every item in the batch counts, not only the last one added");
+
+		// The Judge payload must agree: none of the batch is excluded as stale.
+		const query = buildJudgeQuery({ contract: c, state: state.getState(), checkpoint: completionCheckpoint(["r1", "r2", "r3"]), action: action("bash", { command: "true" }) });
+		const included = query.state.evidenceBundles.flatMap((b) => b.selected.map((s) => s.id)).sort();
+		assert.deepEqual(included, ["evd-r1", "evd-r2", "evd-r3"]);
+
+		// The world moves: the worker edits the report again. Now the verdicts are stale.
+		const edit = action("write", { path: "report.md", content: "# Report v2" });
+		state.recordProposedAction({ ...edit, at: new Date().toISOString(), stateVersion: state.getVersion(), outcome: "pending" });
+		state.recordAllowed(edit.id);
+		state.recordToolResult(edit.id, "written", false);
+		const after = evaluateCompletionConditions({ contract: c, state: state.getState() }).conditions.map((x) => x.status);
+		assert.deepEqual(after, ["UNKNOWN", "UNKNOWN", "UNKNOWN"], "an action after the observation invalidates it");
+	});
+
+	test("a forbidden condition is put to the reviewer as a prohibition, so VERIFIED means it was respected", () => {
+		const c = contract({
+			forbiddenConditions: [
+				{ id: "f2", description: "Any file other than report.md is created inside the directory", source: "user", priority: "hard", verification: [] },
+			],
+			requirements: [{ id: "r1", description: "the report names people", source: "user", priority: "hard", status: "pending", verification: [] }],
+		});
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const plan = createEvidencePlanner().plan({ contract: c, state: state.getState(), checkpoint: completionCheckpoint(["f2", "r1"]), checkpointId: "ckpt-1", action: action("bash", { command: "true" }) });
+		const forbidden = plan.evidenceRequests.find((r) => r.requirementIds.includes("f2"))!.strategy;
+		const requirement = plan.evidenceRequests.find((r) => r.requirementIds.includes("r1"))!.strategy;
+		assert.equal(forbidden.kind, "semantic_evaluation");
+		assert.equal(requirement.kind, "semantic_evaluation");
+		if (forbidden.kind !== "semantic_evaluation" || requirement.kind !== "semantic_evaluation") return;
+		assert.ok(forbidden.instructions.includes("FORBIDDEN outcome"), "the reviewer is told this is a prohibition");
+		assert.ok(forbidden.instructions.includes("VERIFIED if the material shows it did NOT occur"), "polarity is spelled out");
+		assert.ok(!requirement.instructions.includes("FORBIDDEN"), "ordinary conditions keep the plain question");
+	});
+
+	test("the reviewer receives the whole produced report, not the first 4k characters", async () => {
+		const paths = tempPaths();
+		try {
+			const body = `# Report\n\n${"| Name | Role |\n| Someone | CEO |\n".repeat(400)}\nLAST ROW: Ramon Laguarta\n`;
+			assert.ok(body.length > 10_000);
+			writeFileSync(join(paths.configDir, "report.md"), body);
+			let prompt = "";
+			const reviewer = createStubModelAdapter((request) => {
+				prompt = request.userPrompt;
+				return "VERIFIED — the table is complete.";
+			});
+			const c = contract({
+				metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+				successConditions: [
+					{ id: "s3", description: "each contact has a reason", source: "user", priority: "hard", status: "pending", verification: [{ kind: "semantic_evaluation", instructions: "Check every row has a reason", evidenceSources: ["report.md"] }] },
+				],
+			});
+			const state = createStateManager(c.id, c, { persist: false });
+			state.lockContract(c);
+			const plan = createEvidencePlanner().plan({ contract: c, state: state.getState(), checkpoint: completionCheckpoint(["s3"]), checkpointId: "ckpt-1", action: action("bash", { command: "true" }) });
+			await createEvidenceCollector({ reviewer }).collect({ plan, cwd: paths.configDir, state: state.getState() });
+			assert.ok(prompt.includes("LAST ROW: Ramon Laguarta"), "the end of the report is visible to the reviewer");
+			assert.ok(!prompt.includes("chars elided"), "nothing of a 12k report is elided");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});

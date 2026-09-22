@@ -635,7 +635,12 @@ function completionConditionMessage(
 	status: "UNSATISFIED" | "UNKNOWN",
 	conditions: readonly CompletionConditionResult[],
 ): string {
-	const heading = status === "UNSATISFIED" ? "COMPLETION REJECTED — deterministic checks failed." : "COMPLETION REJECTED — evidence is incomplete.";
+	const heading =
+		status === "UNSATISFIED"
+			? conditions.every((condition) => condition.deterministic)
+				? "COMPLETION REJECTED — deterministic checks failed."
+				: "COMPLETION REJECTED — a condition was found not to hold."
+			: "COMPLETION REJECTED — evidence is incomplete.";
 	return [
 		heading,
 		"",

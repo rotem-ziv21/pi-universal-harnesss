@@ -1,6 +1,6 @@
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import { describeContractItem, type TaskContract } from "../contract/schema.ts";
-import { assessFreshness, changedTargetsSince, currentFacts } from "../state/freshness.ts";
+import { assessFreshness, changedTargetsSince, currentFacts, worldVersion } from "../state/freshness.ts";
 import type { HarnessState } from "../state/types.ts";
 import { clamp } from "../util/json.ts";
 import type { JudgeQuery, JudgeState } from "./judge.ts";
@@ -155,6 +155,7 @@ function buildState(
 				now,
 				currentStateVersion: state.stateVersion,
 				changedTargets: changedTargetsSince(state.actions, item.stateVersion),
+				worldVersion: worldVersion(state.actions),
 			});
 			if (!freshness.fresh) {
 				excluded.push({ id: item.id, reason: freshness.reason });
