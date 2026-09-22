@@ -1,7 +1,7 @@
 import { toProposedAction, createExecFn, extractCompletionClaim, summarizeResult } from "./pi-adapter.ts";
 import { renderContractDigest } from "./render.ts";
 import { createRuntime, type ActiveTask, type HarnessRuntime } from "./runtime.ts";
-import { registerCommands } from "./commands.ts";
+import { registerCommands, REPORT_WIDGET } from "./commands.ts";
 import { errorMessage } from "../util/errors.ts";
 import { clamp } from "../util/json.ts";
 
@@ -324,6 +324,9 @@ export function activate(pi: PiExtensionAPI): void {
 		await guard(
 			"agent_settled",
 			async () => {
+				// The transcript now carries any report shown while the agent was busy.
+				if (ctx.hasUI && typeof ctx.ui?.setWidget === "function") ctx.ui.setWidget(REPORT_WIDGET, undefined);
+
 				const rt = runtime;
 				const task = rt?.getTask();
 				if (!rt || !task || !rt.config.enabled) return;

@@ -793,10 +793,23 @@ const indent = (text: string): string => text.split("\n").map((l) => `  ${l}`).j
  * `notify` is a toast and truncates. `display: true` with `triggerTurn: false` means
  * the user sees it without spending a model call.
  */
+export const REPORT_WIDGET = "harness-report";
+
 function show(ctx: any, pi: PiExtensionAPI, text: string): void {
 	if (!ctx.hasUI) {
 		process.stdout.write(`${text}\n`);
 		return;
+	}
+	/**
+	 * A custom message with `triggerTurn: false` is appended to the transcript only
+	 * when the current turn ends: Pi refuses to place it between a tool call and its
+	 * result. While the agent is busy that looks like "nothing happened". So the
+	 * report is also drawn immediately as a widget above the editor, and cleared
+	 * when the run settles (see extension.ts).
+	 */
+	const busy = typeof ctx.isIdle === "function" ? !ctx.isIdle() : false;
+	if (busy && typeof ctx.ui?.setWidget === "function") {
+		ctx.ui.setWidget(REPORT_WIDGET, [...text.split("\n"), "", "(live harness report — clears when the agent settles)"]);
 	}
 	pi.sendMessage({ customType: "harness_report", content: text, display: true }, { triggerTurn: false });
 }
