@@ -612,3 +612,37 @@ describe("A write is observed on disk so the Judge can see the document", () => 
 		}
 	});
 });
+
+describe("Scratch files in the system temp directory are not policy violations", () => {
+	test("curl -o /tmp/... is classified as a write, and the write is in scope", async () => {
+		const paths = tempPaths();
+		try {
+			const c = contract({
+				...smokeContract,
+				metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+				workspace: { allowedScopes: [paths.configDir], protectedResources: [] },
+			});
+			const { core, judge, cleanup } = buildCore({ c });
+			try {
+				const fetch = action("bash", { command: "curl -sL -o /tmp/page.html https://example.com/newsletter" });
+				const effects = fetch.actionSemantics.effects;
+				assert.ok(effects.some((e) => e.operation === "create" || e.operation === "modify"), "the -o target is a file effect");
+
+				const outcome = await core.gateAction({ action: fetch, cwd: paths.configDir });
+				assert.equal(outcome.allowed, true);
+				assert.equal(judge.calls.length, 0, "scratch output needs no Judge");
+
+				const redirect = await core.gateAction({ action: action("bash", { command: "printf x > /tmp/scratch.txt" }), cwd: paths.configDir });
+				assert.equal(redirect.allowed, true, "a redirection into the temp dir is scratch, not an out-of-scope mutation");
+
+				const elsewhere = await core.gateAction({ action: action("bash", { command: "printf x > /etc/scratch.txt" }), cwd: paths.configDir });
+				assert.equal(elsewhere.allowed, false, "writes outside workspace and temp are still blocked");
+				assert.equal(elsewhere.checkpoint?.policyDecision, "block");
+			} finally {
+				cleanup();
+			}
+		} finally {
+			paths.cleanup();
+		}
+	});
+});

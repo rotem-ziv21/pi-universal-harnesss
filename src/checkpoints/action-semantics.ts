@@ -323,6 +323,18 @@ function classifyCommandSegment(words: string[], cwd: string, workspace: TaskWor
 			: endpoint
 				? resourceOperation("read", endpoint, cwd, workspace, "remote_resource", "query_resource", true, `${program} remote query`)
 				: localExecution(`${program} request`, ["query_resource"]);
+		// `-o file` / `--output file` / `-O` write the response to disk: a local file effect
+		// that scope policy must see, exactly like a shell redirection.
+		const outputs: string[] = [];
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index]!;
+			if ((arg === "-o" || arg === "--output" || arg === "--output-document") && args[index + 1]) outputs.push(args[index + 1]!);
+			else if (/^--output=(.+)$/.test(arg)) outputs.push(arg.replace(/^--output=/, ""));
+			else if (arg === "-O" || arg === "--remote-name") outputs.push(basename(endpoint?.split("?")[0] ?? "download"));
+		}
+		if (outputs.length > 0) {
+			operation = combineOperation(operation, [multiWriteOperation(outputs, cwd, workspace, "file", `${program} output`)]);
+		}
 	} else if (["cat", "head", "tail", "less", "more", "stat", "wc", "grep", "rg", "find"].includes(program)) {
 		const target = pathArguments(args).at(-1);
 		operation = target

@@ -1,5 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
 	ResourceEffect,
@@ -46,8 +47,31 @@ export function resourceScope(uri: string, workspace: TaskWorkspaceState): Resou
 	if (!uri.startsWith("file:")) return "external";
 	if (workspace.protectedResources.some((scope) => uriWithin(uri, scope))) return "protected";
 	if (workspace.allowedScopes.some((scope) => uriWithin(uri, scope))) return "allowed";
+	/**
+	 * The system temp directory is scratch space for every tool and every worker.
+	 * Treating it as "outside the workspace" turned `curl -o /tmp/page.html` into a
+	 * policy violation, which is not a rule anyone meant. It stays overridable: a
+	 * contract or project config can still name a temp path as protected.
+	 */
+	if (TEMP_SCOPES.some((scope) => uriWithin(uri, scope))) return "allowed";
 	return "outside_allowed";
 }
+
+const TEMP_SCOPES: readonly string[] = (() => {
+	// Both spellings of each directory: a URI built from a literal path (`/tmp/x`)
+	// and one built from its canonical form (`/private/tmp/x` on macOS) must both count.
+	const dirs = new Set<string>();
+	for (const candidate of [tmpdir(), "/tmp"]) {
+		const literal = resolve(candidate);
+		dirs.add(`${pathToFileURL(literal).href}/`);
+		try {
+			dirs.add(`${pathToFileURL(realpathSync(literal)).href}/`);
+		} catch {
+			// Not present on this platform; the literal form is enough.
+		}
+	}
+	return [...dirs];
+})();
 
 export function registeredResource(uri: string, workspace: TaskWorkspaceState): ResourceRecord | undefined {
 	return workspace.resources.find((resource) => resource.uri === uri);
