@@ -105,8 +105,10 @@ export function activate(pi: PiExtensionAPI): void {
 				// §49: a task survives a Pi restart.
 				const restored = rt.restoreTask();
 				if (restored && ctx.hasUI) {
+					const phase = restored.state.getState().phase;
 					ctx.ui.notify(
-						`Harness: resumed task ${restored.id} (contract v${restored.contract.version}, state v${restored.state.getVersion()})`,
+						`Harness: resumed task ${restored.id} (contract v${restored.contract.version}, state v${restored.state.getVersion()}, ${phase})` +
+							(phase === "awaiting_user" ? " — it was paused for your decision; reply to continue or /harness abandon" : ""),
 						"info",
 					);
 				}
@@ -150,41 +152,66 @@ export function activate(pi: PiExtensionAPI): void {
 				 * no risk of recompiling on our own feedback.
 				 */
 				const existing = rt.getTask();
+				const args = {
+					request: prompt,
+					cwd: ctx.cwd ?? process.cwd(),
+					availableTools: safeTools(pi),
+					...(ctx.hasUI ? { onProgress: (m: string) => ctx.ui.setStatus("harness", m) } : {}),
+				};
+
 				if (existing) {
 					// The harness paused the task for a human decision; the human just spoke.
 					if (existing.state.getState().phase === "awaiting_user") {
 						existing.state.setPhase("execute", "user replied");
 					}
-					// A short reply ("yes", "go on") continues the task under the same contract.
-					// A substantive message changes the task, so the contract is revised.
-					if (!rt.shouldCompile(prompt)) {
-						updateStatus(rt, ctx);
-						return undefined;
-					}
-				} else if (!rt.shouldCompile(prompt)) {
+					updateStatus(rt, ctx);
+
+					// A short reply ("yes", "go on") continues under the same contract. So does
+					// the original request sent again after a restart: it is not new information.
+					if (!rt.shouldCompile(prompt) || sameRequest(existing.contract.originalRequest, prompt)) return undefined;
+
+					/**
+					 * A genuine follow-up revises the contract — in the background. Blocking the
+					 * turn here cost a full model timeout (three minutes on a busy local server)
+					 * before the worker was even allowed to start, and the outcome of that wait
+					 * was "continuing under the previous contract" anyway. The worker starts
+					 * under the previous contract now; gates read the live contract, so the
+					 * revision takes effect the moment it lands, and its digest is appended to
+					 * the transcript for the model to see.
+					 */
+					if (compileInFlight) return undefined;
+					if (ctx.hasUI) ctx.ui.setStatus("harness", "updating task contract in the background…");
+					compileInFlight = rt
+						.reviseTask(args)
+						.then((task) => {
+							if (ctx.hasUI) ctx.ui.notify(`Harness: contract updated to v${task.contract.version} for your follow-up.`, "info");
+							pi.sendMessage(
+								{ customType: CUSTOM_TYPE_CONTRACT, content: renderContractDigest(task.contract, task.state.getVersion()), display: false },
+								{ triggerTurn: false },
+							);
+							return task;
+						})
+						.catch((e) => {
+							rt.logger.error("task revision failed", { error: errorMessage(e) });
+							if (ctx.hasUI) ctx.ui.notify(`Harness: could not update the contract (${errorMessage(e)}); the previous one stays in force.`, "warning");
+							return undefined;
+						})
+						.finally(() => {
+							compileInFlight = undefined;
+							updateStatus(rt, ctx);
+						});
 					return undefined;
 				}
 
-				// Compilation is two model calls; tell the user why there is a pause.
-				if (ctx.hasUI) ctx.ui.setStatus("harness", existing ? "updating task contract…" : "compiling task contract…");
+				if (!rt.shouldCompile(prompt)) return undefined;
 
-				const args = {
-					request: prompt,
-					cwd: ctx.cwd ?? process.cwd(),
-					availableTools: safeTools(pi),
-					...(ctx.signal ? { signal: ctx.signal } : {}),
-					...(ctx.hasUI ? { onProgress: (m: string) => ctx.ui.setStatus("harness", m) } : {}),
-				};
-				compileInFlight = (existing ? rt.reviseTask(args) : rt.startTask(args)).catch((e) => {
-					rt.logger.error(existing ? "task revision failed" : "task start failed", { error: errorMessage(e) });
-					if (ctx.hasUI) {
-						ctx.ui.notify(
-							existing
-								? `Harness: could not update the contract (${errorMessage(e)}); continuing under the previous one.`
-								: `Harness: could not start task governance — ${errorMessage(e)}`,
-							"error",
-						);
-					}
+				// The first contract is compiled before the worker starts: gates need it.
+				// Two model calls; tell the user why there is a pause.
+				if (ctx.hasUI) ctx.ui.setStatus("harness", "compiling task contract…");
+
+				compileInFlight = rt.startTask({ ...args, ...(ctx.signal ? { signal: ctx.signal } : {}) }).catch((e) => {
+					rt.logger.error("task start failed", { error: errorMessage(e) });
+					if (ctx.hasUI) ctx.ui.notify(`Harness: could not start task governance — ${errorMessage(e)}`, "error");
 					return undefined;
 				});
 
@@ -437,6 +464,14 @@ function updateStatus(runtime: HarnessRuntime, ctx: any): void {
 
 	const state = task.state.getState();
 	ctx.ui.setStatus("harness", `harness: ${state.phase} c${state.contractVersion}/v${state.stateVersion}`);
+}
+
+/** The same words again (whitespace aside) are the same request, not a follow-up. */
+function sameRequest(original: string, prompt: string): boolean {
+	const norm = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
+	const a = norm(original);
+	const b = norm(prompt);
+	return a === b || a.includes(b);
 }
 
 function safeTools(pi: PiExtensionAPI): string[] {
