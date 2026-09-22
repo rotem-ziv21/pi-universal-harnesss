@@ -3,7 +3,7 @@ import type { TaskContract } from "../contract/schema.ts";
 import type { EvidencePlan } from "../evidence/types.ts";
 import type { RoutedDecision } from "../judges/router.ts";
 import { describeContractItem } from "../contract/schema.ts";
-import type { HarnessState } from "../state/types.ts";
+import type { CompletionEvaluation, HarnessState } from "../state/types.ts";
 import { displayPath } from "../config/paths.ts";
 import { clamp } from "../util/json.ts";
 
@@ -84,8 +84,10 @@ export function renderCompletionRejection(args: {
 	decision: RoutedDecision;
 	plan?: EvidencePlan | undefined;
 	contract: TaskContract;
+	/** The gate's own deterministic evaluation, so settled conditions are reported as settled. */
+	evaluation?: CompletionEvaluation | undefined;
 }): string {
-	const { decision, plan, contract } = args;
+	const { decision, plan, contract, evaluation } = args;
 	const lines: string[] = [];
 
 	lines.push("COMPLETION REJECTED — the task is not finished.");
@@ -99,7 +101,16 @@ export function renderCompletionRejection(args: {
 		lines.push("");
 	}
 
-	const unsatisfied = contract.successConditions.filter((s) => s.status !== "satisfied");
+	const settled = new Set(evaluation?.conditions.filter((c) => c.status === "SATISFIED").map((c) => c.id) ?? []);
+	if (settled.size > 0) {
+		lines.push("Already verified by the harness (no action needed):");
+		for (const condition of evaluation!.conditions) {
+			if (condition.status === "SATISFIED") lines.push(`  - ${condition.id}: ${condition.description}`);
+		}
+		lines.push("");
+	}
+
+	const unsatisfied = contract.successConditions.filter((s) => !settled.has(s.id));
 	if (unsatisfied.length > 0) {
 		lines.push("Success conditions not yet verified:");
 		for (const condition of unsatisfied) {

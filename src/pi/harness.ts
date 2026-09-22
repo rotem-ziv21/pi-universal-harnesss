@@ -14,7 +14,7 @@ import { buildJudgeQuery, estimatePayloadTokens } from "../judges/payload.ts";
 import type { JudgeRouter, RoutedDecision } from "../judges/router.ts";
 import type { ProgressMonitor } from "../progress/monitor.ts";
 import type { StateManager } from "../state/state-manager.ts";
-import type { CheckpointRecord, CompletionConditionResult, EvidenceRef } from "../state/types.ts";
+import type { CheckpointRecord, CompletionConditionResult, CompletionEvaluation, EvidenceRef } from "../state/types.ts";
 import { newCheckpointId, newDecisionId, newEvidenceId, nowIso } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
 import { renderBlock, renderCompletionHalt, renderCompletionRejection } from "./render.ts";
@@ -413,8 +413,10 @@ async function runGate(args: {
 	}
 
 	let checkpointForJudge = checkpoint;
+	let completionEvaluation: CompletionEvaluation | undefined;
 	if (checkpoint.checkpointType === "completion_claim") {
 		const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
+		completionEvaluation = evaluation;
 		deps.state.recordCompletionEvaluation(evaluation);
 		const hardUnsatisfied = evaluation.conditions.filter(
 			(condition) => condition.priority === "hard" && condition.status === "UNSATISFIED",
@@ -535,7 +537,7 @@ async function runGate(args: {
 	}
 
 	const message = args.renderRejection
-		? renderCompletionRejection({ decision, plan, contract })
+		? renderCompletionRejection({ decision, plan, contract, evaluation: completionEvaluation })
 		: renderBlock({ action, checkpoint, decision, plan, contract, state: deps.state.getState() });
 
 	deps.state.recordBlocked(action.id, decision.decision, checkpointId);

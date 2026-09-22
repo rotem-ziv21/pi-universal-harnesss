@@ -372,3 +372,72 @@ describe("Tasks do not outlive their usefulness", () => {
 		}
 	});
 });
+
+describe("Second live run: false positives that blocked correct work", () => {
+	test("redirecting to /dev/null is not a write outside the workspace", async () => {
+		const { core, judge, cleanup } = buildCore({});
+		try {
+			for (const command of ["ls -la && git log --oneline -5 2>/dev/null; git status", "npm test >/dev/null 2>&1", "cat < /dev/null"]) {
+				const outcome = await core.gateAction({ action: action("bash", { command }), cwd: process.cwd() });
+				assert.equal(outcome.allowed, true, `"${command}" must not be blocked`);
+			}
+			assert.equal(judge.calls.length, 0, "and it must not cost a Judge call either");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a condition the harness verified itself is not put back to the Judge", async () => {
+		const c = contract({
+			...smokeContract,
+			id: "task-settled",
+			successConditions: [
+				{
+					id: "s1",
+					description: "npm test exits successfully",
+					source: "user",
+					priority: "hard",
+					status: "pending",
+					verification: [{ kind: "command_execution", program: "npm test", args: [], expectExitCode: 0 }],
+				},
+			],
+		});
+		const paths = tempPaths();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const executed: string[] = [];
+		const judge = scriptedJudge((query) => {
+			// A Judge that, like the live one, would rate everything it is asked about at 0.06.
+			const support = Object.fromEntries(query.requirements.map((r) => [r.id, 0.06]));
+			return { decision: "PASS", confidence: 0.9, detail: { requirementSupport: support } };
+		});
+		const config = testConfig();
+		const core = createHarnessCore({
+			config,
+			paths,
+			state,
+			detector: createCheckpointDetector({ config, judge }),
+			planner: createEvidencePlanner(),
+			collector: createEvidenceCollector({
+				exec: async (program, args) => {
+					executed.push([program, ...args].join(" "));
+					return { stdout: "# pass 1\n# fail 0", stderr: "", exitCode: 0 };
+				},
+			}),
+			judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+			progress: createProgressMonitor({ config }),
+			logger: nullLogger,
+		});
+		try {
+			const outcome = await core.gateCompletion({ cwd: process.cwd() });
+			assert.deepEqual(executed, ["npm test"], "'npm test' with empty args is run as argv, not rejected");
+			const asked = judge.calls.at(-1)!.requirements.map((r) => r.id);
+			assert.ok(!asked.includes("s1"), `s1 was settled by the harness's own check; the Judge was asked about ${asked.join(", ")}`);
+			assert.deepEqual(asked, ["r1", "r2"], "only the items the harness could not settle reach the Judge");
+			assert.equal(outcome.allowed, true);
+			assert.equal(state.getState().evidence[0]?.result, "supported");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});

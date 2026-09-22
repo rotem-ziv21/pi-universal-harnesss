@@ -343,6 +343,12 @@ function redirectionOperations(words: string[], cwd: string, workspace: TaskWork
 		if (match[3] !== undefined) continue;
 		const target = words[index + 1];
 		if (!target || isControlToken(target) || isRedirectionToken(target)) continue;
+		/**
+		 * `2>/dev/null`, `>/dev/stderr`, `</dev/tty`: device nodes, not resources. Treating
+		 * them as files "outside the workspace" blocked the most ordinary shell idiom
+		 * there is, twice in one run, and taught the worker nothing useful.
+		 */
+		if (/^\/dev\//.test(target)) continue;
 		const input = match[2] === "<";
 		if (input) {
 			operations.push(resourceOperation("read", target, cwd, workspace, "file", "read_resource", true, "input redirection"));

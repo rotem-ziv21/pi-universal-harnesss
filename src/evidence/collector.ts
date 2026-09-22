@@ -95,10 +95,20 @@ async function collectOne(request: EvidenceRequest, context: CollectionContext):
 
 async function collectCommand(
 	request: EvidenceRequest,
-	strategy: Extract<VerificationStrategy, { kind: "command_execution" }>,
+	declared: Extract<VerificationStrategy, { kind: "command_execution" }>,
 	context: CollectionContext,
 ): Promise<CollectedEvidence> {
+	let strategy = declared;
 	if (!context.options.exec) throw new Error("no exec function is available to run an explicit verification command");
+	/**
+	 * Compilers regularly emit `{program: "npm test", args: []}`. That is still an
+	 * argv — whitespace-split, no shell — so accept it rather than throw away the one
+	 * typed check the contract has. A program with shell syntax is still refused.
+	 */
+	if (strategy.args.length === 0 && /\s/.test(strategy.program.trim())) {
+		const [program, ...args] = strategy.program.trim().split(/\s+/);
+		strategy = { ...strategy, program: program!, args };
+	}
 	if (!/^[a-z0-9_./-]+$/i.test(strategy.program)) throw new Error(`invalid verification program: ${strategy.program}`);
 	const timeout = new AbortController();
 	const timer = setTimeout(() => timeout.abort(), context.options.commandTimeoutMs ?? DEFAULT_TIMEOUT_MS);

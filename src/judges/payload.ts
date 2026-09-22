@@ -60,7 +60,6 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	const { contract, state, checkpoint, action } = args;
 
 	const relevantIds = new Set(checkpoint.relatedRequirements);
-	const isCompletion = checkpoint.checkpointType === "completion_claim";
 
 	/**
 	 * What must this checkpoint prove?
@@ -78,16 +77,19 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	const requirements: Array<{ id: string; description: string; priority: "hard" | "soft"; verifiable: boolean }> = [];
 	const verifiable = (item: { verification?: readonly unknown[] }) => (item.verification?.length ?? 0) > 0;
 
+	/**
+	 * Only the items the checkpoint links are put to the Judge. For a completion
+	 * claim the gate links exactly the hard items its own deterministic evaluation
+	 * left UNKNOWN. A condition the harness has already settled by running its typed
+	 * check (`npm test` exited 0 → SATISFIED) is not re-litigated: a Judge that then
+	 * says "p=0.06" would override runtime truth with an opinion, and did.
+	 */
 	for (const r of contract.requirements) {
-		// A completion gate answers to every hard requirement; an action gate answers
-		// to the ones the checkpoint linked.
-		const applies = relevantIds.has(r.id) || (isCompletion && r.priority === "hard");
-		if (applies) requirements.push({ id: r.id, description: r.description, priority: r.priority, verifiable: verifiable(r) });
+		if (relevantIds.has(r.id)) requirements.push({ id: r.id, description: r.description, priority: r.priority, verifiable: verifiable(r) });
 	}
 
 	for (const s of contract.successConditions) {
-		// At a completion gate every success condition applies; otherwise only linked ones.
-		if (isCompletion || relevantIds.has(s.id)) {
+		if (relevantIds.has(s.id)) {
 			requirements.push({ id: s.id, description: s.description, priority: s.priority, verifiable: verifiable(s) });
 		}
 	}
@@ -102,10 +104,10 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 
 	const constraints = [
 		...contract.constraints
-			.filter((constraint) => constraint.priority === "hard" && (isCompletion || relevantIds.has(constraint.id)))
+			.filter((constraint) => constraint.priority === "hard" && relevantIds.has(constraint.id))
 			.map((constraint) => ({ id: constraint.id, description: constraint.description })),
 		...contract.forbiddenConditions
-			.filter((condition) => condition.priority === "hard" && (isCompletion || relevantIds.has(condition.id)))
+			.filter((condition) => condition.priority === "hard" && relevantIds.has(condition.id))
 			.map((condition) => ({ id: condition.id, description: condition.description })),
 	];
 
