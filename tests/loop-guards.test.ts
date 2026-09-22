@@ -784,8 +784,13 @@ describe("Sixth live run: completion gets real evidence for prose conditions", (
 			const evidence = state.getState().evidence.find((e) => e.requirementIds.includes("r2"));
 			assert.equal(evidence?.trust, "model_interpretation");
 			assert.equal(evidence?.result, "supported");
-			const bundle = judge.calls.at(-1)!.state.evidenceBundles.find((b) => b.requirementId === "r2");
-			assert.equal(bundle?.selected.length, 1, "the Judge sees the reviewer's verdict in r2's bundle");
+			assert.ok(
+				judge.calls.every((q) => !q.requirements.some((r) => r.id === "r2")),
+				"a condition the reviewer verified from the content is settled; the Judge is not asked to second-guess it",
+			);
+			const settled = state.getState().lastCompletionEvaluation?.conditions.find((c) => c.id === "r2");
+			assert.equal(settled?.status, "SATISFIED");
+			assert.equal(settled?.deterministic, false, "recorded as reviewer-settled, not as a deterministic fact");
 		} finally {
 			paths.cleanup();
 		}

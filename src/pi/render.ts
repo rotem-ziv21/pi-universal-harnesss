@@ -103,9 +103,11 @@ export function renderCompletionRejection(args: {
 
 	const settled = new Set(evaluation?.conditions.filter((c) => c.status === "SATISFIED").map((c) => c.id) ?? []);
 	if (settled.size > 0) {
-		lines.push("Already verified by the harness (no action needed):");
+		lines.push("Already verified (no action needed):");
 		for (const condition of evaluation!.conditions) {
-			if (condition.status === "SATISFIED") lines.push(`  - ${condition.id}: ${condition.description}`);
+			if (condition.status === "SATISFIED") {
+				lines.push(`  - ${condition.id}: ${condition.description}${condition.deterministic ? "" : "  [by the reviewer model, from the produced content]"}`);
+			}
 		}
 		lines.push("");
 	}

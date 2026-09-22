@@ -61,6 +61,35 @@ function evaluateEvidenceCondition(
 			true,
 		);
 	}
+
+	/**
+	 * A condition that only a reader can settle — "the recommendations are reasoned
+	 * and grounded" — has no exit code. The best verification that exists is a
+	 * separate reviewer model reading the produced artifact against the sources and
+	 * answering for that condition. When it has done so and answered VERIFIED, the
+	 * condition is settled for completion; NOT_VERIFIED settles it the other way.
+	 * This is still model interpretation (trust level 3) and is recorded as such:
+	 * it is never promoted to a verified fact, and the worker's own claim never
+	 * reaches this path. Asking a decisions model afterwards "is this supported by
+	 * runtime evidence?" only produced a confident no to a question that has no
+	 * runtime answer, and rejected correct work three runs in a row.
+	 */
+	const reviewed = evidence.filter((entry) => isReviewerEvidence(entry));
+	const refuted = reviewed.find((entry) => entry.result === "contradicted");
+	if (refuted) {
+		return condition(item, kind, "UNSATISFIED", `Reviewer: ${refuted.summary}`, [refuted.id], false);
+	}
+	const verified = reviewed.filter((entry) => entry.result === "supported");
+	if (verified.length > 0) {
+		return condition(
+			item,
+			kind,
+			"SATISFIED",
+			`Reviewer verified against the produced content: ${verified.map((entry) => entry.summary).join("; ")}`,
+			verified.map((entry) => entry.id),
+			false,
+		);
+	}
 	return condition(
 		item,
 		kind,
@@ -134,6 +163,14 @@ function freshEvidence(state: HarnessState, requirementId: string): EvidenceRef[
 			currentStateVersion: state.stateVersion,
 			changedTargets: changedTargetsSince(state.actions, entry.stateVersion),
 		}).fresh,
+	);
+}
+
+function isReviewerEvidence(evidence: EvidenceRef): boolean {
+	return (
+		evidence.trust === "model_interpretation" &&
+		(evidence.type === "semantic_evaluation" || evidence.type === "visual_evaluation") &&
+		evidence.sourceType === "model"
 	);
 }
 

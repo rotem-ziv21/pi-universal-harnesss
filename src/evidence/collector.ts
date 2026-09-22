@@ -339,7 +339,13 @@ async function fetchSource(url: string, context: CollectionContext): Promise<str
 		const response = await fetch(url, {
 			signal: context.signal ? anySignal(context.signal, controller.signal) : controller.signal,
 			redirect: "follow",
-			headers: { "user-agent": "Mozilla/5.0 (compatible; pi-universal-harness evidence collector)" },
+			headers: {
+				// Sites that serve full content to browsers and a login wall to everything
+				// else (LinkedIn) must show the reviewer what the worker saw.
+				"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+				accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+				"accept-language": "en-US,en;q=0.9",
+			},
 		});
 		const body = (await response.text()).slice(0, FETCH_MAX_CHARS);
 		const text = /<html/i.test(body) ? htmlToText(body) : body;
