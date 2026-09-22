@@ -581,3 +581,34 @@ describe("Fourth live run: a coarse forbid policy must not brick the task", () =
 		}
 	});
 });
+
+describe("A write is observed on disk so the Judge can see the document", () => {
+	test("the tool result carries the written file's head, redacted and capped", async () => {
+		const paths = tempPaths();
+		try {
+			const { core, state, cleanup } = buildCore({
+				c: contract({
+					...smokeContract,
+					metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+					workspace: { allowedScopes: [paths.configDir], protectedResources: [] },
+				}),
+			});
+			try {
+				const path = join(paths.configDir, "summary.md");
+				const write = action("write", { path, content: "# Comparison\n\nSQLite is small.\n\n| Name | License |\n" });
+				await core.gateAction({ action: write, cwd: paths.configDir });
+				writeFileSync(path, "# Comparison\n\nSQLite is small. API_KEY=sk-live-abc123\n\n| Name | License |\n");
+				core.recordToolResult({ actionId: write.id, summary: "Successfully wrote 60 bytes", isError: false });
+
+				const recorded = state.getState().actions.find((a) => a.id === write.id)!;
+				assert.ok(recorded.resultSummary?.includes("observed on disk after the write"));
+				assert.ok(recorded.resultSummary?.includes("| Name | License |"), "the Judge can now see the table");
+				assert.ok(!recorded.resultSummary?.includes("sk-live-abc123"), "secrets in written files are redacted");
+			} finally {
+				cleanup();
+			}
+		} finally {
+			paths.cleanup();
+		}
+	});
+});

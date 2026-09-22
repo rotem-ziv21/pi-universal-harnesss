@@ -1,4 +1,8 @@
+import { readFileSync, statSync } from "node:fs";
 import { withActionSemantics } from "../checkpoints/action-semantics.ts";
+import { resourcePath } from "../resources/registry.ts";
+import { redact } from "../security/redact.ts";
+import { clamp } from "../util/json.ts";
 import type { CheckpointDetector } from "../checkpoints/detector.ts";
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import type { HarnessPaths } from "../config/paths.ts";
@@ -592,7 +596,39 @@ function recordRuntimeToolEvidence(
 	// Tool outcomes update canonical action/resource state. They become completion
 	// evidence only through an explicit typed verification request collected by the
 	// Evidence Collector; filenames and prose are never used as implicit links.
-	deps.state.recordToolResult(actionId, summary, isError);
+	deps.state.recordToolResult(actionId, isError ? summary : `${summary}${observeWrittenFiles(deps, actionId)}`, isError);
+}
+
+/**
+ * After a successful write, look at what is now on disk.
+ *
+ * A `write` tool result says "wrote 1723 bytes" and nothing else, so the Judge
+ * could not see the document the worker had just produced and rejected it for
+ * lack of evidence; the worker then had to `cat` the file to be believed. The
+ * harness observes the resource itself instead — a runtime observation, capped
+ * and redacted, never a link to any requirement.
+ */
+function observeWrittenFiles(deps: HarnessCoreDeps, actionId: string): string {
+	const action = deps.state.getState().actions.find((item) => item.id === actionId);
+	if (!action) return "";
+	const written = action.actionSemantics.effects.filter(
+		(effect) => effect.kind === "file" && (effect.operation === "create" || effect.operation === "modify"),
+	);
+	const notes: string[] = [];
+	for (const effect of written.slice(0, 2)) {
+		const path = resourcePath(effect.uri);
+		if (!path) continue;
+		try {
+			const stats = statSync(path);
+			if (!stats.isFile()) continue;
+			const head = readFileSync(path).subarray(0, 4096);
+			const text = head.includes(0) ? `(binary, ${stats.size} bytes)` : redact(clamp(head.toString("utf8"), 600));
+			notes.push(`\n[observed on disk after the write: ${path}, ${stats.size} bytes]\n${text}`);
+		} catch {
+			// The file may be gone already; nothing to observe.
+		}
+	}
+	return notes.join("");
 }
 
 function completionConditionMessage(
