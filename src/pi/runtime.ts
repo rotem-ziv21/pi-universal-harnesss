@@ -50,6 +50,12 @@ export interface HarnessRuntime {
 	refreshModel(host: PiModelHost): void;
 	/** Compile, review, lock and activate a new task. */
 	startTask(args: StartTaskArgs): Promise<ActiveTask>;
+	/**
+	 * The user sent a new substantive message while a task was active. Recompile the
+	 * contract for the whole conversation and record it as a revision of the same
+	 * task, so the event log, evidence and action history survive.
+	 */
+	reviseTask(args: StartTaskArgs): Promise<ActiveTask>;
 	/** Load the most recent task for this cwd, if any (§49). */
 	restoreTask(): ActiveTask | undefined;
 	clearTask(): void;
@@ -409,6 +415,59 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 			return task;
 		},
 
+		async reviseTask({ request, cwd, availableTools, signal, onProgress }): Promise<ActiveTask> {
+			const current = task;
+			if (!current) return this.startTask({ request, cwd, availableTools, signal, onProgress });
+
+			const previousContract = current.state.getContract();
+			const compilerInput = { request, cwd, availableTools, projectConfig, previousContract, ...(signal ? { signal } : {}) };
+			const reviewNotes: string[] = [];
+			const openQuestions: string[] = [];
+
+			const progress = makeProgress(onProgress, modelAdapter.id);
+			let next = await compiler.compile({ ...compilerInput, onAttempt: progress("Updating the Task Contract") });
+
+			if (config.contractReviewer.enabled) {
+				const reviewProgress = makeProgress(onProgress, reviewerAdapter.id);
+				const review = await reviewer.review({
+					request: next.originalRequest,
+					contract: next,
+					...(signal ? { signal } : {}),
+					onAttempt: reviewProgress("Reviewing the updated contract"),
+				});
+				reviewNotes.push(...findingLines(review));
+				if (review.verdict === "REVISE") {
+					try {
+						next = await compiler.compile({
+							...compilerInput,
+							reviewFindings: findingLines(review),
+							onAttempt: makeProgress(onProgress, modelAdapter.id)("Recompiling after review"),
+						});
+					} catch (e) {
+						logger.warn("recompilation failed; keeping the first revision", { error: errorMessage(e) });
+					}
+				} else if (review.verdict === "NEEDS_USER_INPUT") {
+					openQuestions.push(...review.questions);
+				}
+			}
+
+			// The user authored the change, so dropping an earlier hard item is legitimate.
+			current.state.reviseContract(next, { reason: `user follow-up: ${request.slice(0, 120)}`, source: "user" });
+			if (reviewNotes.length > 0) current.state.emit("contract_reviewed", { notes: reviewNotes, questions: openQuestions });
+			current.state.setPhase("plan", "contract revised by a user follow-up");
+
+			task = {
+				...current,
+				contract: current.state.getContract(),
+				reviewNotes,
+				openQuestions,
+				degraded: false,
+			};
+			rememberActiveTask(current.id);
+			logger.info("task revised", { taskId: current.id, contractVersion: task.contract.version, goal: task.contract.goal });
+			return task;
+		},
+
 		restoreTask(): ActiveTask | undefined {
 			const pointer = readJsonFile<ActiveTaskPointer>(paths.activeTaskFile);
 			if (!pointer?.taskId) return undefined;
@@ -425,6 +484,17 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 
 			// Finished tasks are history, not something to resume into.
 			if (restored.state.phase === "completed" || restored.state.phase === "abandoned") return undefined;
+
+			/**
+			 * So is a task nobody touched for a while. Resuming last week's contract on
+			 * today's unrelated prompt in the same directory would block the user with
+			 * rules they no longer remember agreeing to.
+			 */
+			const ageMs = Date.now() - Date.parse(restored.state.updatedAt);
+			if (Number.isFinite(ageMs) && ageMs > config.state.resumeWithinHours * 3_600_000) {
+				logger.info("not resuming a stale task", { taskId: pointer.taskId, ageHours: Math.round(ageMs / 3_600_000) });
+				return undefined;
+			}
 
 			task = {
 				id: pointer.taskId,

@@ -31,6 +31,13 @@ export interface CompilerInput {
 	readonly signal?: AbortSignal | undefined;
 	/** Present when re-compiling after a REVISE verdict from the reviewer. */
 	readonly reviewFindings?: readonly string[] | undefined;
+	/**
+	 * Present when the user sent a new message while a task was active. The compiler
+	 * then produces the *updated* contract for the whole conversation, not a contract
+	 * for the new sentence alone — earlier constraints survive unless the user changed
+	 * them, and the goal absorbs the new request.
+	 */
+	readonly previousContract?: TaskContract | undefined;
 	/** Progress callback so the UI can show which attempt is running. */
 	readonly onAttempt?: ((attempt: number, total: number) => void) | undefined;
 }
@@ -218,6 +225,29 @@ function buildUserPrompt(input: CompilerInput): string {
 		);
 	}
 
+	if (input.previousContract) {
+		const prev = input.previousContract;
+		const items = (label: string, list: ReadonlyArray<{ id: string; description: string; source?: string; priority?: string }>) =>
+			list.length ? [`${label}:`, ...list.map((item) => `  ${item.id} [${[item.source, item.priority].filter(Boolean).join("/")}] ${item.description}`)] : [];
+		parts.push(
+			"",
+			"<previous_contract>",
+			"The user is continuing the SAME conversation. The request above is their newest message; the contract",
+			"below was compiled from their earlier messages and governed the work so far. Produce the full updated",
+			"contract: keep every earlier item that still applies (especially user constraints and prohibitions),",
+			"drop only what the newest message clearly changes or cancels, and add what it introduces. The goal",
+			"should describe the whole task, not only the newest sentence.",
+			`original request: ${prev.originalRequest}`,
+			`goal: ${prev.goal}`,
+			...items("requirements", prev.requirements),
+			...items("constraints", prev.constraints),
+			...items("success conditions", prev.successConditions),
+			...items("forbidden conditions", prev.forbiddenConditions),
+			...items("critical actions", prev.criticalActions),
+			"</previous_contract>",
+		);
+	}
+
 	if (input.reviewFindings?.length) {
 		parts.push(
 			"",
@@ -245,7 +275,7 @@ function materialize(compiled: CompiledContract, input: CompilerInput, modelId: 
 	return {
 		id: newTaskId(),
 		version: 1,
-		originalRequest: input.request,
+		originalRequest: input.previousContract ? `${input.previousContract.originalRequest}\n\n[follow-up] ${input.request}` : input.request,
 		goal: compiled.goal,
 		workspace: { allowedScopes, protectedResources },
 		requirements: compiled.requirements.map((requirement, index) => ({

@@ -17,7 +17,7 @@ import type { StateManager } from "../state/state-manager.ts";
 import type { CheckpointRecord, CompletionConditionResult, EvidenceRef } from "../state/types.ts";
 import { newCheckpointId, newDecisionId, newEvidenceId, nowIso } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
-import { renderBlock, renderCompletionRejection } from "./render.ts";
+import { renderBlock, renderCompletionHalt, renderCompletionRejection } from "./render.ts";
 
 /**
  * The gate.
@@ -42,6 +42,12 @@ export interface GateOutcome {
 	readonly plan?: EvidencePlan;
 	/** True when the worker should stop rather than retry (§43 STOP_BRANCH). */
 	readonly terminate?: boolean;
+	/**
+	 * Completion gate only. True when the worker should be restarted with `message`
+	 * to keep working; false when the harness has halted the loop and the user must
+	 * decide (cap reached, no progress since the last rejection, or a user limit).
+	 */
+	readonly resume?: boolean;
 }
 
 export interface HarnessCore {
@@ -158,8 +164,51 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 				checkpoint,
 			});
 			if (retry.action === "NO_PROGRESS") {
+				/**
+				 * The same checkpoint already failed and nothing changed. Blocking again
+				 * with the same words teaches the worker nothing; it will try a third time.
+				 * A human can settle it in one answer, so ask when there is a UI. Without
+				 * one, block and say plainly that the worker cannot fix this by retrying.
+				 */
+				if (deps.confirmWithUser) {
+					const checkpointId = recordCheckpoint(deps, normalizedAction, checkpoint);
+					const approved = await deps.confirmWithUser(
+						"Harness: the same action was blocked before",
+						[
+							`Action: ${normalizedAction.summary}`,
+							`Checkpoint: ${checkpoint.checkpointType ?? "unspecified"} (${checkpoint.severity})`,
+							`Reason it was blocked: ${checkpoint.reason}`,
+							"",
+							"No new evidence has appeared since. Allow this action now?",
+						].join("\n"),
+					);
+					deps.state.emit("user_intervention", { checkpointId, approved, reason: "no_progress" });
+					if (approved) {
+						deps.state.recordAllowed(normalizedAction.id, checkpointId);
+						log.info("user approved a NO_PROGRESS checkpoint", { checkpointId });
+						return { allowed: true, checkpoint };
+					}
+					deps.state.recordBlocked(normalizedAction.id, "user rejected after no progress", checkpointId, "user_rejected");
+					return {
+						allowed: false,
+						message: `BLOCKED — you asked the user and they declined this action.\n\nAction: ${normalizedAction.summary}\n\nDo not retry it. Continue with the rest of the task or stop and report.`,
+						checkpoint,
+					};
+				}
 				deps.state.recordBlocked(normalizedAction.id, retry.reason);
-				return { allowed: false, message: `NO_PROGRESS\n\nReason: ${retry.reason}`, checkpoint };
+				return {
+					allowed: false,
+					message: [
+						"NO_PROGRESS — this action was already blocked and nothing has changed since.",
+						"",
+						`Reason: ${retry.reason}`,
+						"",
+						"Retrying it, or a rephrased equivalent, will be blocked again. The missing evidence is not something you can produce",
+						"by reading files or re-running the same command. Either change the approach so this action is unnecessary,",
+						"or stop and tell the user exactly which action you need approved and why.",
+					].join("\n"),
+					checkpoint,
+				};
 			}
 
 			return runGate({ deps, log, action: normalizedAction, checkpoint, contract, cwd, agentAssessment, signal });
@@ -175,6 +224,43 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 		 */
 		async gateCompletion({ cwd, agentAssessment, signal }): Promise<GateOutcome> {
 			const contract = deps.state.getContract();
+			const before = deps.state.getState();
+
+			/**
+			 * Loop guard (§43 applied to §44). Two ways a rejected completion is not
+			 * allowed to restart the worker again:
+			 *
+			 *   1. The worker recorded no action since the last rejection. It did not
+			 *      gather anything; it just said "done" again. Bouncing it back would
+			 *      produce the same claim a third time.
+			 *   2. The rejection budget is spent. A condition nothing can verify must end
+			 *      with a human decision, not with the model circling until the context
+			 *      is full.
+			 *
+			 * In both cases the gate still evaluates and still rejects — the harness never
+			 * pretends the task is verified — but it reports `resume: false` so the
+			 * extension hands the decision to the user instead of the worker.
+			 */
+			const noProgress =
+				before.lastCompletionRejection !== undefined && before.actions.length === before.lastCompletionRejection.actionCount;
+			const budgetSpent = before.counters.completionAttempts >= deps.config.progress.maxCompletionRejections;
+			const haltReason = noProgress
+				? "the worker declared completion again without performing any new action"
+				: budgetSpent
+					? `completion has already been rejected ${before.counters.completionAttempts} time(s), the configured maximum`
+					: undefined;
+
+			const halt = (outcome: GateOutcome): GateOutcome => {
+				if (outcome.allowed || !haltReason) return { ...outcome, resume: !outcome.allowed };
+				deps.state.setPhase("awaiting_user", haltReason);
+				log.warn("completion loop halted; waiting for the user", { reason: haltReason });
+				return {
+					...outcome,
+					resume: false,
+					message: renderCompletionHalt({ reason: haltReason, rejection: outcome.message ?? "" }),
+				};
+			};
+
 			deps.state.requestCompletion();
 
 			const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
@@ -189,7 +275,7 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			if (hardUnsatisfied.length > 0) {
 				const message = completionConditionMessage("UNSATISFIED", hardUnsatisfied);
 				deps.state.rejectCompletion(message);
-				return { allowed: false, message };
+				return halt({ allowed: false, message });
 			}
 			if (hardUnknown.length === 0) {
 				deps.state.completeTask();
@@ -236,10 +322,10 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			if (outcome.allowed) {
 				deps.state.completeTask();
 				log.info("task completed and verified", { taskId: deps.state.taskId, stateVersion: deps.state.getVersion() });
-			} else {
-				deps.state.rejectCompletion(outcome.message ?? "Completion was rejected.");
+				return outcome;
 			}
-			return outcome;
+			deps.state.rejectCompletion(outcome.message ?? "Completion was rejected.");
+			return halt(outcome);
 		},
 
 		recordToolResult({ actionId, summary, isError }): void {
@@ -461,8 +547,12 @@ async function runGate(args: {
 		decision,
 		checkpoint,
 		plan,
-		// A FAIL means the approach is wrong; retrying it unchanged wastes a turn.
-		terminate: decision.decision === "FAIL",
+		/**
+		 * No `terminate` on FAIL. Ending the agent run here fires `agent_settled`, the
+		 * completion gate rejects, the worker is restarted, it tries the same thing,
+		 * FAIL again — a loop made of nothing but harness plumbing. The block message
+		 * already tells the worker not to retry; let it read that and adapt in-turn.
+		 */
 	};
 }
 
@@ -516,6 +606,8 @@ function completionConditionMessage(
 			`  ${condition.reason}`,
 		]),
 		"",
-		"Continue the task and address the conditions above.",
+		"These checks were run by the harness itself against the current state of the workspace.",
+		"Fix the underlying problem, then finish again. Do not simply restate that the work is done.",
+		"If a condition is wrong or impossible, say so explicitly and stop so the user can decide.",
 	].join("\n");
 }

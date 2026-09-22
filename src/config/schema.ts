@@ -69,6 +69,14 @@ export const JudgeConfigSchema = Type.Object(
 		),
 		/** USD per million input tokens, for the estimate in `/harness judge`. */
 		inputCostPerMillion: Type.Number({ default: 0.042, minimum: 0 }),
+		/**
+		 * Budget for the fallback *model* Judge, per attempt. Separate from `timeoutMs`
+		 * because that one bounds an HTTP call to Jev, while this bounds a structured
+		 * completion from whatever chat model Pi is on — which on a local machine can
+		 * be slow. Unbounded, a stalled fallback Judge stalls every gate for minutes.
+		 */
+		modelFallbackTimeoutMs: Type.Integer({ default: 90_000, minimum: 5_000, maximum: 1_800_000 }),
+		modelFallbackRepairAttempts: Type.Integer({ default: 1, minimum: 0, maximum: 5 }),
 	},
 	{ default: {} },
 );
@@ -151,6 +159,13 @@ export const HarnessConfigSchema = Type.Object(
 				 */
 				repeatActionThreshold: Type.Integer({ default: 3, minimum: 2, maximum: 50 }),
 				noNewEvidenceTurns: Type.Integer({ default: 4, minimum: 2, maximum: 50 }),
+				/**
+				 * How many times a rejected completion may restart the worker. Beyond this,
+				 * or when the worker made no progress since the last rejection, the harness
+				 * stops the loop and hands the decision to the user. Without a cap, a
+				 * condition nothing can verify keeps the model circling forever.
+				 */
+				maxCompletionRejections: Type.Integer({ default: 2, minimum: 0, maximum: 20 }),
 			},
 			{ default: {} },
 		),
@@ -162,6 +177,12 @@ export const HarnessConfigSchema = Type.Object(
 				snapshotEveryEvents: Type.Integer({ default: 25, minimum: 1, maximum: 1000 }),
 				/** Task directories older than this are pruned by `/harness prune`. */
 				retainTaskDays: Type.Integer({ default: 30, minimum: 1, maximum: 3650 }),
+				/**
+				 * An unfinished task is resumed on session start only if it was last touched
+				 * within this window. Yesterday's contract must not silently govern today's
+				 * unrelated prompt in the same directory.
+				 */
+				resumeWithinHours: Type.Number({ default: 12, minimum: 0, maximum: 24 * 365 }),
 			},
 			{ default: {} },
 		),

@@ -27,6 +27,8 @@ const LIMITS = {
 	evidenceItems: 20,
 	evidenceResultChars: 400,
 	recentActions: 8,
+	runtimeObservations: 12,
+	observationChars: 300,
 	hypotheses: 6,
 	verifiedFacts: 12,
 	actionArgumentChars: 1200,
@@ -73,31 +75,30 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	 * evidence would be filtered straight back out and the Judge would be asked to
 	 * approve an irreversible action with nothing in front of it.
 	 */
-	const requirements: Array<{ id: string; description: string; priority: "hard" | "soft" }> = [];
+	const requirements: Array<{ id: string; description: string; priority: "hard" | "soft"; verifiable: boolean }> = [];
+	const verifiable = (item: { verification?: readonly unknown[] }) => (item.verification?.length ?? 0) > 0;
 
 	for (const r of contract.requirements) {
 		// A completion gate answers to every hard requirement; an action gate answers
 		// to the ones the checkpoint linked.
 		const applies = relevantIds.has(r.id) || (isCompletion && r.priority === "hard");
-		if (applies) requirements.push({ id: r.id, description: r.description, priority: r.priority });
+		if (applies) requirements.push({ id: r.id, description: r.description, priority: r.priority, verifiable: verifiable(r) });
 	}
 
 	for (const s of contract.successConditions) {
 		// At a completion gate every success condition applies; otherwise only linked ones.
 		if (isCompletion || relevantIds.has(s.id)) {
-			requirements.push({ id: s.id, description: s.description, priority: s.priority });
+			requirements.push({ id: s.id, description: s.description, priority: s.priority, verifiable: verifiable(s) });
 		}
 	}
 
-	// Only an unlinked generic risk falls back to all hard requirements. A checkpoint
-	// linked solely to a constraint must not suddenly require proof of task completion.
-	if (requirements.length === 0 && relevantIds.size === 0) {
-		for (const requirement of contract.requirements) {
-			if (requirement.priority === "hard") {
-				requirements.push({ id: requirement.id, description: requirement.description, priority: requirement.priority });
-			}
-		}
-	}
+	/**
+	 * An action gate with no linked requirement asks only about the action itself:
+	 * does it violate a constraint or a user instruction? It deliberately does NOT
+	 * fall back to "prove every hard requirement of the task first". That fallback
+	 * turned a user-requested `rm *.log` into "show me evidence the comment was added
+	 * to app.py", which the worker could never satisfy — and the loop began there.
+	 */
 
 	const constraints = [
 		...contract.constraints
@@ -240,6 +241,15 @@ function buildState(
 		recentActions: state.actions
 			.slice(-LIMITS.recentActions)
 			.map((a) => `${a.summary} → ${a.outcome}${a.resultSummary ? `: ${clamp(a.resultSummary, 120)}` : ""}`),
+
+		runtimeObservations: state.actions
+			.filter((a) => (a.outcome === "succeeded" || a.outcome === "failed") && a.resultSummary)
+			.slice(-LIMITS.runtimeObservations)
+			.map((a) => ({
+				action: clamp(a.summary, 200),
+				outcome: a.outcome,
+				result: clamp(a.resultSummary ?? "", LIMITS.observationChars),
+			})),
 
 		counters: {
 			toolCalls: state.counters.toolCalls,

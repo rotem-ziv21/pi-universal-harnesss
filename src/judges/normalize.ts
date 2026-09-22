@@ -62,7 +62,12 @@ export function normalizeDecision(args: {
 			reasons.push(`Requirement "${requirement.description}" is supported by the evidence (p=${fmt(p)}).`);
 		} else if (requirement.priority === "hard") {
 			unsupportedHard.push(requirement.id);
-			missingEvidence.push(`${requirement.id}: ${requirement.description} — not sufficiently supported (p=${fmt(p)}).`);
+			missingEvidence.push(
+				`${requirement.id}: ${requirement.description} — not sufficiently supported (p=${fmt(p)}).` +
+					(requirement.verifiable === false
+						? " The harness has no typed check for this; demonstrate it with a tool result (run a test, a listing, a diff, a check)."
+						: ""),
+			);
 			reasons.push(`Requirement "${requirement.description}" lacks sufficient evidence (p=${fmt(p)}).`);
 		} else {
 			reasons.push(`Soft requirement "${requirement.description}" is weakly supported (p=${fmt(p)}); not blocking.`);

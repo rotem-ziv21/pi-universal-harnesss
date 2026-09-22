@@ -143,31 +143,50 @@ export function activate(pi: PiExtensionAPI): void {
 
 				const prompt = String(event.prompt ?? "").trim();
 
-				// An active task continues; a new prompt refines it rather than replacing it.
+				/**
+				 * This event fires only for prompts the user typed. A turn the harness
+				 * itself triggers (a completion rejection sent with `triggerTurn`) goes
+				 * through Pi's `_runAgentPrompt` directly and never lands here, so there is
+				 * no risk of recompiling on our own feedback.
+				 */
 				const existing = rt.getTask();
 				if (existing) {
-					updateStatus(rt, ctx);
+					// The harness paused the task for a human decision; the human just spoke.
+					if (existing.state.getState().phase === "awaiting_user") {
+						existing.state.setPhase("execute", "user replied");
+					}
+					// A short reply ("yes", "go on") continues the task under the same contract.
+					// A substantive message changes the task, so the contract is revised.
+					if (!rt.shouldCompile(prompt)) {
+						updateStatus(rt, ctx);
+						return undefined;
+					}
+				} else if (!rt.shouldCompile(prompt)) {
 					return undefined;
 				}
 
-				if (!rt.shouldCompile(prompt)) return undefined;
-
 				// Compilation is two model calls; tell the user why there is a pause.
-				if (ctx.hasUI) ctx.ui.setStatus("harness", "compiling task contract…");
+				if (ctx.hasUI) ctx.ui.setStatus("harness", existing ? "updating task contract…" : "compiling task contract…");
 
-				compileInFlight = rt
-					.startTask({
-						request: prompt,
-						cwd: ctx.cwd ?? process.cwd(),
-						availableTools: safeTools(pi),
-						...(ctx.signal ? { signal: ctx.signal } : {}),
-						...(ctx.hasUI ? { onProgress: (m: string) => ctx.ui.setStatus("harness", m) } : {}),
-					})
-					.catch((e) => {
-						rt.logger.error("task start failed", { error: errorMessage(e) });
-						if (ctx.hasUI) ctx.ui.notify(`Harness: could not start task governance — ${errorMessage(e)}`, "error");
-						return undefined;
-					});
+				const args = {
+					request: prompt,
+					cwd: ctx.cwd ?? process.cwd(),
+					availableTools: safeTools(pi),
+					...(ctx.signal ? { signal: ctx.signal } : {}),
+					...(ctx.hasUI ? { onProgress: (m: string) => ctx.ui.setStatus("harness", m) } : {}),
+				};
+				compileInFlight = (existing ? rt.reviseTask(args) : rt.startTask(args)).catch((e) => {
+					rt.logger.error(existing ? "task revision failed" : "task start failed", { error: errorMessage(e) });
+					if (ctx.hasUI) {
+						ctx.ui.notify(
+							existing
+								? `Harness: could not update the contract (${errorMessage(e)}); continuing under the previous one.`
+								: `Harness: could not start task governance — ${errorMessage(e)}`,
+							"error",
+						);
+					}
+					return undefined;
+				});
 
 				const task = await compileInFlight;
 				compileInFlight = undefined;
@@ -317,6 +336,8 @@ export function activate(pi: PiExtensionAPI): void {
 
 				const phase = task.state.getState().phase;
 				if (phase === "completed" || phase === "abandoned") return;
+				// The harness already stopped the loop and is waiting for the user.
+				if (phase === "awaiting_user") return;
 
 				completionGateRunning = true;
 				try {
@@ -337,16 +358,54 @@ export function activate(pi: PiExtensionAPI): void {
 						return;
 					}
 
-					if (ctx.hasUI) ctx.ui.notify("Harness: completion rejected — continuing the task", "warning");
+					if (outcome.resume !== false) {
+						if (ctx.hasUI) ctx.ui.notify("Harness: completion rejected — continuing the task", "warning");
+						pi.sendMessage(
+							{
+								customType: CUSTOM_TYPE_COMPLETION,
+								content: outcome.message ?? "Completion rejected. Continue the task.",
+								display: true,
+							},
+							{ triggerTurn: true, deliverAs: "followUp" },
+						);
+						return;
+					}
 
+					/**
+					 * The loop guard fired. The worker is NOT restarted; the message is shown
+					 * and the user decides. With a UI, offer the one-click way out, because
+					 * "the harness could not verify it" is often a fact about the harness's
+					 * evidence routes, not about the work.
+					 */
 					pi.sendMessage(
-						{
-							customType: CUSTOM_TYPE_COMPLETION,
-							content: outcome.message ?? "Completion rejected. Continue the task.",
-							display: true,
-						},
-						{ triggerTurn: true, deliverAs: "followUp" },
+						{ customType: CUSTOM_TYPE_COMPLETION, content: outcome.message ?? "Completion not verified.", display: true },
+						{ triggerTurn: false },
 					);
+					if (!ctx.hasUI) {
+						rt.logger.warn("completion loop halted with no UI; task left in awaiting_user");
+						return;
+					}
+					let accept = false;
+					try {
+						accept = Boolean(
+							await ctx.ui.confirm(
+								"Harness: completion could not be verified",
+								"The harness stopped the verify/retry loop. Accept the task as complete anyway?\n\n" +
+									"No = keep the task paused; your next message continues it, or run /harness abandon.",
+							),
+						);
+					} catch {
+						accept = false;
+					}
+					if (accept) {
+						task.state.emit("user_intervention", { approved: true, reason: "completion accepted by user" });
+						task.state.completeTask();
+						rt.clearTask();
+						ctx.ui.notify("Harness: task accepted as complete by you (unverified).", "info");
+					} else {
+						ctx.ui.notify("Harness: task paused. Reply to continue it, or run /harness abandon.", "warning");
+					}
+					updateStatus(rt, ctx);
 				} finally {
 					completionGateRunning = false;
 					if (ctx.hasUI) ctx.ui.setStatus("harness", undefined);

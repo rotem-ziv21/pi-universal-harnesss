@@ -316,8 +316,47 @@ policy. `UNSATISFIED` blocks directly; only `UNKNOWN` conditions reach the Judge
 
 On rejection the harness pushes structured feedback back with `triggerTurn`, so the
 worker resumes with the exact remaining conditions instead of repeating the same
-action. Retrying an equivalent blocked checkpoint without new evidence returns
-`NO_PROGRESS` before another Judge call.
+action. The feedback tells the worker what actually counts: the Judge sees what its
+tools returned (exit codes, output, listings, diffs), so it must *demonstrate* a
+condition with a tool result rather than restate that the work is done.
+
+### 11. The loop guard
+
+A harness that sends the worker back "for more evidence" has to know when more
+evidence cannot exist. Otherwise it produces the failure it was built to prevent: a
+model circling until its context is full, and finally claiming success to escape.
+
+Four rules keep that from happening:
+
+- **An action gate asks only about the action.** A `rm *.log` the user asked for is
+  judged on the constraints it might violate, never on whether an unrelated
+  requirement has been proven yet.
+- **Unverifiable is not "more evidence".** A hard requirement with no typed
+  verification route can never acquire linked runtime evidence. The deterministic
+  Judge sends it to a human (`REVIEW`) instead of demanding the impossible, and the
+  Judge payload flags it so a model Judge weighs the tool observations instead.
+- **A repeated block goes to the user.** Retrying an equivalent blocked checkpoint
+  with no new evidence asks the user to decide when there is a UI, and otherwise
+  returns `NO_PROGRESS` with a message that says retrying cannot work.
+- **Completion rejections are finite.** If the worker declares completion again
+  without recording a single new action, or after `progress.maxCompletionRejections`
+  rejections, the harness stops restarting it. The task moves to `awaiting_user`, the
+  last rejection is shown, and the user is asked whether to accept the result, continue
+  with a new instruction, or `/harness abandon`. The harness never marks an unverified
+  task complete on its own.
+
+A `FAIL` on an action gate no longer ends the agent run. Ending it only bounced the
+worker through the completion gate and back into the same `FAIL`; the block message
+already tells it not to retry.
+
+### 12. Follow-ups revise the contract
+
+A new substantive prompt while a task is active is not ignored and does not start an
+unrelated task. The compiler is given the previous contract and the new message and
+produces the updated contract for the whole conversation; it is recorded as a contract
+revision of the same task, so the event log, evidence and action history survive. A
+short reply ("yes", "go on") continues under the existing contract. An unfinished task
+is resumed on session start only if it was touched within `state.resumeWithinHours`.
 
 ---
 
@@ -516,6 +555,8 @@ Global config lives outside the repository and contains **no secrets**:
     "decisionsPath": "/alpha/decisions",
     "model": "~typesafe/jev-latest",
     "timeoutMs": 30000,
+    "modelFallbackTimeoutMs": 90000,     // budget per attempt for the chat-model fallback Judge
+    "modelFallbackRepairAttempts": 1,
     "fallbackChain": ["model", "deterministic"],
     "failurePolicy": { "critical": "user_review", "noncritical": "fallback" },
     "thresholds": {
@@ -525,7 +566,8 @@ Global config lives outside the repository and contains **no secrets**:
     }
   },
   "contract": { "autoCompile": "substantive" },
-  "state":    { "persist": true },
+  "progress": { "maxCompletionRejections": 2 },  // then the user decides, not the loop
+  "state":    { "persist": true, "resumeWithinHours": 12 },
   "logging":  { "level": "info" }
 }
 ```

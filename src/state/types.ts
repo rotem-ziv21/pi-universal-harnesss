@@ -221,6 +221,12 @@ export interface HarnessState {
 	/** Set when the completion gate refused, so the next attempt knows what was missing. */
 	readonly lastCompletionFeedback?: string;
 	readonly lastCompletionEvaluation?: CompletionEvaluation;
+	/**
+	 * Where the task stood when completion was last rejected. The next completion
+	 * attempt compares against it: if the worker recorded no new action since, it
+	 * merely repeated its claim, and restarting it again would be a loop.
+	 */
+	readonly lastCompletionRejection?: { readonly stateVersion: number; readonly actionCount: number; readonly attempt: number };
 }
 
 // --- events ---

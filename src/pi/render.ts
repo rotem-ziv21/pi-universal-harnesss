@@ -125,10 +125,38 @@ export function renderCompletionRejection(args: {
 
 	lines.push(`Judge: ${decision.judgeId} · decision ${decision.decision} · confidence ${decision.confidence.toFixed(2)} · state v${decision.stateVersion}`);
 	lines.push("");
-	lines.push("Continue the task: gather the missing evidence, then declare completion again.");
-	lines.push("If you believe a requirement cannot be verified, say so explicitly and explain why.");
+	lines.push("How to continue — this matters, read it:");
+	lines.push("  - The Judge sees what your tools actually returned (exit codes, output, listings, diffs).");
+	lines.push("    Saying the work is done is not evidence. Demonstrating it with a tool result is.");
+	lines.push("  - For each item above, run the command or inspection whose output shows it holds");
+	lines.push("    (run the tests, list the files, show the diff, execute the check), then finish again.");
+	lines.push("  - If an item is wrong, impossible, or needs a decision only the user can make, say so");
+	lines.push("    explicitly and stop. The harness will hand the decision to the user; it will not");
+	lines.push("    keep sending you back.");
 
 	return lines.join("\n");
+}
+
+/**
+ * The completion loop has been halted (§43 applied to §44).
+ *
+ * Written for the user as much as for the worker: the worker will not be restarted
+ * by this message, so it must explain what happened and what the user can do.
+ */
+export function renderCompletionHalt(args: { reason: string; rejection: string }): string {
+	return [
+		"COMPLETION NOT VERIFIED — the harness has stopped the verify/retry loop.",
+		"",
+		`Why it stopped: ${args.reason}.`,
+		"",
+		"The task is paused and waits for you. Options:",
+		"  - Reply with what you want done next (the worker continues under the same contract).",
+		"  - Accept the result as-is when prompted, or run /harness abandon to drop the task.",
+		"  - Run /harness evidence to see what was and was not verified.",
+		"",
+		"Last rejection:",
+		...args.rejection.split("\n").map((line) => `  ${line}`),
+	].join("\n");
 }
 
 /** The contract digest injected into the worker's context at task start. */

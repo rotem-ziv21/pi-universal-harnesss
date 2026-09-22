@@ -265,7 +265,9 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 		}
 
 		case "branch_stopped":
-			return state;
+			// A user-set limit was reached. The worker must not be restarted by the
+			// completion gate; the user decides what happens next.
+			return { ...state, phase: "awaiting_user" };
 
 		case "user_intervention":
 			return { ...state, phase: (p.phase as TaskPhase) ?? state.phase };
@@ -282,6 +284,11 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 				...state,
 				phase: "verify",
 				...(typeof p.feedback === "string" ? { lastCompletionFeedback: p.feedback } : {}),
+				lastCompletionRejection: {
+					stateVersion: state.stateVersion,
+					actionCount: state.actions.length,
+					attempt: state.counters.completionAttempts,
+				},
 			};
 
 		case "completion_evaluated":

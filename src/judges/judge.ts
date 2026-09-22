@@ -56,8 +56,15 @@ export interface JudgeDecision {
 export interface JudgeQuery {
 	/** Compact, harness-built payload (§37). See `payload.ts`. */
 	readonly state: JudgeState;
-	/** Requirements to evaluate individually, by id. */
-	readonly requirements: ReadonlyArray<{ id: string; description: string; priority: "hard" | "soft" }>;
+	/**
+	 * Requirements to evaluate individually, by id.
+	 *
+	 * `verifiable` says whether the contract carries a typed verification strategy the
+	 * harness itself can run. When it is false, no amount of "gather more evidence" can
+	 * ever produce linked runtime evidence, so a Judge that cannot reason must hand the
+	 * item to a human rather than demand the impossible.
+	 */
+	readonly requirements: ReadonlyArray<{ id: string; description: string; priority: "hard" | "soft"; verifiable?: boolean }>;
 	/** Hard constraints to check the proposed action against, by id. */
 	readonly constraints: ReadonlyArray<{ id: string; description: string }>;
 	readonly checkpointType: string;
@@ -103,6 +110,13 @@ export interface JudgeState {
 	}>;
 	readonly hypotheses: readonly string[];
 	readonly recentActions: readonly string[];
+	/**
+	 * Runtime observations: what the worker's tools actually returned. Produced by the
+	 * tool runtime, not by the model, so they are Level 1 evidence for the Judge's
+	 * semantic assessment. They are never linked to a requirement by the harness — the
+	 * Judge decides whether "pytest → exit 0, 12 passed" demonstrates "tests pass".
+	 */
+	readonly runtimeObservations: ReadonlyArray<{ action: string; outcome: string; result: string }>;
 	readonly counters: Readonly<Record<string, number>>;
 	readonly stateVersion: number;
 	/** Untrusted. Included for context only; never treated as evidence (§38). */

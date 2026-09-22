@@ -109,10 +109,8 @@ function resolveTargets(contract: TaskContract, checkpoint: CheckpointDecision):
 	for (const item of contract.successConditions) if (wanted.has(item.id)) add(item);
 	for (const item of contract.constraints) if (wanted.has(item.id)) add(item);
 	for (const item of contract.forbiddenConditions) if (wanted.has(item.id)) add(item);
-	if (targets.size === 0) {
-		for (const item of contract.constraints) if (item.priority === "hard") add(item);
-		for (const item of contract.requirements) if (item.priority === "hard") add(item);
-	}
+	// No fallback to "every hard item": an action gate verifies what it is linked to,
+	// nothing more. Unrelated requirements are the completion gate's business.
 	return [...targets.values()];
 }
 

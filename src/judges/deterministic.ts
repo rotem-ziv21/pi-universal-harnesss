@@ -36,6 +36,7 @@ export function createDeterministicJudge(options: { config: JudgeConfig }): Judg
 			];
 			const missingEvidence: string[] = [];
 			const requirementSupport: Record<string, number> = {};
+			let unverifiableHard = 0;
 
 			// Which requirements have any current runtime evidence attached?
 			const covered = new Set<string>();
@@ -47,11 +48,21 @@ export function createDeterministicJudge(options: { config: JudgeConfig }): Judg
 				// Evidence is matched by description, which is how the payload builder emits it.
 				const hasEvidence = covered.has(requirement.description) || covered.has(requirement.id);
 				requirementSupport[requirement.id] = hasEvidence ? 0.6 : 0;
+				if (hasEvidence || requirement.priority !== "hard") continue;
 
-				if (!hasEvidence && requirement.priority === "hard") {
-					missingEvidence.push(`${requirement.id}: ${requirement.description} — no runtime evidence has been collected.`);
-					reasons.push(`Hard requirement "${requirement.description}" has no supporting runtime evidence.`);
+				/**
+				 * Demand more evidence only where evidence can exist. A requirement with no
+				 * typed verification route will never acquire linked runtime evidence, so
+				 * MORE_EVIDENCE would send the worker on an errand it cannot complete — and
+				 * it would come back, and be sent again. That item goes to a human instead.
+				 */
+				if (requirement.verifiable === false) {
+					unverifiableHard++;
+					reasons.push(`Hard requirement "${requirement.description}" has no typed verification route; a human must judge it.`);
+					continue;
 				}
+				missingEvidence.push(`${requirement.id}: ${requirement.description} — no runtime evidence has been collected.`);
+				reasons.push(`Hard requirement "${requirement.description}" has no supporting runtime evidence.`);
 			}
 
 			const isCritical = query.checkpointType !== "progress_stall" && query.checkpointType !== "claim_promotion";
@@ -73,15 +84,18 @@ export function createDeterministicJudge(options: { config: JudgeConfig }): Judg
 			 * demonstrates the requirement is a judgement this engine cannot make, so it
 			 * hands the decision to a human rather than inventing a PASS.
 			 */
+			const needsHuman = isCritical || unverifiableHard > 0;
 			reasons.push(
-				isCritical
-					? "All hard requirements have supporting evidence, but assessing whether that evidence is sufficient requires a decision model. Escalating to human review."
+				needsHuman
+					? unverifiableHard > 0
+						? `${unverifiableHard} hard requirement(s) cannot be verified by the harness and need a human decision.`
+						: "All hard requirements have supporting evidence, but assessing whether that evidence is sufficient requires a decision model. Escalating to human review."
 					: "All hard requirements have supporting evidence. This checkpoint is not critical, so it proceeds.",
 			);
 
 			return {
-				decision: isCritical ? "REVIEW" : "PASS",
-				confidence: isCritical ? 0 : options.config.thresholds.minPassConfidence,
+				decision: needsHuman ? "REVIEW" : "PASS",
+				confidence: needsHuman ? 0 : options.config.thresholds.minPassConfidence,
 				reasons,
 				missingEvidence: [],
 				stateVersion: query.stateVersion,

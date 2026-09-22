@@ -137,7 +137,9 @@ describe("The gate actually blocks", () => {
 			});
 
 			assert.equal(outcome.allowed, false);
-			assert.equal(outcome.terminate, true);
+			// No `terminate`: ending the run would only bounce through the completion gate
+			// and back into the same FAIL. The message carries the instruction instead.
+			assert.equal(outcome.terminate, undefined);
 			assert.ok(outcome.message?.includes("Do not retry this action as-is"));
 		} finally {
 			cleanup();
@@ -219,8 +221,9 @@ describe("The completion gate (§44)", () => {
 			const outcome = await core.gateCompletion({ cwd: process.cwd() });
 
 			assert.equal(outcome.allowed, false);
+			assert.equal(outcome.resume, true, "the first rejection restarts the worker");
 			assert.ok(outcome.message?.includes("COMPLETION REJECTED"));
-			assert.ok(outcome.message?.includes("Continue the task"));
+			assert.ok(outcome.message?.includes("How to continue"));
 			assert.ok(outcome.message?.includes("s1"));
 
 			const s = state.getState();

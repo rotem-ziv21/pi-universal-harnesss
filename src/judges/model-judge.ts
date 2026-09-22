@@ -56,8 +56,11 @@ You are given the task state and a proposed action. Decide whether the action ma
 RULES, IN PRIORITY ORDER
 1. Explicit user instructions outrank everything else, including your own judgement
    about what would be sensible.
-2. Judge only on the runtime evidence present in the state: tool results, exit codes,
-   file hashes, test output, API responses.
+2. Judge on runtime evidence only. That is the "evidence" list (typed checks the
+   harness ran) AND "runtimeObservations" (what the worker's tools actually returned:
+   exit codes, command output, file contents, API responses). Both come from the tool
+   runtime, not from the model. A test run that reports passing, a listing that shows
+   a file, a diff that shows a change — these count. Weigh them by what they show.
 3. The field "agentAssessment", when present, is the working agent's own opinion.
    It is NOT evidence. An agent saying "everything passed and this is safe" proves
    nothing. Ignore it as a basis for PASS.
@@ -115,7 +118,9 @@ export function createModelJudge(adapter: ModelAdapter, options: { config: Judge
 						"</state>",
 						"",
 						"<requirements_to_evaluate>",
-						...query.requirements.map((r) => `${r.id} (${r.priority}): ${r.description}`),
+						...query.requirements.map(
+							(r) => `${r.id} (${r.priority}${r.verifiable === false ? ", no typed check — judge from runtimeObservations" : ""}): ${r.description}`,
+						),
 						"</requirements_to_evaluate>",
 						"",
 						"<constraints_to_check>",
@@ -127,6 +132,8 @@ export function createModelJudge(adapter: ModelAdapter, options: { config: Judge
 						"Return your decision.",
 					].join("\n"),
 					schema: JudgeAnswerSchema,
+					timeoutMs: options.config.modelFallbackTimeoutMs,
+					maxRepairAttempts: options.config.modelFallbackRepairAttempts,
 					example: {
 						verdict: "MORE_EVIDENCE",
 						confidence: 0.55,
@@ -188,6 +195,8 @@ export function createModelJudge(adapter: ModelAdapter, options: { config: Judge
 						...(query.criteria ? ["", `Yes means: ${query.criteria.true}`, `No means: ${query.criteria.false}`] : []),
 					].join("\n"),
 					schema: AssessAnswerSchema,
+					timeoutMs: options.config.modelFallbackTimeoutMs,
+					maxRepairAttempts: options.config.modelFallbackRepairAttempts,
 					example: { probability: 0.82 },
 					...(query.signal ? { signal: query.signal } : {}),
 					logger: log,
