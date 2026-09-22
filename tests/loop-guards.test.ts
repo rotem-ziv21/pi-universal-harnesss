@@ -646,3 +646,90 @@ describe("Scratch files in the system temp directory are not policy violations",
 		}
 	});
 });
+
+describe("Fifth live run: a FAIL must be backed, and web sources must be read", () => {
+	test("a low-confidence FAIL with no violation becomes MORE_EVIDENCE, not a rejection", async () => {
+		const { normalizeDecision } = await import("../src/judges/normalize.ts");
+		const query = {
+			state: {} as never,
+			requirements: [{ id: "r2", description: "recommendations are backed by content", priority: "hard" as const, verifiable: true }],
+			constraints: [{ id: "c2", description: "do not invent people" }],
+			checkpointType: "completion_claim",
+			stateVersion: 61,
+		};
+		const decision = normalizeDecision({
+			answers: {
+				verdict: { choice: "FAIL", probabilities: { FAIL: 0.35, PASS: 0.3, MORE_EVIDENCE: 0.35 }, confidence: 0.35 },
+				requirementSupport: { r2: 0.29 },
+				constraintViolation: { c2: 0.29 },
+			},
+			query,
+			config: testConfig().judge,
+			judgeId: "test",
+			latencyMs: 1,
+		});
+		assert.equal(decision.decision, "MORE_EVIDENCE");
+		assert.ok(decision.reasons[0]?.includes("Downgrading FAIL"));
+
+		const backed = normalizeDecision({
+			answers: {
+				verdict: { choice: "FAIL", probabilities: { FAIL: 0.4 }, confidence: 0.4 },
+				requirementSupport: { r2: 0.9 },
+				constraintViolation: { c2: 0.8 },
+			},
+			query,
+			config: testConfig().judge,
+			judgeId: "test",
+			latencyMs: 1,
+		});
+		assert.equal(backed.decision, "FAIL", "a FAIL backed by a constraint violation stands, whatever the confidence");
+	});
+
+	test("the semantic reviewer receives the text of an http source", async () => {
+		const { createServer } = await import("node:http");
+		const server = createServer((_req, res) => {
+			res.writeHead(200, { "content-type": "text/html" });
+			res.end("<html><body><h1>Path to Positive</h1><p>I met with PepsiCo Canada CEO Cara Keating.</p><script>x()</script></body></html>");
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const port = (server.address() as { port: number }).port;
+		const paths = tempPaths();
+		try {
+			const prompts: string[] = [];
+			const reviewer = createStubModelAdapter((request) => {
+				prompts.push(request.userPrompt);
+				return "VERIFIED — Cara Keating is named in the issue.";
+			});
+			const c = contract({
+				metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+				requirements: [
+					{
+						id: "r2",
+						description: "People recommended are backed by the fetched issues",
+						source: "user",
+						priority: "hard",
+						status: "pending",
+						verification: [{ kind: "semantic_evaluation", instructions: "Check the named people appear in the sources", evidenceSources: [`http://127.0.0.1:${port}/issue`] }],
+					},
+				],
+			});
+			const state = createStateManager(c.id, c, { persist: false });
+			state.lockContract(c);
+			const plan = createEvidencePlanner().plan({
+				contract: c,
+				state: state.getState(),
+				checkpoint: { needsGate: true, checkpointType: "completion_claim", severity: "critical", reason: "completion", signals: [], relatedRequirements: ["r2"], escalated: false },
+				checkpointId: "ckpt-1",
+				action: action("bash", { command: "true" }),
+			});
+			const result = await createEvidenceCollector({ reviewer }).collect({ plan, cwd: paths.configDir, state: state.getState() });
+			assert.equal(result.collected[0]?.result, "supported");
+			assert.ok(prompts[0]?.includes("HTTP 200"));
+			assert.ok(prompts[0]?.includes("Cara Keating"), "page text reaches the reviewer");
+			assert.ok(!prompts[0]?.includes("x()"), "scripts are stripped");
+		} finally {
+			paths.cleanup();
+			server.close();
+		}
+	});
+});

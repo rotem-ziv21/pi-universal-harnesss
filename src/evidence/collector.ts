@@ -240,7 +240,7 @@ async function collectReviewer(
 	 * the named files and directories itself (runtime observation, redacted, capped)
 	 * and adds the worker's recent tool results, so the reviewer judges real content.
 	 */
-	const observed = sources.map((source) => ({ source, content: observeSource(source, context) }));
+	const observed = await Promise.all(sources.map(async (source) => ({ source, content: await observeSource(source, context) })));
 	const recentResults = context.state.actions
 		.filter((a) => (a.outcome === "succeeded" || a.outcome === "failed") && a.resultSummary)
 		.slice(-8)
@@ -309,8 +309,9 @@ function baseEvidence(
 	};
 }
 
-/** What a named source currently contains: file text, a directory listing, or its absence. */
-function observeSource(source: string, context: CollectionContext): string {
+/** What a named source currently contains: file text, a directory listing, a fetched page, or its absence. */
+async function observeSource(source: string, context: CollectionContext): Promise<string> {
+	if (/^https?:\/\//i.test(source)) return fetchSource(source, context);
 	const path = isAbsolute(source) ? source : resolve(context.cwd, source);
 	try {
 		const stats = statSync(path);
@@ -324,6 +325,50 @@ function observeSource(source: string, context: CollectionContext): string {
 	} catch {
 		return "(does not exist)";
 	}
+}
+
+/**
+ * A read-only GET of a named remote source, so a semantic strategy over web
+ * content is judged on the content. Bounded in time and size; failure is reported
+ * as an observation ("HTTP 403"), never guessed around.
+ */
+async function fetchSource(url: string, context: CollectionContext): Promise<string> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+	try {
+		const response = await fetch(url, {
+			signal: context.signal ? anySignal(context.signal, controller.signal) : controller.signal,
+			redirect: "follow",
+			headers: { "user-agent": "Mozilla/5.0 (compatible; pi-universal-harness evidence collector)" },
+		});
+		const body = (await response.text()).slice(0, FETCH_MAX_CHARS);
+		const text = /<html/i.test(body) ? htmlToText(body) : body;
+		return `(HTTP ${response.status}, ${body.length}+ chars)\n${redact(clamp(text, context.maxOutput * 4))}`;
+	} catch (error) {
+		return `(fetch failed: ${error instanceof Error ? error.message : String(error)})`;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+const FETCH_TIMEOUT_MS = 15_000;
+const FETCH_MAX_CHARS = 400_000;
+
+function htmlToText(html: string): string {
+	return html
+		.replace(/<script[\s\S]*?<\/script>/gi, " ")
+		.replace(/<style[\s\S]*?<\/style>/gi, " ")
+		.replace(/<\/(p|div|li|h[1-6]|tr|br)>/gi, "\n")
+		.replace(/<[^>]+>/g, " ")
+		.replace(/&nbsp;/g, " ")
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;|&rsquo;|&lsquo;/g, "'")
+		.replace(/[ \t]+/g, " ")
+		.replace(/\n\s*\n+/g, "\n")
+		.trim();
 }
 
 function compareOutput(observed: string, expectation: { operator: string; value: string }): boolean {

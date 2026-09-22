@@ -102,6 +102,22 @@ export function normalizeDecision(args: {
 		verdict = "REVIEW";
 	}
 
+	/**
+	 * Rule 4 — a FAIL has to be backed by something. FAIL means a hard constraint
+	 * would be violated or evidence shows a requirement broken; it ends the attempt.
+	 * When no per-item answer names a violation and the Judge's own confidence is
+	 * below the PASS bar, the honest reading is "not demonstrated", not "wrong":
+	 * MORE_EVIDENCE when hard requirements are unsupported, REVIEW otherwise. A live
+	 * run had a well-sourced report rejected three times by a FAIL at 0.35.
+	 */
+	if (verdict === "FAIL" && violations.length === 0 && confidence < minPassConfidence) {
+		const next: JudgeVerdict = unsupportedHard.length > 0 ? "MORE_EVIDENCE" : "REVIEW";
+		reasons.unshift(
+			`Downgrading FAIL to ${next}: no constraint violation was identified and confidence ${fmt(confidence)} is below the ${fmt(minPassConfidence)} threshold.`,
+		);
+		verdict = next;
+	}
+
 	// Keep the contract of the type honest: MORE_EVIDENCE must say what is missing.
 	if (verdict === "MORE_EVIDENCE" && missingEvidence.length === 0) {
 		missingEvidence.push("The Judge requested more evidence but did not identify a specific gap. Collect evidence for the checkpoint's requirements.");
