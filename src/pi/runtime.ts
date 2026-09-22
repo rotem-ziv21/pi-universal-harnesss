@@ -261,6 +261,8 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 	});
 
 	let task: ActiveTask | undefined;
+	const ticker = createProgressTicker();
+	const makeProgress = ticker.make;
 
 	const buildCore = (state: StateManager): HarnessCore =>
 		createHarnessCore({
@@ -387,6 +389,8 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 				contract = degradedContract(compilerInput, errorMessage(e));
 				degraded = true;
 				reviewNotes.push(`Contract compilation failed: ${errorMessage(e)}. Running with generic gating only.`);
+			} finally {
+				ticker.stop();
 			}
 
 			const state = createStateManager(contract.id, contract, {
@@ -424,31 +428,36 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 			const reviewNotes: string[] = [];
 			const openQuestions: string[] = [];
 
-			const progress = makeProgress(onProgress, modelAdapter.id);
-			let next = await compiler.compile({ ...compilerInput, onAttempt: progress("Updating the Task Contract") });
+			let next: TaskContract;
+			try {
+				const progress = makeProgress(onProgress, modelAdapter.id);
+				next = await compiler.compile({ ...compilerInput, onAttempt: progress("Updating the Task Contract") });
 
-			if (config.contractReviewer.enabled) {
-				const reviewProgress = makeProgress(onProgress, reviewerAdapter.id);
-				const review = await reviewer.review({
-					request: next.originalRequest,
-					contract: next,
-					...(signal ? { signal } : {}),
-					onAttempt: reviewProgress("Reviewing the updated contract"),
-				});
-				reviewNotes.push(...findingLines(review));
-				if (review.verdict === "REVISE") {
-					try {
-						next = await compiler.compile({
-							...compilerInput,
-							reviewFindings: findingLines(review),
-							onAttempt: makeProgress(onProgress, modelAdapter.id)("Recompiling after review"),
-						});
-					} catch (e) {
-						logger.warn("recompilation failed; keeping the first revision", { error: errorMessage(e) });
+				if (config.contractReviewer.enabled) {
+					const reviewProgress = makeProgress(onProgress, reviewerAdapter.id);
+					const review = await reviewer.review({
+						request: next.originalRequest,
+						contract: next,
+						...(signal ? { signal } : {}),
+						onAttempt: reviewProgress("Reviewing the updated contract"),
+					});
+					reviewNotes.push(...findingLines(review));
+					if (review.verdict === "REVISE") {
+						try {
+							next = await compiler.compile({
+								...compilerInput,
+								reviewFindings: findingLines(review),
+								onAttempt: makeProgress(onProgress, modelAdapter.id)("Recompiling after review"),
+							});
+						} catch (e) {
+							logger.warn("recompilation failed; keeping the first revision", { error: errorMessage(e) });
+						}
+					} else if (review.verdict === "NEEDS_USER_INPUT") {
+						openQuestions.push(...review.questions);
 					}
-				} else if (review.verdict === "NEEDS_USER_INPUT") {
-					openQuestions.push(...review.questions);
 				}
+			} finally {
+				ticker.stop();
 			}
 
 			// The user authored the change, so dropping an earlier hard item is legitimate.
@@ -610,30 +619,41 @@ export const provisionalTaskId = newTaskId;
  * indistinguishable from a hang. Showing the model, the attempt and a ticking counter
  * is the difference between "it is working" and "something is broken".
  */
-function makeProgress(
-	onProgress: ((message: string) => void) | undefined,
-	modelId: string,
-): (label: string) => ((attempt: number, total: number) => void) | undefined {
-	return (label: string) => {
-		if (!onProgress) return undefined;
+/**
+ * One ticker per runtime. A new attempt replaces it; `stop()` ends it. An earlier
+ * version left every interval running for 30 minutes, so "Compiling · 321s" kept
+ * overwriting the real status long after the contract was compiled — which looks
+ * exactly like a hang.
+ */
+function createProgressTicker() {
+	let timer: NodeJS.Timeout | undefined;
+	const stop = () => {
+		if (timer) clearInterval(timer);
+		timer = undefined;
+	};
+	const make = (
+		onProgress: ((message: string) => void) | undefined,
+		modelId: string,
+	): ((label: string) => ((attempt: number, total: number) => void) | undefined) => {
+		return (label: string) => {
+			if (!onProgress) return undefined;
 
-		return (attempt: number, total: number): void => {
-			const started = Date.now();
-			const suffix = total > 1 && attempt > 1 ? ` · retry ${attempt - 1}/${total - 1}` : "";
+			return (attempt: number, total: number): void => {
+				stop();
+				const started = Date.now();
+				const suffix = total > 1 && attempt > 1 ? ` · retry ${attempt - 1}/${total - 1}` : "";
 
-			const tick = () => {
-				const seconds = Math.round((Date.now() - started) / 1000);
-				onProgress(`${label} · ${modelId} · ${seconds}s${suffix}`);
+				const tick = () => {
+					const seconds = Math.round((Date.now() - started) / 1000);
+					onProgress(`${label} · ${modelId} · ${seconds}s${suffix}`);
+				};
+				tick();
+
+				// Unref'd so a pending tick can never hold the process open at shutdown.
+				timer = setInterval(tick, 1000);
+				if (typeof timer.unref === "function") timer.unref();
 			};
-			tick();
-
-			/**
-			 * Unref'd so a pending tick can never hold the process open at shutdown.
-			 * Cleared by the next attempt's tick or by the caller clearing the status.
-			 */
-			const timer = setInterval(tick, 1000);
-			if (typeof timer.unref === "function") timer.unref();
-			setTimeout(() => clearInterval(timer), 30 * 60_000).unref?.();
 		};
 	};
+	return { make, stop };
 }
