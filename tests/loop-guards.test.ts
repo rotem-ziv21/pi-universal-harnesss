@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createStubModelAdapter } from "../src/models/model-adapter.ts";
 import { describe, test } from "node:test";
 import { createCheckpointDetector } from "../src/checkpoints/detector.ts";
 import { createEvidenceCollector } from "../src/evidence/collector.ts";
@@ -436,6 +438,59 @@ describe("Second live run: false positives that blocked correct work", () => {
 			assert.deepEqual(asked, ["r1", "r2"], "only the items the harness could not settle reach the Judge");
 			assert.equal(outcome.allowed, true);
 			assert.equal(state.getState().evidence[0]?.result, "supported");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
+
+describe("Third live run: semantic evaluation must see real content", () => {
+	test("the reviewer is handed file contents, directory listings and tool results, not names", async () => {
+		const paths = tempPaths();
+		try {
+			mkdirSync(join(paths.configDir, "out"), { recursive: true });
+			writeFileSync(join(paths.configDir, "out", "clean.csv"), "name,age\nAlice,30\n");
+			const prompts: string[] = [];
+			const reviewer = createStubModelAdapter((request) => {
+				prompts.push(request.userPrompt);
+				return "VERIFIED — the listing shows no .txt files.";
+			});
+			const c = contract({
+				metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+				successConditions: [
+					{
+						id: "s1",
+						description: "All scratch .txt files have been deleted from out/",
+						source: "user",
+						priority: "hard",
+						status: "pending",
+						verification: [{ kind: "semantic_evaluation", instructions: "Confirm out/ contains no .txt files", evidenceSources: ["out/", "out/clean.csv", "out/missing.txt"] }],
+					},
+				],
+			});
+			const state = createStateManager(c.id, c, { persist: false });
+			state.lockContract(c);
+			const rm = action("bash", { command: "rm out/*.txt && ls out/" });
+			state.recordProposedAction({ ...rm, at: new Date().toISOString(), stateVersion: 1, outcome: "pending" });
+			state.recordAllowed(rm.id);
+			state.recordToolResult(rm.id, "clean.csv", false);
+
+			const plan = createEvidencePlanner().plan({
+				contract: c,
+				state: state.getState(),
+				checkpoint: { needsGate: true, checkpointType: "completion_claim", severity: "critical", reason: "completion", signals: [], relatedRequirements: ["s1"], escalated: false },
+				checkpointId: "ckpt-1",
+				action: action("bash", { command: "true" }),
+			});
+			const result = await createEvidenceCollector({ reviewer }).collect({ plan, cwd: paths.configDir, state: state.getState() });
+
+			assert.equal(result.collected[0]?.result, "supported");
+			assert.equal(result.collected[0]?.trust, "model_interpretation", "still Level 3: it never becomes a deterministic fact");
+			const prompt = prompts[0]!;
+			assert.ok(prompt.includes("entries: clean.csv"), "directory listing is supplied");
+			assert.ok(prompt.includes("Alice,30"), "file contents are supplied");
+			assert.ok(prompt.includes("(does not exist)"), "absence is reported, not guessed");
+			assert.ok(prompt.includes("rm out/*.txt") && prompt.includes("succeeded"), "recent tool results are supplied");
 		} finally {
 			paths.cleanup();
 		}

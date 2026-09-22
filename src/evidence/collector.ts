@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { VerificationStrategy } from "../contract/schema.ts";
 import { matchesActionSelector } from "../checkpoints/signals.ts";
@@ -232,11 +232,31 @@ async function collectReviewer(
 	if (!reviewer?.available) throw new Error(`no reviewer is available for ${strategy.kind}`);
 	const instructions = strategy.instructions;
 	const sources = strategy.kind === "visual_evaluation" ? strategy.resources : strategy.evidenceSources;
+
+	/**
+	 * The reviewer is given what the sources actually contain, not just their names.
+	 * Handed "Evidence sources: out/" alone, a model can only answer CANNOT_DETERMINE,
+	 * and did — which made every semantic strategy a dead route. The harness reads
+	 * the named files and directories itself (runtime observation, redacted, capped)
+	 * and adds the worker's recent tool results, so the reviewer judges real content.
+	 */
+	const observed = sources.map((source) => ({ source, content: observeSource(source, context) }));
+	const recentResults = context.state.actions
+		.filter((a) => (a.outcome === "succeeded" || a.outcome === "failed") && a.resultSummary)
+		.slice(-8)
+		.map((a) => `- ${clamp(a.summary, 160)} → ${a.outcome}: ${clamp(a.resultSummary ?? "", 300)}`);
+
 	const response = await reviewer.complete({
 		systemPrompt:
-			"You are an evidence reviewer. Assess only the named observed resources and supplied evidence. " +
-			"Begin with VERIFIED, NOT_VERIFIED, or CANNOT_DETERMINE. Never infer that a resource was observed merely because its URI is listed.",
-		userPrompt: [`Verification instructions: ${instructions}`, `Evidence sources: ${sources.join(", ") || "(none supplied)"}`].join("\n"),
+			"You are an evidence reviewer. Assess only the observed resource contents and tool results supplied below. " +
+			"Begin your reply with exactly one of VERIFIED, NOT_VERIFIED, or CANNOT_DETERMINE, then one short sentence of justification. " +
+			"Do not infer anything that the supplied content does not show.",
+		userPrompt: [
+			`Verification instructions: ${instructions}`,
+			"",
+			...observed.flatMap(({ source, content }) => [`<source path="${source}">`, content, "</source>", ""]),
+			...(recentResults.length > 0 ? ["Recent tool results (from the runtime, not the agent):", ...recentResults] : []),
+		].join("\n"),
 		...(context.signal ? { signal: context.signal } : {}),
 	});
 	const text = response.text.trim();
@@ -287,6 +307,23 @@ function baseEvidence(
 		freshnessClass: request.freshnessClass,
 		...fields,
 	};
+}
+
+/** What a named source currently contains: file text, a directory listing, or its absence. */
+function observeSource(source: string, context: CollectionContext): string {
+	const path = isAbsolute(source) ? source : resolve(context.cwd, source);
+	try {
+		const stats = statSync(path);
+		if (stats.isDirectory()) {
+			return `(directory) entries: ${readdirSync(path).sort().join(", ") || "(empty)"}`;
+		}
+		if (!stats.isFile()) return `(exists, not a regular file, ${stats.size} bytes)`;
+		const buffer = readFileSync(path);
+		if (buffer.subarray(0, 512).includes(0)) return `(binary file, ${stats.size} bytes, sha256 ${createHash("sha256").update(buffer).digest("hex")})`;
+		return redact(clamp(buffer.toString("utf8"), context.maxOutput));
+	} catch {
+		return "(does not exist)";
+	}
 }
 
 function compareOutput(observed: string, expectation: { operator: string; value: string }): boolean {
