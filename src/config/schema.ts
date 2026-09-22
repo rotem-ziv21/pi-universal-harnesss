@@ -100,6 +100,16 @@ const providerRefFields = {
 	 * out and nothing on screen explaining why.
 	 */
 	timeoutMs: Type.Integer({ default: 180_000, minimum: 5_000, maximum: 1_800_000 }),
+	/**
+	 * Thinking effort for this role's calls. A harness call is "emit one JSON
+	 * document that satisfies this schema"; it does not need a reasoning model to
+	 * deliberate for 20,000 tokens. One live compile spent 22k output tokens and
+	 * 138 seconds, most of it thinking. Minimal is the default; raise it for a
+	 * role if its output quality actually suffers.
+	 */
+	reasoning: Type.Union([Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], { default: "minimal" }),
+	/** Hard cap on output tokens per call. A contract or review fits comfortably. */
+	maxOutputTokens: Type.Integer({ default: 8_000, minimum: 500, maximum: 200_000 }),
 };
 
 export const ProviderRefSchema = Type.Object(providerRefFields, { default: {} });

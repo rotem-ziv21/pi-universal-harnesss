@@ -599,14 +599,17 @@ interface ProviderRefLike {
 	model?: string | undefined;
 	maxRepairAttempts?: number | undefined;
 	timeoutMs?: number | undefined;
+	reasoning?: "minimal" | "low" | "medium" | "high" | undefined;
+	maxOutputTokens?: number | undefined;
 }
 
 /** Build a model adapter from a `ProviderRef`, honouring an explicit pin. */
-function buildAdapter(host: PiModelHost, ref: { provider: string; model?: string | undefined }): ModelAdapter {
+function buildAdapter(host: PiModelHost, ref: ProviderRefLike): ModelAdapter {
+	const defaults = { reasoning: ref.reasoning, maxTokens: ref.maxOutputTokens };
 	if (ref.provider !== "current-pi-model" && ref.model) {
-		return createPinnedModelAdapter(host, ref.provider, ref.model);
+		return createPinnedModelAdapter(host, ref.provider, ref.model, defaults);
 	}
-	return createCurrentModelAdapter(host);
+	return createCurrentModelAdapter(host, defaults);
 }
 
 /** A stable task id for callers that need one before compilation. */

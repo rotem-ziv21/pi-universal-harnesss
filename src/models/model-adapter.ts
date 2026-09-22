@@ -11,12 +11,22 @@ import { HarnessError } from "../util/errors.ts";
  * adapter deliberately exposes the smallest possible surface: one text completion.
  */
 
+export type ReasoningLevel = "minimal" | "low" | "medium" | "high";
+
 export interface ModelRequest {
 	readonly systemPrompt: string;
 	readonly userPrompt: string;
 	/** Propagated from `ctx.signal` so Esc cancels harness model calls too. */
 	readonly signal?: AbortSignal;
 	readonly maxTokens?: number;
+	/** Thinking effort for this call; the adapter's default applies when omitted. */
+	readonly reasoning?: ReasoningLevel;
+}
+
+/** Per-adapter defaults, set from the role's config. */
+export interface AdapterDefaults {
+	readonly reasoning?: ReasoningLevel | undefined;
+	readonly maxTokens?: number | undefined;
 }
 
 export interface ModelResponse {
@@ -73,7 +83,7 @@ interface PiUsage {
  * This is what makes `compiler.provider = "current-pi-model"` work: the harness
  * borrows the session's model without ever naming it.
  */
-export function createCurrentModelAdapter(host: PiModelHost): ModelAdapter {
+export function createCurrentModelAdapter(host: PiModelHost, defaults: AdapterDefaults = {}): ModelAdapter {
 	const model = host.model;
 	return createAdapter({
 		registry: host.modelRegistry,
@@ -81,6 +91,7 @@ export function createCurrentModelAdapter(host: PiModelHost): ModelAdapter {
 		id: model ? `${model.provider}/${model.id}` : "unknown",
 		available: Boolean(host.modelRegistry && model),
 		unavailableMessage: "No active Pi model is available for harness model calls.",
+		defaults,
 	});
 }
 
@@ -100,8 +111,10 @@ function createAdapter(args: {
 	id: string;
 	available: boolean;
 	unavailableMessage: string;
+	defaults?: AdapterDefaults;
 }): ModelAdapter {
 	const { registry, model, id } = args;
+	const defaults = args.defaults ?? {};
 
 	return {
 		id,
@@ -130,6 +143,9 @@ function createAdapter(args: {
 					...(request.signal ? { signal: request.signal } : {}),
 					// Harness calls are one-shot and must not pollute the session's prompt cache.
 					cacheRetention: "none",
+					// Structured output, not deliberation: keep thinking and output bounded.
+					reasoning: request.reasoning ?? defaults.reasoning ?? "minimal",
+					...((request.maxTokens ?? defaults.maxTokens) !== undefined ? { maxTokens: request.maxTokens ?? defaults.maxTokens } : {}),
 				},
 			);
 
@@ -157,7 +173,7 @@ function createAdapter(args: {
  * Reports itself unavailable rather than throwing at construction, so a typo in the
  * config surfaces in `/harness status` instead of breaking startup.
  */
-export function createPinnedModelAdapter(host: PiModelHost, provider: string, modelId: string): ModelAdapter {
+export function createPinnedModelAdapter(host: PiModelHost, provider: string, modelId: string, defaults: AdapterDefaults = {}): ModelAdapter {
 	const registry = host.modelRegistry;
 	const model = registry?.find(provider, modelId);
 
@@ -174,6 +190,7 @@ export function createPinnedModelAdapter(host: PiModelHost, provider: string, mo
 		id: `${provider}/${modelId}`,
 		available,
 		unavailableMessage: `Model ${provider}/${modelId} was not found in Pi's registry. Check the provider and model ids with /model.`,
+		defaults,
 	});
 }
 

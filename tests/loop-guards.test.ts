@@ -821,3 +821,42 @@ describe("Sixth live run: completion gets real evidence for prose conditions", (
 		assert.equal(decision.decision, "MORE_EVIDENCE");
 	});
 });
+
+describe("Harness model calls do not deliberate", () => {
+	test("compiler and reviewer calls go out with minimal reasoning and a bounded output", async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		class Registry {
+			find(provider: string, modelId: string): unknown {
+				return { id: modelId, provider };
+			}
+			hasConfiguredAuth(): boolean {
+				return true;
+			}
+			getAvailable(): Array<{ id: string; provider: string }> {
+				return [];
+			}
+			async complete(_model: unknown, _context: unknown, options: Record<string, unknown>): Promise<{ content: Array<{ type: string; text?: string }> }> {
+				seen.push(options);
+				return { content: [{ type: "text", text: JSON.stringify({ goal: "g" }) }] };
+			}
+		}
+		const paths = tempPaths();
+		try {
+			mkdirSync(paths.harnessDir, { recursive: true });
+			writeFileSync(paths.configFile, JSON.stringify({ contractReviewer: { enabled: false }, judge: { enabled: false } }));
+			const rt = createRuntime({
+				host: { model: { id: "m", provider: "p" }, modelRegistry: new Registry() as never },
+				cwd: paths.configDir,
+				projectTrusted: false,
+				paths,
+			});
+			await rt.startTask({ request: "Write a summary of the three databases for me please", cwd: paths.configDir, availableTools: [] });
+			assert.ok(seen.length >= 1);
+			assert.equal(seen[0]!.reasoning, "minimal", "a schema-bound JSON call does not need 20k tokens of thinking");
+			assert.equal(seen[0]!.maxTokens, 8000);
+			assert.equal(seen[0]!.cacheRetention, "none");
+		} finally {
+			paths.cleanup();
+		}
+	});
+});
