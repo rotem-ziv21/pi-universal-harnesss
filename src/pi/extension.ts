@@ -380,8 +380,28 @@ export function activate(pi: PiExtensionAPI): void {
 					});
 
 					if (outcome.allowed) {
+						/**
+						 * "Verified" must mean something. A degraded contract has nothing to
+						 * check, so its completion is trivially allowed — and must be reported
+						 * as unverified, not dressed up as a pass.
+						 */
+						const degraded = task.degraded || task.contract.metadata.compiledBy === "degraded";
+						const nothingToCheck =
+							task.contract.requirements.length === 0 &&
+							task.contract.successConditions.length === 0 &&
+							task.contract.constraints.length === 0 &&
+							task.contract.forbiddenConditions.length === 0;
 						if (ctx.hasUI) {
-							ctx.ui.notify(`Harness: task verified complete (state v${task.state.getVersion()})`, "info");
+							if (degraded) {
+								ctx.ui.notify(
+									"Harness: task ended — NOT verified. The contract could not be compiled (the compiler model did not answer), so there was nothing to check. See /harness model.",
+									"warning",
+								);
+							} else if (nothingToCheck) {
+								ctx.ui.notify("Harness: task ended — the contract listed nothing to verify.", "warning");
+							} else {
+								ctx.ui.notify(`Harness: task verified complete (state v${task.state.getVersion()})`, "info");
+							}
 						}
 						rt.clearTask();
 						updateStatus(rt, ctx);
