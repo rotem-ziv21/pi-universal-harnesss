@@ -435,19 +435,23 @@ export function activate(pi: PiExtensionAPI): void {
 						rt.logger.warn("completion loop halted with no UI; task left in awaiting_user");
 						return;
 					}
-					let accept = false;
+					const CONTINUE = "Continue — let the worker try again with the rejection feedback";
+					const ACCEPT = "Accept as complete — I have looked at the result myself";
+					const PAUSE = "Pause — I will reply with instructions, or run /harness abandon";
+					let choice: string | undefined;
 					try {
-						accept = Boolean(
-							await ctx.ui.confirm(
-								"Harness: completion could not be verified",
-								"The harness stopped the verify/retry loop. Accept the task as complete anyway?\n\n" +
-									"No = keep the task paused; your next message continues it, or run /harness abandon.",
-							),
-						);
+						choice = await ctx.ui.select("Harness: completion could not be verified. What now?", [CONTINUE, ACCEPT, PAUSE]);
 					} catch {
-						accept = false;
+						choice = undefined;
 					}
-					if (accept) {
+					if (choice === CONTINUE) {
+						task.state.emit("user_intervention", { approved: true, reason: "user chose to continue after halt", resetCompletionBudget: true, phase: "execute" });
+						ctx.ui.notify("Harness: continuing — the worker gets a fresh rejection budget.", "info");
+						pi.sendMessage(
+							{ customType: CUSTOM_TYPE_COMPLETION, content: task.state.getState().lastCompletionFeedback ?? "Continue the task.", display: false },
+							{ triggerTurn: true, deliverAs: "followUp" },
+						);
+					} else if (choice === ACCEPT) {
 						task.state.emit("user_intervention", { approved: true, reason: "completion accepted by user" });
 						task.state.completeTask();
 						rt.clearTask();

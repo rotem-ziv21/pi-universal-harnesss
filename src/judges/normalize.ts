@@ -105,16 +105,15 @@ export function normalizeDecision(args: {
 	/**
 	 * Rule 4 — a FAIL has to be backed by something. FAIL means a hard constraint
 	 * would be violated or evidence shows a requirement broken; it ends the attempt.
-	 * When no per-item answer names a violation and the Judge's own confidence is
-	 * below the PASS bar, the honest reading is "not demonstrated", not "wrong":
-	 * MORE_EVIDENCE when hard requirements are unsupported, REVIEW otherwise. A live
-	 * run had a well-sourced report rejected three times by a FAIL at 0.35.
+	 * When no per-item answer names a violation, the honest reading is "not
+	 * demonstrated", not "wrong": MORE_EVIDENCE when hard requirements are
+	 * unsupported, REVIEW otherwise. The per-item questions are the narrower ones
+	 * and win, as everywhere else in this file. Two live runs had well-sourced
+	 * reports rejected by a bare FAIL, at 0.35 and then at 0.68.
 	 */
-	if (verdict === "FAIL" && violations.length === 0 && confidence < minPassConfidence) {
+	if (verdict === "FAIL" && violations.length === 0) {
 		const next: JudgeVerdict = unsupportedHard.length > 0 ? "MORE_EVIDENCE" : "REVIEW";
-		reasons.unshift(
-			`Downgrading FAIL to ${next}: no constraint violation was identified and confidence ${fmt(confidence)} is below the ${fmt(minPassConfidence)} threshold.`,
-		);
+		reasons.unshift(`Downgrading FAIL to ${next}: no per-item answer identified a constraint violation, so nothing is shown to be broken.`);
 		verdict = next;
 	}
 

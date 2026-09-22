@@ -733,3 +733,86 @@ describe("Fifth live run: a FAIL must be backed, and web sources must be read", 
 		}
 	});
 });
+
+describe("Sixth live run: completion gets real evidence for prose conditions", () => {
+	test("a hard condition with no typed check is evaluated by the reviewer over the files the task produced", async () => {
+		const paths = tempPaths();
+		try {
+			const reportPath = join(paths.configDir, "report.md");
+			const prompts: string[] = [];
+			const reviewer = createStubModelAdapter((request) => {
+				prompts.push(request.userPrompt);
+				return "VERIFIED — the report names Cara Keating with a source URL.";
+			});
+			const c = contract({
+				metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+				workspace: { allowedScopes: [paths.configDir], protectedResources: [] },
+				requirements: [
+					{ id: "r2", description: "Recommended people are backed by the fetched issues", source: "user", priority: "hard", status: "pending" },
+				],
+			});
+			const config = testConfig();
+			const state = createStateManager(c.id, c, { persist: false });
+			state.lockContract(c);
+			const judge = scriptedJudge((query) => ({
+				decision: "PASS",
+				confidence: 0.9,
+				detail: { requirementSupport: Object.fromEntries(query.requirements.map((r) => [r.id, 0.9])) },
+			}));
+			const core = createHarnessCore({
+				config,
+				paths,
+				state,
+				detector: createCheckpointDetector({ config, judge }),
+				planner: createEvidencePlanner(),
+				collector: createEvidenceCollector({ reviewer }),
+				judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+				progress: createProgressMonitor({ config }),
+				logger: nullLogger,
+			});
+
+			const write = action("write", { path: reportPath, content: "# Report\n| Cara Keating | CEO | ... | https://x |\n" });
+			await core.gateAction({ action: write, cwd: paths.configDir });
+			writeFileSync(reportPath, "# Report\n| Cara Keating | CEO | ... | https://x |\n");
+			core.recordToolResult({ actionId: write.id, summary: "wrote 44 bytes", isError: false });
+
+			const outcome = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(outcome.allowed, true);
+			assert.equal(prompts.length, 1, "one synthesized semantic evaluation ran");
+			assert.ok(prompts[0]?.includes("Cara Keating"), "the reviewer read the produced report");
+			assert.ok(prompts[0]?.includes("Recommended people are backed"), "and was asked about the condition itself");
+			const evidence = state.getState().evidence.find((e) => e.requirementIds.includes("r2"));
+			assert.equal(evidence?.trust, "model_interpretation");
+			assert.equal(evidence?.result, "supported");
+			const bundle = judge.calls.at(-1)!.state.evidenceBundles.find((b) => b.requirementId === "r2");
+			assert.equal(bundle?.selected.length, 1, "the Judge sees the reviewer's verdict in r2's bundle");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("a FAIL with no violation is downgraded regardless of confidence", async () => {
+		const { normalizeDecision } = await import("../src/judges/normalize.ts");
+		const decision = normalizeDecision({
+			answers: {
+				verdict: { choice: "FAIL", probabilities: { FAIL: 0.68 }, confidence: 0.68 },
+				requirementSupport: { r2: 0.38, r3: 0.71 },
+				constraintViolation: {},
+			},
+			query: {
+				state: {} as never,
+				requirements: [
+					{ id: "r2", description: "people are backed", priority: "hard" },
+					{ id: "r3", description: "report written", priority: "hard" },
+				],
+				constraints: [],
+				checkpointType: "completion_claim",
+				stateVersion: 32,
+			},
+			config: testConfig().judge,
+			judgeId: "test",
+			latencyMs: 1,
+		});
+		assert.equal(decision.decision, "MORE_EVIDENCE");
+	});
+});

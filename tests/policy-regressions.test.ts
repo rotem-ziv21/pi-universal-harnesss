@@ -246,10 +246,11 @@ describe("typed policy and evidence", () => {
 					return { stdout: "", stderr: "", exitCode: 0 };
 				},
 			});
-			await collector.collect({ plan, cwd: paths.configDir, state: state.getState() });
-			assert.equal(plan.evidenceRequests.length, 0);
-			assert.equal(plan.unverifiable[0]?.requirementId, "s1");
-			assert.equal(executions, 0);
+			const result = await collector.collect({ plan, cwd: paths.configDir, state: state.getState() });
+			assert.ok(plan.evidenceRequests.every((r) => r.strategy.kind !== "command_execution"), "no command is derived from prose");
+			assert.equal(plan.evidenceRequests[0]?.strategy.kind, "semantic_evaluation", "a completion claim gets a synthesized semantic check instead");
+			assert.equal(executions, 0, "nothing is executed");
+			assert.equal(result.collected.length, 0, "without a reviewer the semantic check yields no evidence, and no fact is invented");
 		} finally {
 			paths.cleanup();
 		}

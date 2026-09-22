@@ -3,6 +3,7 @@ import type { ProjectConfig } from "../config/schema.ts";
 import type { TaskContract, VerificationStrategy } from "../contract/schema.ts";
 import { assessFreshness, changedTargetsSince, evidenceFor } from "../state/freshness.ts";
 import type { FreshnessClass, HarnessState } from "../state/types.ts";
+import { resourcePath } from "../resources/registry.ts";
 import { newId } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
@@ -52,6 +53,27 @@ export function createEvidencePlanner(options: { logger?: Logger } = {}): Eviden
 					continue;
 				}
 				if (target.verification.length === 0) {
+					/**
+					 * At a completion claim, a hard condition with no typed check is not
+					 * abandoned to guesswork. The harness synthesizes a semantic evaluation:
+					 * the reviewer model reads what the task produced (files it created or
+					 * modified) and the recent tool results, and says whether the condition
+					 * holds. That is model interpretation and is recorded as such — it never
+					 * becomes a deterministic fact — but it gives the Judge a real, sourced
+					 * evidence item instead of a 300-character snippet to reason from.
+					 */
+					if (checkpoint.checkpointType === "completion_claim" && target.priority === "hard") {
+						requests.push(
+							requestFor(target, {
+								kind: "semantic_evaluation",
+								instructions:
+									`Determine whether this condition of the task holds, judging only from the supplied sources and tool results: "${target.description}". ` +
+									"Answer VERIFIED only if the supplied material shows it; NOT_VERIFIED if it shows the opposite; CANNOT_DETERMINE if the material does not settle it.",
+								evidenceSources: producedResources(state),
+							}),
+						);
+						continue;
+					}
 					unverifiable.push({
 						requirementId: target.id,
 						reason: "The contract defines no typed verification strategy; descriptive prose is never executed.",
@@ -112,6 +134,15 @@ function resolveTargets(contract: TaskContract, checkpoint: CheckpointDecision):
 	// No fallback to "every hard item": an action gate verifies what it is linked to,
 	// nothing more. Unrelated requirements are the completion gate's business.
 	return [...targets.values()];
+}
+
+/** Files the task itself created or modified and that still exist, newest first. */
+function producedResources(state: HarnessState): string[] {
+	return [...state.workspace.resources]
+		.filter((r) => r.status === "active" && r.kind === "file" && r.provenance === "created_by_current_task")
+		.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+		.slice(0, 6)
+		.map((r) => resourcePath(r.uri) ?? r.uri);
 }
 
 function requestFor(target: PlanTarget, strategy: VerificationStrategy): EvidenceRequest {

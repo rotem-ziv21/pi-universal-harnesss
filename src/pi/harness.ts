@@ -622,7 +622,7 @@ function observeWrittenFiles(deps: HarnessCoreDeps, actionId: string): string {
 			const stats = statSync(path);
 			if (!stats.isFile()) continue;
 			const head = readFileSync(path).subarray(0, 4096);
-			const text = head.includes(0) ? `(binary, ${stats.size} bytes)` : redact(clamp(head.toString("utf8"), 600));
+			const text = head.includes(0) ? `(binary, ${stats.size} bytes)` : redact(clamp(head.toString("utf8"), 2000));
 			notes.push(`\n[observed on disk after the write: ${path}, ${stats.size} bytes]\n${text}`);
 		} catch {
 			// The file may be gone already; nothing to observe.

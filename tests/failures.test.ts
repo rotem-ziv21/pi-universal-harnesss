@@ -1290,8 +1290,12 @@ describe("Signals and planning against a weaker compiler model", () => {
 			checkpointId: "ckpt-1",
 			action: action("bash", { command: "true" }),
 		});
-		assert.equal(plan.evidenceRequests.length, 0);
-		assert.equal(plan.unverifiable[0]?.requirementId, "r1");
+		// Prose is never turned into a command. At a completion claim the harness may
+		// synthesize a *semantic* evaluation for the item, which is model interpretation
+		// over sources, not execution of anything.
+		assert.ok(plan.evidenceRequests.every((r) => r.strategy.kind !== "command_execution"), "no command is derived from prose");
+		assert.equal(plan.evidenceRequests[0]?.strategy.kind, "semantic_evaluation");
+		assert.equal(plan.unverifiable.length, 0);
 	});
 
 	test("a typed strategy is authoritative even when prose mentions another command", () => {

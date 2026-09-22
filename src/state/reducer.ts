@@ -269,8 +269,15 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 			// completion gate; the user decides what happens next.
 			return { ...state, phase: "awaiting_user" };
 
-		case "user_intervention":
-			return { ...state, phase: (p.phase as TaskPhase) ?? state.phase };
+		case "user_intervention": {
+			const next = { ...state, phase: (p.phase as TaskPhase) ?? state.phase };
+			// The user chose to keep going after a halt: the worker gets a fresh budget.
+			if (p.resetCompletionBudget === true) {
+				const { lastCompletionRejection: _dropped, ...rest } = next;
+				return { ...rest, counters: { ...rest.counters, completionAttempts: 0 } };
+			}
+			return next;
+		}
 
 		case "completion_requested":
 			return {
