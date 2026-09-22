@@ -211,7 +211,20 @@ function effectMatches(selector: ActionSelector, effect: ResourceEffect): boolea
 	if (selector.provenances?.length && !selector.provenances.includes(effect.provenance)) return false;
 	if (selector.scopes?.length && !selector.scopes.includes(effect.scope)) return false;
 	if (selector.targetUriPrefix && !effect.uri.startsWith(selector.targetUriPrefix)) return false;
+	if (selector.excludeTargets?.some((excluded) => targetExcluded(effect.uri, excluded))) return false;
 	return true;
+}
+
+/** An exclusion matches by URI prefix, or by path suffix so a workspace-relative name works. */
+function targetExcluded(uri: string, excluded: string): boolean {
+	const candidate = excluded.trim();
+	if (!candidate) return false;
+	if (uri.startsWith(candidate)) return true;
+	const path = resourcePath(uri) ?? uri;
+	const rel = normalizePath(candidate);
+	if (!rel) return false;
+	const norm = normalizePath(path);
+	return norm === rel || norm.endsWith(`/${rel}`) || norm.startsWith(`${rel}/`) || norm.includes(`/${rel}/`);
 }
 
 function genericCriticalCandidate(action: ProposedAction): boolean {

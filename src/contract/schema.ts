@@ -99,6 +99,13 @@ export const ActionSelectorSchema = Type.Object(
 		scopes: Type.Optional(Type.Array(ResourceScopeSchema)),
 		externalSideEffect: Type.Optional(Type.Boolean()),
 		targetUriPrefix: Type.Optional(Type.String()),
+		/**
+		 * Resources the selector must NOT match, as URI prefixes or paths relative to
+		 * the workspace. "Create nothing except summary.md" is
+		 * `{operations:["create"], excludeTargets:["summary.md"]}`; without this the
+		 * compiler could only forbid every creation, including the one the user asked for.
+		 */
+		excludeTargets: Type.Optional(Type.Array(Type.String())),
 	},
 	{ additionalProperties: false },
 );

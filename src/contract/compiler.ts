@@ -121,7 +121,12 @@ EXAMPLES
    scopes:["protected"]}}
 5. An exact verifier is known from project context:
    successCondition.verification = [{kind:"command_execution", program:"python3",
-   args:["tools/verify.py","output.bin"], expectExitCode:0}]`;
+   args:["tools/verify.py","output.bin"], expectExitCode:0}]
+6. "Create only report.md, nothing else" — the requested file MUST be excluded,
+   otherwise the policy forbids the very file the user asked for:
+   constraint.policy = {effect:"forbid", action:{operations:["create"],
+   excludeTargets:["report.md"]}}
+   A forbid policy must never match an action the requirements demand.`;
 
 const EXAMPLE_OUTPUT: CompiledContract = {
 	goal: "Produce the requested artifact without mutating protected inputs",

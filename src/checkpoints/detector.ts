@@ -77,13 +77,27 @@ export function createCheckpointDetector(options: {
 		async evaluate({ contract, state, action, protectedPaths = [], signal }): Promise<CheckpointDecision> {
 			if (!isMutating(action)) return NO_GATE;
 
-			// Tier 1: typed forbidden policies and protected scopes are deterministic.
+			/**
+			 * Tier 1: typed forbidden policies and protected scopes.
+			 *
+			 * Protected or out-of-scope mutation is blocked outright; there is no reading
+			 * of the contract under which it is fine. A compiler-written forbid policy is
+			 * different: the compiler encodes prose into a selector, and the selector
+			 * vocabulary is coarse. In a live run "create only summary.md" became
+			 * "forbid every creation", and the harness then blocked the one file the user
+			 * asked for — deterministically, with no Judge and no way out. So a policy
+			 * match on reversible, in-scope construction is a *gate*, not a block: the
+			 * Judge sees the user's instructions next to the constraint and decides.
+			 * Deletion, external effects and low reversibility still block.
+			 */
 			const directSignals: CheckpointSignal[] = [];
+			const policySignals: CheckpointSignal[] = [];
+			const policyTarget = isReversibleConstruction(action) ? policySignals : directSignals;
 			for (const constraint of contract.constraints) {
 				if (constraint.priority !== "hard" || constraint.policy?.effect !== "forbid") continue;
 				const match = matchConstraintToAction(constraint, action);
 				if (!match.violates) continue;
-				directSignals.push({
+				policyTarget.push({
 					type: "constraint_risk",
 					reason: match.reason,
 					origin: "contract",
@@ -94,7 +108,7 @@ export function createCheckpointDetector(options: {
 			for (const forbidden of contract.forbiddenConditions) {
 				if (forbidden.priority !== "hard" || !forbidden.policy) continue;
 				if (!matchesActionSelector(forbidden.policy.action, action)) continue;
-				directSignals.push({
+				policyTarget.push({
 					type: "constraint_risk",
 					reason: `The action directly reaches typed forbidden condition: "${forbidden.description}"`,
 					origin: "contract",
@@ -106,6 +120,14 @@ export function createCheckpointDetector(options: {
 			directSignals.push(...protectedPathSignals(protectedPaths, action));
 			if (directSignals.length > 0) {
 				return { ...decide(directSignals, false), policyDecision: "block" };
+			}
+			if (policySignals.length > 0) {
+				const decision = decide(policySignals, false);
+				log.info("forbid policy matched reversible construction; gating instead of blocking", {
+					tool: action.toolName,
+					items: decision.relatedRequirements,
+				});
+				return decision;
 			}
 
 			// Tier 2: capability-aware contract relevance. Conditional constraints gate;
@@ -211,6 +233,22 @@ export function createCheckpointDetector(options: {
 			};
 		},
 	};
+}
+
+/** Create/modify of allowed-scope resources, readily reversible, nothing external. */
+function isReversibleConstruction(action: ProposedAction): boolean {
+	const semantics = action.actionSemantics;
+	return (
+		semantics.classification !== "unknown" &&
+		semantics.reversibility === "high" &&
+		!semantics.externalSideEffect &&
+		semantics.effects.length > 0 &&
+		semantics.effects.every(
+			(effect) =>
+				["create", "modify", "read", "query", "execute"].includes(effect.operation) &&
+				(effect.scope === "allowed" || effect.scope === "unknown"),
+		)
+	);
 }
 
 /** Build a decision from signals. The highest-weight signal names the checkpoint. */

@@ -496,3 +496,88 @@ describe("Third live run: semantic evaluation must see real content", () => {
 		}
 	});
 });
+
+describe("Fourth live run: a coarse forbid policy must not brick the task", () => {
+	const paths = tempPaths();
+	const base = (policy: Record<string, unknown>) =>
+		contract({
+			id: "task-only-summary",
+			originalRequest: "Write summary.md. Do not create any other files.",
+			goal: "Write summary.md and nothing else",
+			metadata: { createdAt: new Date().toISOString(), cwd: paths.configDir },
+			workspace: { allowedScopes: [paths.configDir], protectedResources: [] },
+			requirements: [{ id: "r1", description: "summary.md exists with the comparison", source: "user", priority: "hard", status: "pending" }],
+			constraints: [
+				{
+					id: "c1",
+					description: "Only create summary.md; do not create other files",
+					source: "user",
+					priority: "hard",
+					policy: { effect: "forbid", action: policy },
+				},
+			],
+		});
+
+	function coreFor(c: ReturnType<typeof contract>) {
+		const config = testConfig();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const judge = scriptedJudge(() => ({ decision: "PASS", confidence: 0.95 }));
+		const core = createHarnessCore({
+			config,
+			paths,
+			state,
+			detector: createCheckpointDetector({ config, judge }),
+			planner: createEvidencePlanner(),
+			collector: createEvidenceCollector(),
+			judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+			progress: createProgressMonitor({ config }),
+			logger: nullLogger,
+		});
+		return { core, judge, state };
+	}
+
+	test("a forbid-all-creation policy gates the requested file instead of blocking it", async () => {
+		try {
+			// What the compiler actually produced: no way to say "except summary.md".
+			const { core, judge } = coreFor(base({ operations: ["create"] }));
+			const outcome = await core.gateAction({
+				action: action("write", { path: join(paths.configDir, "summary.md"), content: "# x" }),
+				cwd: paths.configDir,
+			});
+			assert.equal(outcome.allowed, true, "the Judge, not a deterministic block, decides");
+			assert.equal(judge.calls.length, 1);
+			assert.ok(judge.calls[0]!.constraints.some((c) => c.id === "c1"), "the Judge is asked about c1 specifically");
+			assert.ok(judge.calls[0]!.state.userInstructions.some((u) => u.includes("summary.md")), "and sees the user's instruction");
+
+			// Deletion under the same kind of policy still blocks without a Judge.
+			const deleting = coreFor(base({ operations: ["delete"] }));
+			const blocked = await deleting.core.gateAction({ action: action("bash", { command: "rm notes.txt" }), cwd: paths.configDir });
+			assert.equal(blocked.allowed, false);
+			assert.equal(blocked.checkpoint?.policyDecision, "block");
+			assert.equal(deleting.judge.calls.length, 0);
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("excludeTargets lets the compiler say 'nothing except summary.md'", async () => {
+		const p2 = tempPaths();
+		try {
+			const c = contract({
+				...base({ operations: ["create"], excludeTargets: ["summary.md"] }),
+				metadata: { createdAt: new Date().toISOString(), cwd: p2.configDir },
+				workspace: { allowedScopes: [p2.configDir], protectedResources: [] },
+			});
+			const { core, judge } = coreFor(c);
+			const allowed = await core.gateAction({ action: action("write", { path: join(p2.configDir, "summary.md"), content: "# x" }), cwd: p2.configDir });
+			assert.equal(allowed.allowed, true);
+			assert.equal(judge.calls.length, 0, "the excluded file does not even match the policy");
+
+			const other = await core.gateAction({ action: action("write", { path: join(p2.configDir, "notes.md"), content: "x" }), cwd: p2.configDir });
+			assert.equal(other.checkpoint?.needsGate, true, "any other creation still matches the policy");
+		} finally {
+			p2.cleanup();
+		}
+	});
+});
