@@ -123,7 +123,15 @@ export function classifyAction(
 		operation = unknownOperation(leaf.replace(/[-_]/g, " "));
 	}
 
-	const effects = operation.effects.map((effect) => materializeResourceEffect({ ...effect, workspace }));
+	/**
+	 * `/dev/null`, `/dev/stdout`, `/dev/tty` are device nodes, not resources. The
+	 * redirection parser already skipped them; `curl -o /dev/null`, `tee /dev/null`
+	 * and `cp x /dev/stdout` did not, and each was "a mutation outside the
+	 * workspace". One rule, at the one place every effect passes through.
+	 */
+	const effects = operation.effects
+		.filter((effect) => !isDeviceReference(effect.reference))
+		.map((effect) => materializeResourceEffect({ ...effect, workspace }));
 	const primary = [...effects].sort((a, b) => effectRisk(b) - effectRisk(a))[0];
 	return {
 		actionType: operation.actionType,
@@ -595,6 +603,10 @@ function firstString(input: Record<string, unknown>, keys: readonly string[]): s
 		if (typeof value === "string" && value.trim()) return value.trim();
 	}
 	return undefined;
+}
+
+function isDeviceReference(reference: string): boolean {
+	return /^\/dev\//.test(reference) || /^file:\/\/\/dev\//.test(reference);
 }
 
 function isLoopbackUrl(url: string): boolean {

@@ -4,6 +4,7 @@ import type { Judge } from "../judges/judge.ts";
 import type { HarnessState } from "../state/types.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
+import { isTempUri } from "../resources/registry.ts";
 import {
 	constraintRiskSignals,
 	contractCriticalActionSignals,
@@ -93,8 +94,17 @@ export function createCheckpointDetector(options: {
 			const directSignals: CheckpointSignal[] = [];
 			const policySignals: CheckpointSignal[] = [];
 			const policyTarget = isReversibleConstruction(action) ? policySignals : directSignals;
+			/**
+			 * "Create only report.md" compiles to a forbid-creation policy with no way
+			 * to say "except scratch files". The temp directory is scratch by
+			 * definition and the task's prompts say so ("scratch files go in /tmp");
+			 * a creation there is not what any such constraint is about. Deletions
+			 * and out-of-scope effects are unaffected.
+			 */
+			const scratchOnly = isScratchConstruction(action);
 			for (const constraint of contract.constraints) {
 				if (constraint.priority !== "hard" || constraint.policy?.effect !== "forbid") continue;
+				if (scratchOnly) continue;
 				const match = matchConstraintToAction(constraint, action);
 				if (!match.violates) continue;
 				policyTarget.push({
@@ -107,6 +117,7 @@ export function createCheckpointDetector(options: {
 			}
 			for (const forbidden of contract.forbiddenConditions) {
 				if (forbidden.priority !== "hard" || !forbidden.policy) continue;
+				if (scratchOnly) continue;
 				if (!matchesActionSelector(forbidden.policy.action, action)) continue;
 				policyTarget.push({
 					type: "constraint_risk",
@@ -236,6 +247,18 @@ export function createCheckpointDetector(options: {
 }
 
 /** Create/modify of allowed-scope resources, readily reversible, nothing external. */
+/**
+ * Every mutating effect lives in the temp directory: creating, editing or
+ * removing scratch files. Contract policies describe the deliverable and the
+ * workspace; scratch is neither, so they do not apply. Anything outside temp
+ * in the same command brings the policies back for the whole action.
+ */
+function isScratchConstruction(action: ProposedAction): boolean {
+	const mutating = action.actionSemantics.effects.filter((effect) => !["read", "query", "execute"].includes(effect.operation));
+	if (mutating.length === 0) return false;
+	return mutating.every((effect) => isTempUri(effect.uri));
+}
+
 function isReversibleConstruction(action: ProposedAction): boolean {
 	const semantics = action.actionSemantics;
 	return (

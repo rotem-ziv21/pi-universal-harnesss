@@ -539,6 +539,22 @@ describe("Fourth live run: a coarse forbid policy must not brick the task", () =
 		return { core, judge, state };
 	}
 
+	test("a forbid-all-creation policy does not reach scratch files in the temp directory", async () => {
+		try {
+			const { core, judge } = coreFor(base({ operations: ["create"] }));
+			const outcome = await core.gateAction({
+				action: action("bash", { command: "mkdir -p /tmp/jev && cd /tmp/jev && curl -s -o gh.json 'https://api.github.com/search/repositories?q=jev'" }),
+				cwd: paths.configDir,
+			});
+			assert.equal(outcome.allowed, true, outcome.message);
+			assert.equal(judge.calls.length, 0, "scratch construction needs no Judge");
+			const probe = await core.gateAction({ action: action("bash", { command: "echo test > /tmp/jev_test.txt && rm /tmp/jev_test.txt" }), cwd: paths.configDir });
+			assert.equal(probe.allowed, true, probe.message);
+		} finally {
+			// paths are shared by this describe; cleaned up by the last test
+		}
+	});
+
 	test("a forbid-all-creation policy gates the requested file instead of blocking it", async () => {
 		try {
 			// What the compiler actually produced: no way to say "except summary.md".
