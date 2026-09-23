@@ -4,6 +4,7 @@ import { createRuntime, type ActiveTask, type HarnessRuntime } from "./runtime.t
 import { registerCommands, REPORT_WIDGET } from "./commands.ts";
 import { errorMessage } from "../util/errors.ts";
 import { clamp } from "../util/json.ts";
+import { diffSnapshots, snapshotTree, type TreeDiff, type TreeSnapshot } from "../resources/snapshot.ts";
 
 /**
  * Pi wiring — where §45 stops being a diagram and becomes runtime behaviour.
@@ -281,7 +282,21 @@ export function activate(pi: PiExtensionAPI): void {
 
 				updateStatus(rt, ctx);
 
-				if (outcome.allowed) return undefined;
+				if (outcome.allowed) {
+					/**
+					 * Ground truth for what the command does to the workspace: the tree
+					 * before, the tree after, and the difference. Taken for tools whose
+					 * file effects the harness cannot know exactly from the call itself.
+					 */
+					if (observesFilesystem(event.toolName)) {
+						try {
+							pendingSnapshots.set(event.toolCallId, snapshotTree(ctx.cwd ?? process.cwd()));
+						} catch {
+							// An unreadable tree is not a reason to block work; there is simply no observation.
+						}
+					}
+					return undefined;
+				}
 
 				// Surface the full explanation in the transcript, not just the block reason.
 				if (outcome.message) {
@@ -307,10 +322,21 @@ export function activate(pi: PiExtensionAPI): void {
 			() => {
 				const task = runtime?.getTask();
 				if (!task) return;
+				let observed: TreeDiff | undefined;
+				const before = pendingSnapshots.get(event.toolCallId);
+				if (before) {
+					pendingSnapshots.delete(event.toolCallId);
+					try {
+						observed = diffSnapshots(before, snapshotTree(before.root));
+					} catch {
+						observed = undefined;
+					}
+				}
 				task.core.recordToolResult({
 					actionId: event.toolCallId,
 					summary: summarizeResult(event.content, Boolean(event.isError)),
 					isError: Boolean(event.isError),
+					...(observed ? { observed } : {}),
 				});
 			},
 			undefined,
@@ -475,6 +501,18 @@ export function activate(pi: PiExtensionAPI): void {
 		getRuntime: () => runtime,
 		bootstrap,
 	});
+}
+
+/** Snapshots taken before a tool ran, keyed by tool call id, waiting for its result. */
+const pendingSnapshots = new Map<string, TreeSnapshot>();
+
+/**
+ * Tools whose effect on the tree is not fully known from the call: a shell
+ * command, or any tool the harness has no exact semantics for. `write`, `edit`
+ * and `read` name their single path; nothing needs observing there.
+ */
+function observesFilesystem(toolName: string): boolean {
+	return !["read", "write", "edit", "ls", "grep", "find", "glob"].includes(toolName.toLowerCase());
 }
 
 function updateStatus(runtime: HarnessRuntime, ctx: any): void {

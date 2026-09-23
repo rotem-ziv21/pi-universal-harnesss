@@ -54,6 +54,8 @@ export interface StateManager {
 	recordAllowed(actionId: string, checkpointId?: string): void;
 	recordBlocked(actionId: string, reason: string, checkpointId?: string, userDecision?: CheckpointRecord["outcome"]): void;
 	recordToolResult(actionId: string, summary: string, isError: boolean): void;
+	/** Files the workspace gained, changed or lost while an action ran (file URIs). */
+	recordFilesystemObservation(actionId: string, diff: { created: readonly string[]; modified: readonly string[]; deleted: readonly string[]; truncated: boolean }): void;
 
 	addEvidence(evidence: EvidenceRef): void;
 	verifyFact(fact: Omit<VerifiedFact, "stateVersion">, supersedes?: readonly string[]): VerifiedFact;
@@ -190,6 +192,7 @@ export function createStateManager(taskId: string, contract: TaskContract, optio
 			}),
 
 		recordToolResult: (actionId, summary, isError) => void emit("tool_result", { actionId, summary, isError }),
+		recordFilesystemObservation: (actionId, diff) => void emit("filesystem_observed", { actionId, ...diff }),
 
 		addEvidence: (evidence) => void emit("evidence_added", { evidence }),
 

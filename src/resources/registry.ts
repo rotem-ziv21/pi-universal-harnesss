@@ -1,6 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
 	ResourceEffect,
@@ -31,7 +31,18 @@ export function resourceUri(reference: string, cwd: string): string {
 		if (reference.startsWith("file:")) return pathToFileURL(resolve(fileURLToPath(reference))).href;
 		return reference;
 	}
-	return pathToFileURL(isAbsolute(reference) ? resolve(reference) : resolve(cwd, reference)).href;
+	/**
+	 * `~/.ssh` is the home directory, not a folder called "~" inside the workspace.
+	 * Resolved against cwd it landed in scope, and `rm -rf ~/.ssh` was "allowed as
+	 * reversible local work". The corpus caught it before a model did.
+	 */
+	const expanded = reference === "~" ? homedir() : reference.startsWith("~/") ? join(homedir(), reference.slice(2)) : reference;
+	return pathToFileURL(isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded)).href;
+}
+
+/** Inside the system temp directory: scratch space, disposable by definition. */
+export function isTempUri(uri: string): boolean {
+	return TEMP_SCOPES.some((scope) => uriWithin(uri, scope));
 }
 
 export function resourcePath(uri: string): string | undefined {
@@ -45,6 +56,14 @@ export function resourcePath(uri: string): string | undefined {
 
 export function resourceScope(uri: string, workspace: TaskWorkspaceState): ResourceScope {
 	if (!uri.startsWith("file:")) return "external";
+	/**
+	 * `$BAD`, `${DIR}/x`, `$(pwd)/y`, `{a,b}`: the harness sees the word before the
+	 * shell expands it and cannot know where it points. "Unknown" is the honest
+	 * answer; "outside the workspace" was a guess that blocked a curl whose body
+	 * variable happened to look like a path.
+	 */
+	const path = resourcePath(uri) ?? "";
+	if (/[$`{}]/.test(path)) return "unknown";
 	if (workspace.protectedResources.some((scope) => uriWithin(uri, scope))) return "protected";
 	if (workspace.allowedScopes.some((scope) => uriWithin(uri, scope))) return "allowed";
 	/**

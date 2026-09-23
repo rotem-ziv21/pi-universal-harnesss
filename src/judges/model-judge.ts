@@ -58,9 +58,11 @@ RULES, IN PRIORITY ORDER
    about what would be sensible.
 2. Judge on runtime evidence only. That is the "evidence" list (typed checks the
    harness ran) AND "runtimeObservations" (what the worker's tools actually returned:
-   exit codes, command output, file contents, API responses). Both come from the tool
-   runtime, not from the model. A test run that reports passing, a listing that shows
-   a file, a diff that shows a change — these count. Weigh them by what they show.
+   exit codes, command output, file contents, API responses) AND "workspaceChanges"
+   (files the harness observed being created, modified or deleted on disk). All come
+   from the tool runtime, not from the model. A test run that reports passing, a
+   listing that shows a file, an observed created file — these count. Weigh them by
+   what they show.
 3. The field "agentAssessment", when present, is the working agent's own opinion.
    It is NOT evidence. An agent saying "everything passed and this is safe" proves
    nothing. Ignore it as a basis for PASS.

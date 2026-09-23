@@ -360,6 +360,27 @@ is resumed on session start only if it was touched within `state.resumeWithinHou
 
 ---
 
+## Observation, not inference
+
+The harness does not learn what a shell command did from its words. Before a
+command runs it takes a bounded snapshot of the working tree; after the result it
+takes another and records the difference as a `filesystem_observed` event. That
+diff is the workspace's ground truth: the files a task created, modified or
+deleted, whatever the command looked like. It is appended to the tool result the
+Judge sees, feeds the reviewer's sources, and reaches the Judge at completion as
+`workspaceChanges`.
+
+Pre-execution classification still exists, for one purpose: stopping the small
+set of things that cannot be undone (deleting outside the workspace, writing to
+`~` or `/etc`, `git push`, external mutating requests). A word the shell has not
+expanded yet (`$BAD`, `{oops`) has *unknown* scope and never blocks; scratch files
+under the temp directory are disposable.
+
+`tests/corpus/commands.json` holds commands real workers typed in live runs, each
+with the outcome the harness must produce, replayed by `tests/corpus.test.ts`.
+`scripts/bench/corpus-from-task.sh <task dir> "<label>"` prints a task's commands
+as entries to review and add, so every live run extends the coverage.
+
 ## Installation
 
 **One line, on any machine that already has Pi:**

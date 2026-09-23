@@ -124,6 +124,12 @@ export interface JudgeState {
 	 * Judge decides whether "pytest → exit 0, 12 passed" demonstrates "tests pass".
 	 */
 	readonly runtimeObservations: ReadonlyArray<{ action: string; outcome: string; result: string }>;
+	/**
+	 * What the task did to the workspace, observed by the harness on disk (not
+	 * inferred from commands): files it created, changed and deleted since the
+	 * task began, as paths relative to the working directory.
+	 */
+	readonly workspaceChanges: Readonly<{ created: readonly string[]; modified: readonly string[]; deleted: readonly string[] }>;
 	readonly counters: Readonly<Record<string, number>>;
 	readonly stateVersion: number;
 	/** Untrusted. Included for context only; never treated as evidence (§38). */

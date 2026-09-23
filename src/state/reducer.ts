@@ -1,7 +1,8 @@
 import type { ContractRevision } from "../contract/revisions.ts";
 import type { TaskContract } from "../contract/schema.ts";
 import { nowIso } from "../util/ids.ts";
-import { applyResourceEffects, createWorkspaceState } from "../resources/registry.ts";
+import { applyResourceEffects, createWorkspaceState, registeredResource, resourceScope } from "../resources/registry.ts";
+import type { ResourceEffect } from "../resources/types.ts";
 import { contradicts, supersede } from "./freshness.ts";
 import type {
 	CheckpointRecord,
@@ -173,6 +174,34 @@ function applyEvent(state: HarnessState, event: HarnessEvent): HarnessState {
 
 		case "tool_executed":
 			return state;
+
+		/**
+		 * What the tree looked like after a command, minus what it looked like
+		 * before. This is the workspace's ground truth for files touched by shell
+		 * commands; the classifier's guesses only ever steered the pre-execution
+		 * gate. Observed changes are applied like effects, with the same provenance
+		 * rules, so producedResources() and completion see real files.
+		 */
+		case "filesystem_observed": {
+			const actionId = p.actionId as string;
+			const toEffect = (uri: string, operation: "create" | "modify" | "delete"): ResourceEffect => ({
+				uri,
+				kind: "file",
+				operation,
+				// "Created" means it was not there before the command ran; that is the
+				// observation, and it outranks an existence check made afterwards.
+				provenance: registeredResource(uri, state.workspace)?.provenance ?? (operation === "create" ? "created_by_current_task" : "preexisting"),
+				scope: resourceScope(uri, state.workspace),
+				reversible: true,
+				external: false,
+			});
+			const effects: ResourceEffect[] = [
+				...((p.created as string[] | undefined) ?? []).map((uri) => toEffect(uri, "create")),
+				...((p.modified as string[] | undefined) ?? []).map((uri) => toEffect(uri, "modify")),
+				...((p.deleted as string[] | undefined) ?? []).map((uri) => toEffect(uri, "delete")),
+			];
+			return { ...state, workspace: applyResourceEffects(state.workspace, effects, actionId, event.at) };
+		}
 
 		case "tool_result": {
 			const action = state.actions.find((item) => item.id === p.actionId);

@@ -245,6 +245,7 @@ export type HarnessEventType =
 	| "tool_blocked"
 	| "tool_executed"
 	| "tool_result"
+	| "filesystem_observed"
 	| "evidence_added"
 	| "evidence_superseded"
 	| "hypothesis_created"

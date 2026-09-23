@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { withActionSemantics } from "../checkpoints/action-semantics.ts";
-import { resourcePath } from "../resources/registry.ts";
+import { resourcePath, resourceUri } from "../resources/registry.ts";
+import { describeDiff, isEmptyDiff, type TreeDiff } from "../resources/snapshot.ts";
 import { redact } from "../security/redact.ts";
 import { clamp } from "../util/json.ts";
 import type { CheckpointDetector } from "../checkpoints/detector.ts";
@@ -68,7 +69,7 @@ export interface HarnessCore {
 		signal?: AbortSignal | undefined;
 	}): Promise<GateOutcome>;
 
-	recordToolResult(args: { actionId: string; summary: string; isError: boolean }): void;
+	recordToolResult(args: { actionId: string; summary: string; isError: boolean; observed?: TreeDiff | undefined }): void;
 	observeTurn(): void;
 }
 
@@ -347,8 +348,8 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			return halt(outcome);
 		},
 
-		recordToolResult({ actionId, summary, isError }): void {
-			recordRuntimeToolEvidence(deps, actionId, summary, isError);
+		recordToolResult({ actionId, summary, isError, observed }): void {
+			recordRuntimeToolEvidence(deps, actionId, summary, isError, observed);
 		},
 
 		observeTurn(): void {
@@ -629,11 +630,23 @@ function recordRuntimeToolEvidence(
 	actionId: string,
 	summary: string,
 	isError: boolean,
+	observed?: TreeDiff,
 ): void {
 	// Tool outcomes update canonical action/resource state. They become completion
 	// evidence only through an explicit typed verification request collected by the
 	// Evidence Collector; filenames and prose are never used as implicit links.
-	deps.state.recordToolResult(actionId, isError ? summary : `${summary}${observeWrittenFiles(deps, actionId)}`, isError);
+	const observation = observed && !isEmptyDiff(observed) ? `\n${describeDiff(observed)}` : "";
+	deps.state.recordToolResult(actionId, isError ? `${summary}${observation}` : `${summary}${observeWrittenFiles(deps, actionId)}${observation}`, isError);
+	if (observed && !isEmptyDiff(observed)) {
+		const cwd = deps.state.getState().workspace.initialWorkingDirectory;
+		const toUri = (rel: string) => resourceUri(rel, cwd);
+		deps.state.recordFilesystemObservation(actionId, {
+			created: observed.created.map(toUri),
+			modified: observed.modified.map(toUri),
+			deleted: observed.deleted.map(toUri),
+			truncated: observed.truncated,
+		});
+	}
 }
 
 /**

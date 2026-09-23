@@ -1,6 +1,8 @@
 import type { CheckpointDecision, ProposedAction } from "../checkpoints/types.ts";
 import { describeContractItem, type TaskContract } from "../contract/schema.ts";
 import { assessFreshness, changedTargetsSince, currentFacts, worldVersion } from "../state/freshness.ts";
+import { isAbsolute, relative } from "node:path";
+import { resourcePath } from "../resources/registry.ts";
 import type { HarnessState } from "../state/types.ts";
 import { clamp } from "../util/json.ts";
 import type { JudgeQuery, JudgeState } from "./judge.ts";
@@ -28,6 +30,7 @@ const LIMITS = {
 	evidenceResultChars: 400,
 	recentActions: 8,
 	runtimeObservations: 20,
+	workspaceChanges: 80,
 	observationChars: 1200,
 	hypotheses: 6,
 	verifiedFacts: 12,
@@ -122,6 +125,31 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 		stateVersion: state.stateVersion,
 		...(args.signal ? { signal: args.signal } : {}),
 	};
+}
+
+/** Files the task created, modified or deleted, as the harness observed them on disk. */
+export function workspaceChanges(state: HarnessState): { created: string[]; modified: string[]; deleted: string[] } {
+	const root = state.workspace.initialWorkingDirectory;
+	const rel = (uri: string) => {
+		const path = resourcePath(uri);
+		if (!path) return uri;
+		const r = relative(root, path);
+		return r.startsWith("..") || isAbsolute(r) ? path : r;
+	};
+	const created: string[] = [];
+	const modified: string[] = [];
+	const deleted: string[] = [];
+	for (const resource of state.workspace.resources) {
+		if (resource.kind !== "file" && resource.kind !== "artifact" && resource.kind !== "directory") continue;
+		if (resource.status === "deleted") {
+			if (resource.provenance !== "created_by_current_task") deleted.push(rel(resource.uri));
+			continue;
+		}
+		if (resource.provenance === "created_by_current_task") created.push(rel(resource.uri));
+		else if (resource.lastOperation === "modify" || resource.lastOperation === "create") modified.push(rel(resource.uri));
+	}
+	const cap = (items: string[]) => items.sort().slice(0, LIMITS.workspaceChanges);
+	return { created: cap(created), modified: cap(modified), deleted: cap(deleted) };
 }
 
 function buildState(
@@ -256,6 +284,8 @@ function buildState(
 				outcome: a.outcome,
 				result: clamp(a.resultSummary ?? "", LIMITS.observationChars),
 			})),
+
+		workspaceChanges: workspaceChanges(state),
 
 		counters: {
 			toolCalls: state.counters.toolCalls,

@@ -1,5 +1,5 @@
 import type { ActionSelector, Constraint, ForbiddenCondition, TaskContract } from "../contract/schema.ts";
-import { resourcePath } from "../resources/registry.ts";
+import { isTempUri, resourcePath } from "../resources/registry.ts";
 import type { ResourceEffect } from "../resources/types.ts";
 import type { CheckpointSignal, ProposedAction } from "./types.ts";
 
@@ -99,7 +99,8 @@ export function externalMutationSignal(action: ProposedAction): CheckpointSignal
 }
 
 export function destructiveSignal(action: ProposedAction): CheckpointSignal | undefined {
-	const deletions = action.actionSemantics.effects.filter((effect) => effect.operation === "delete");
+	// Scratch files under the temp directory are disposable; cleaning them up is not a loss.
+	const deletions = action.actionSemantics.effects.filter((effect) => effect.operation === "delete" && !isTempUri(effect.uri));
 	if (deletions.length === 0) return undefined;
 	if (deletions.every((effect) => effect.provenance === "created_by_current_task" && effect.scope === "allowed")) return undefined;
 	const protectedDeletion = deletions.some((effect) => effect.scope === "protected" || effect.scope === "outside_allowed");
