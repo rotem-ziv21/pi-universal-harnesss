@@ -659,6 +659,17 @@ function shellSegments(command: string): ShellSegment[] {
 			quote = char;
 			continue;
 		}
+		/**
+		 * A newline ends a command exactly like `;`. Without this, a multi-line
+		 * script collapsed into one segment: `grep`'s "last argument" became the
+		 * JSON body of the curl on the next line, and a `tee` target picked up
+		 * `{oops`, a deliberately broken request body. The harness then blocked a
+		 * "file creation" that no shell would ever perform.
+		 */
+		if (char === "\n") {
+			flushSegment(";");
+			continue;
+		}
 		if (/\s/.test(char)) {
 			flushWord();
 			continue;
@@ -671,6 +682,11 @@ function shellSegments(command: string): ShellSegment[] {
 		}
 		if (char === ";" || char === "|") {
 			flushSegment(char);
+			continue;
+		}
+		// A lone `&` backgrounds the command so far and starts a new one, like `;`.
+		if (char === "&") {
+			flushSegment(";");
 			continue;
 		}
 		if (char === ">" || char === "<") {

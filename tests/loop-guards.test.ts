@@ -1208,3 +1208,25 @@ describe("Shorty run 4: a config update stores only what the user set", () => {
 		}
 	});
 });
+
+describe("Shorty run 4: a multi-line shell script is classified line by line", () => {
+	test("a JSON body on one line is not a file argument of the command on the previous line", async () => {
+		const { classifyAction } = await import("../src/checkpoints/action-semantics.ts");
+		const command = [
+			"cd /workspace/shorty4 && PORT=4455 node bin/shorty.js > /tmp/shorty-4455.log 2>&1 & SRV=$!; sleep 0.6",
+			"echo '=== s2: startup output ==='",
+			"cat /tmp/shorty-4455.log",
+			"BAD='{\"url\":\"ftp:/example.com/file\"}'",
+			"curl -si -X POST http://127.0.0.1:4455/links -d \"$BAD\" | grep -E 'HTTP|error'",
+			"echo '--- invalid JSON'",
+			"curl -si -X POST http://127.0.0.1:4455/links -d '{oops' | grep -E 'HTTP|error'",
+			"kill $SRV",
+		].join("\n");
+		const semantics = classifyAction("bash", { command }, { cwd: "/workspace/shorty4" });
+		const uris = semantics.effects.map((e) => e.uri);
+		assert.ok(!uris.some((u) => /oops|%7B|ftp:/.test(u)), `request bodies must not become paths: ${uris.join(", ")}`);
+		const creates = semantics.effects.filter((e) => e.operation === "create" || e.operation === "modify").map((e) => e.uri);
+		assert.deepEqual(creates, ["file:///tmp/shorty-4455.log"], "the only write is the log redirect");
+		assert.notEqual(semantics.actionType, "external_mutation");
+	});
+});
