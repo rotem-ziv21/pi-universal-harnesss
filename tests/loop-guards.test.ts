@@ -1146,3 +1146,41 @@ describe("Clean run 1: the Judge is always consulted at completion, in a bounded
 		}
 	});
 });
+
+describe("Shorty run 4: a contract cut off by the output limit is retried with room, not repaired", () => {
+	test("an unterminated object is reported as truncation instead of being replaced by an inner array", async () => {
+		const { extractJson } = await import("../src/util/json.ts");
+		const cut = '{"goal":"build shorty","requirements":[{"id":"r1","description":"store"},{"id":"r2","description":"serv';
+		const result = extractJson(cut);
+		assert.equal(result.ok, false);
+		if (!result.ok) assert.match(result.error, /unterminated|cut off/);
+		const whole = extractJson('prose before {"a":[1,2]} prose after');
+		assert.deepEqual(whole.ok ? whole.value : undefined, { a: [1, 2] });
+	});
+
+	test("completeStructured retries a length-stopped reply with a larger budget and thinking off", async () => {
+		const { completeStructured } = await import("../src/models/structured.ts");
+		const { Type } = await import("typebox");
+		const seen: Array<{ reasoning?: string; maxTokens?: number }> = [];
+		const adapter = {
+			id: "openrouter/deepseek/deepseek-v4.1-flash",
+			available: true,
+			async complete(request: { reasoning?: string; maxTokens?: number; userPrompt: string }) {
+				seen.push({ reasoning: request.reasoning, maxTokens: request.maxTokens });
+				if (seen.length === 1) return { text: '{"answer":"ye', model: "m", stopReason: "length" };
+				assert.ok(!/did not satisfy the schema/.test(request.userPrompt), "no repair prompt for a truncation");
+				return { text: '{"answer":"yes"}', model: "m", stopReason: "stop" };
+			},
+		};
+		const result = await completeStructured<{ answer: string }>(adapter, {
+			systemPrompt: "s",
+			userPrompt: "u",
+			schema: Type.Object({ answer: Type.String() }),
+			maxRepairAttempts: 2,
+		});
+		assert.equal(result.value.answer, "yes");
+		assert.equal(result.attempts, 2);
+		assert.equal(seen[1]?.reasoning, "off");
+		assert.ok((seen[1]?.maxTokens ?? 0) >= 32_000);
+	});
+});

@@ -45,15 +45,26 @@ export function extractJson<T = unknown>(raw: string): { ok: true; value: T } | 
 	}
 
 	const scanned = scanBalanced(text);
-	if (scanned) {
-		const parsed = safeParse<T>(scanned);
+	if (scanned.kind === "found") {
+		const parsed = safeParse<T>(scanned.text);
 		if (parsed.ok) return parsed;
+	}
+	if (scanned.kind === "unterminated") {
+		/**
+		 * The document opened and never closed: the output was cut off, almost always
+		 * by the token limit. Falling through to a smaller balanced fragment (an inner
+		 * array) produced a "must be object" schema error that sent the model into a
+		 * repair loop for a problem it had not caused.
+		 */
+		return { ok: false, error: "the JSON document is unterminated; the output was cut off before it ended (token limit?)" };
 	}
 
 	return { ok: false, error: "no parseable JSON document found in model output" };
 }
 
-function scanBalanced(text: string): string | undefined {
+type Scan = { kind: "found"; text: string } | { kind: "unterminated" } | { kind: "none" };
+
+function scanBalanced(text: string): Scan {
 	for (const [open, close] of [
 		["{", "}"],
 		["[", "]"],
@@ -83,11 +94,13 @@ function scanBalanced(text: string): string | undefined {
 			if (ch === open) depth++;
 			else if (ch === close) {
 				depth--;
-				if (depth === 0) return text.slice(start, i + 1);
+				if (depth === 0) return { kind: "found", text: text.slice(start, i + 1) };
 			}
 		}
+		// Opened but never closed at this nesting: a truncated document, not a smaller one.
+		return { kind: "unterminated" };
 	}
-	return undefined;
+	return { kind: "none" };
 }
 
 /** Write via temp file + rename so a reader never sees a truncated document. */

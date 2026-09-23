@@ -33,6 +33,8 @@ export interface ModelResponse {
 	readonly text: string;
 	readonly model: string;
 	readonly usage?: { input?: number; output?: number };
+	/** Why generation ended, as the provider reports it ("stop", "length", "error"...). */
+	readonly stopReason?: string;
 }
 
 export interface ModelAdapter {
@@ -177,7 +179,8 @@ function createAdapter(args: {
 				});
 			}
 
-			return { text, model: id, usage: normalizeUsage(response.usage) };
+			const stopReason = (response as { stopReason?: string }).stopReason;
+			return { text, model: id, usage: normalizeUsage(response.usage), ...(stopReason ? { stopReason } : {}) };
 		},
 	};
 }

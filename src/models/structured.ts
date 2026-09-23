@@ -155,6 +155,22 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 		});
 
 		const extracted = extractJson<unknown>(response.text);
+		if (!extracted.ok && (response.stopReason === "length" || /unterminated/.test(extracted.error)) && attempt < totalAttempts) {
+			/**
+			 * The document was cut off by the output limit. Asking the model to "fix its
+			 * JSON" cannot help; the same budget cuts the same document again. The next
+			 * attempt gets room, with thinking off so none of it goes to deliberation.
+			 */
+			lastError = `output truncated (${response.stopReason ?? "unterminated JSON"})`;
+			override = { reasoning: "off", maxTokens: EMPTY_REPLY_RETRY_MAX_TOKENS };
+			log?.warn("structured output: truncated; retrying with a larger budget and thinking off", {
+				attempt,
+				model: adapter.id,
+				chars: response.text.length,
+				...(response.usage ? { usage: response.usage } : {}),
+			});
+			continue;
+		}
 		if (!extracted.ok) {
 			lastError = extracted.error;
 			log?.warn("structured output: no JSON found", { attempt, model: adapter.id, error: extracted.error });
