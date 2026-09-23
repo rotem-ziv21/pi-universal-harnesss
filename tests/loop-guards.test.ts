@@ -1184,3 +1184,27 @@ describe("Shorty run 4: a contract cut off by the output limit is retried with r
 		assert.ok((seen[1]?.maxTokens ?? 0) >= 32_000);
 	});
 });
+
+describe("Shorty run 4: a config update stores only what the user set", () => {
+	test("pinning a model does not freeze that day's defaults into config.json", async () => {
+		const { updateConfig } = await import("../src/config/loader.ts");
+		const { readJsonFile } = await import("../src/util/json.ts");
+		const { mkdirSync } = await import("node:fs");
+		const paths = tempPaths();
+		try {
+			mkdirSync(paths.harnessDir, { recursive: true });
+			const result = updateConfig(paths, { compiler: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" } });
+			assert.equal(result.compiler.maxOutputTokens, 16_000, "the returned config carries the current default");
+			const stored = readJsonFile<{ compiler?: Record<string, unknown>; judge?: unknown }>(paths.configFile)!;
+			assert.deepEqual(stored.compiler, { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" });
+			assert.equal(stored.judge, undefined, "untouched sections are not written");
+			// A later update keeps the earlier pin.
+			updateConfig(paths, { enabled: false });
+			const again = readJsonFile<{ compiler?: Record<string, unknown>; enabled?: boolean }>(paths.configFile)!;
+			assert.equal(again.compiler?.model, "deepseek/deepseek-v4.1-flash");
+			assert.equal(again.enabled, false);
+		} finally {
+			paths.cleanup();
+		}
+	});
+});

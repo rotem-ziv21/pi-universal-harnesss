@@ -63,15 +63,23 @@ export function saveConfig(paths: HarnessPaths, config: HarnessConfig): void {
 
 /** Deep-merge a patch into the stored config and save it. Used by `/harness setup`. */
 export function updateConfig(paths: HarnessPaths, patch: DeepPartial<HarnessConfig>): HarnessConfig {
-	const current = loadConfig(paths).config;
-	const merged = deepMerge(current as unknown as Record<string, unknown>, patch as Record<string, unknown>);
+	/**
+	 * Persist only what the user set. An earlier version merged the patch into the
+	 * fully defaulted config and wrote all of it back, which froze every default of
+	 * that day into the file: `/harness model` pinned a compiler and, with it,
+	 * `maxOutputTokens: 8000`. When the default later rose, the file still won,
+	 * and a large contract was cut off at 8k on a machine nobody had tuned.
+	 */
+	const stored = readJsonFile<unknown>(paths.configFile);
+	const base = isRecord(stored) ? stored : {};
+	const merged = deepMerge(base, patch as Record<string, unknown>);
 	const result = withDefaults<HarnessConfig>(HarnessConfigSchema, merged);
 	if (!result.ok) {
 		throw new HarnessError("CONFIG_INVALID", `Config update produced an invalid config: ${formatIssues(result.issues)}`, {
 			details: { issues: result.issues },
 		});
 	}
-	writeJsonAtomic(paths.configFile, result.value);
+	writeJsonAtomic(paths.configFile, merged);
 	return result.value;
 }
 
