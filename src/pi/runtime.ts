@@ -659,7 +659,7 @@ export const provisionalTaskId = newTaskId;
  * overwriting the real status long after the contract was compiled — which looks
  * exactly like a hang.
  */
-function createProgressTicker() {
+export function createProgressTicker() {
 	let timer: NodeJS.Timeout | undefined;
 	const stop = () => {
 		if (timer) clearInterval(timer);
@@ -679,9 +679,23 @@ function createProgressTicker() {
 
 				const tick = () => {
 					const seconds = Math.round((Date.now() - started) / 1000);
-					onProgress(`${label} · ${modelId} · ${seconds}s${suffix}`);
+					/**
+					 * The callback writes to a Pi context. After `/reload` or a session
+					 * switch that context is stale and Pi throws on any use of it; from a
+					 * timer that exception is uncaught and takes the whole process down
+					 * (it did, mid-compile). A status line nobody can see is not worth a
+					 * crash: the first failure ends the ticker.
+					 */
+					try {
+						onProgress(`${label} · ${modelId} · ${seconds}s${suffix}`);
+					} catch {
+						dead = true;
+						stop();
+					}
 				};
+				let dead = false;
 				tick();
+				if (dead) return;
 
 				// Unref'd so a pending tick can never hold the process open at shutdown.
 				timer = setInterval(tick, 1000);

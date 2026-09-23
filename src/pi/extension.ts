@@ -156,7 +156,7 @@ export function activate(pi: PiExtensionAPI): void {
 					request: prompt,
 					cwd: ctx.cwd ?? process.cwd(),
 					availableTools: safeTools(pi),
-					...(ctx.hasUI ? { onProgress: (m: string) => ctx.ui.setStatus("harness", m) } : {}),
+					...(ctx.hasUI ? { onProgress: (m: string) => safeStatus(ctx, m) } : {}),
 				};
 
 				if (existing) {
@@ -180,7 +180,7 @@ export function activate(pi: PiExtensionAPI): void {
 					 * the transcript for the model to see.
 					 */
 					if (compileInFlight) return undefined;
-					if (ctx.hasUI) ctx.ui.setStatus("harness", "updating task contract in the background…");
+					safeStatus(ctx, "updating task contract in the background…");
 					compileInFlight = rt
 						.reviseTask(args)
 						.then((task) => {
@@ -207,7 +207,7 @@ export function activate(pi: PiExtensionAPI): void {
 
 				// The first contract is compiled before the worker starts: gates need it.
 				// Two model calls; tell the user why there is a pause.
-				if (ctx.hasUI) ctx.ui.setStatus("harness", "compiling task contract…");
+				safeStatus(ctx, "compiling task contract…");
 
 				compileInFlight = rt.startTask({ ...args, ...(ctx.signal ? { signal: ctx.signal } : {}) }).catch((e) => {
 					rt.logger.error("task start failed", { error: errorMessage(e) });
@@ -217,7 +217,7 @@ export function activate(pi: PiExtensionAPI): void {
 
 				const task = await compileInFlight;
 				compileInFlight = undefined;
-				if (ctx.hasUI) ctx.ui.setStatus("harness", undefined);
+				safeStatus(ctx, undefined);
 				if (!task) return undefined;
 
 				updateStatus(rt, ctx);
@@ -270,7 +270,7 @@ export function activate(pi: PiExtensionAPI): void {
 					{ cwd: ctx.cwd ?? process.cwd(), contract: task.contract, state: task.state.getState() },
 				);
 
-				if (ctx.hasUI) ctx.ui.setStatus("harness", `checking: ${clamp(action.summary, 40)}`);
+				safeStatus(ctx, `checking: ${clamp(action.summary, 40)}`);
 
 				const outcome = await task.core.gateAction({
 					action,
@@ -371,7 +371,7 @@ export function activate(pi: PiExtensionAPI): void {
 
 				completionGateRunning = true;
 				try {
-					if (ctx.hasUI) ctx.ui.setStatus("harness", "verifying completion…");
+					safeStatus(ctx, "verifying completion…");
 
 					const outcome = await task.core.gateCompletion({
 						cwd: ctx.cwd ?? process.cwd(),
@@ -462,7 +462,7 @@ export function activate(pi: PiExtensionAPI): void {
 					updateStatus(rt, ctx);
 				} finally {
 					completionGateRunning = false;
-					if (ctx.hasUI) ctx.ui.setStatus("harness", undefined);
+					safeStatus(ctx, undefined);
 				}
 			},
 			undefined,
@@ -482,12 +482,26 @@ function updateStatus(runtime: HarnessRuntime, ctx: any): void {
 
 	const task = runtime.getTask();
 	if (!task) {
-		ctx.ui.setStatus("harness", runtime.config.enabled ? "harness: idle" : undefined);
+		safeStatus(ctx, runtime.config.enabled ? "harness: idle" : undefined);
 		return;
 	}
 
 	const state = task.state.getState();
-	ctx.ui.setStatus("harness", `harness: ${state.phase} c${state.contractVersion}/v${state.stateVersion}`);
+	safeStatus(ctx, `harness: ${state.phase} c${state.contractVersion}/v${state.stateVersion}`);
+}
+
+/**
+ * Write the harness status line, tolerating a context Pi has since retired.
+ * Background work (a compile in flight, a contract revision, the progress
+ * ticker) can outlive `/reload`; Pi throws on any use of the old context, and
+ * a status update is never worth a crash.
+ */
+function safeStatus(ctx: any, message: string | undefined): void {
+	try {
+		if (ctx.hasUI) ctx.ui.setStatus("harness", message);
+	} catch {
+		// stale context after reload or session switch: nothing to show it on
+	}
 }
 
 /** The same words again (whitespace aside) are the same request, not a follow-up. */

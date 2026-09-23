@@ -1027,3 +1027,21 @@ describe("Shorty run: a turn with no tool call is nudged automatically", () => {
 		assert.equal(judgeCalls, 0);
 	});
 });
+
+describe("Clean run 1: a progress ticker whose context died must not crash Pi", () => {
+	test("the ticker stops itself the first time the status callback throws", async () => {
+		const { createProgressTicker } = await import("../src/pi/runtime.ts");
+		const ticker = createProgressTicker();
+		let calls = 0;
+		const onProgress = () => {
+			calls++;
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		};
+		const attempt = ticker.make(onProgress, "openrouter/x")("Compiling")!;
+		attempt(1, 3); // first tick throws synchronously and is swallowed
+		assert.equal(calls, 1);
+		await new Promise((resolve) => setTimeout(resolve, 1100));
+		assert.equal(calls, 1, "no further ticks after the callback failed");
+		ticker.stop();
+	});
+});
