@@ -963,3 +963,15 @@ describe("Smoke run 13: evidence collected in one batch must all count", () => {
 		}
 	});
 });
+
+describe("Shorty run: exercising the task's own local server is not an external mutation", () => {
+	test("a POST to localhost is local execution; a POST to a remote host still is not", async () => {
+		const { classifyAction } = await import("../src/checkpoints/action-semantics.ts");
+		const local = classifyAction("bash", { command: `PORT=3457 node bin/shorty.js & sleep 0.7; curl -s -X POST -d '{"url":"https://example.com/foo"}' http://127.0.0.1:3457/links` }, { cwd: "/work" });
+		assert.notEqual(local.actionType, "external_mutation", `got ${local.actionType}`);
+		const named = classifyAction("bash", { command: `curl -X POST -d '{}' http://localhost:3000/links` }, { cwd: "/work" });
+		assert.notEqual(named.actionType, "external_mutation");
+		const remote = classifyAction("bash", { command: `curl -X POST -d '{}' https://api.example.com/links` }, { cwd: "/work" });
+		assert.equal(remote.actionType, "external_mutation");
+	});
+});

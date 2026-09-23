@@ -318,8 +318,18 @@ function classifyCommandSegment(words: string[], cwd: string, workspace: TaskWor
 		const mutating =
 			args.some((arg, index) => /^(?:-x|--request)$/i.test(arg) && /^(?:post|put|patch|delete)$/i.test(args[index + 1] ?? "")) ||
 			args.some((arg) => /^(?:--data|-d|--upload-file|-t)$/i.test(arg));
+		/**
+		 * A request to the loopback interface talks to a process on this machine —
+		 * usually the server the task itself just started. Its state lives in the
+		 * workspace, so a POST there is the task exercising its own code, not a
+		 * change to the outside world. Gating it as an external mutation sent a
+		 * "curl the shortener you just wrote" smoke test to human review.
+		 */
+		const loopback = endpoint !== undefined && isLoopbackUrl(endpoint);
 		operation = mutating
-			? externalOperation("modify", `${program} remote mutation`, ["mutate_remote"], endpoint)
+			? loopback
+				? localExecution(`${program} local request`, ["query_resource"])
+				: externalOperation("modify", `${program} remote mutation`, ["mutate_remote"], endpoint)
 			: endpoint
 				? resourceOperation("read", endpoint, cwd, workspace, "remote_resource", "query_resource", true, `${program} remote query`)
 				: localExecution(`${program} request`, ["query_resource"]);
@@ -585,6 +595,15 @@ function firstString(input: Record<string, unknown>, keys: readonly string[]): s
 		if (typeof value === "string" && value.trim()) return value.trim();
 	}
 	return undefined;
+}
+
+function isLoopbackUrl(url: string): boolean {
+	try {
+		const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+		return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host.endsWith(".localhost");
+	} catch {
+		return false;
+	}
 }
 
 function isDependencyCommand(program: string, args: string[]): boolean {
