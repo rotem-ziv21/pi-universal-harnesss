@@ -30,6 +30,15 @@ export const JudgeConfigSchema = Type.Object(
 		maxRetries: Type.Integer({ default: 2, minimum: 0, maximum: 5 }),
 		/** Ordered adapter names tried when the primary Judge cannot answer. */
 		fallbackChain: Type.Array(Type.String(), { default: ["model", "deterministic"] }),
+		/**
+		 * When the completion gate consults the Judge. "always": every completion is
+		 * put to the Judge with the full state, and a constraint violation it finds is
+		 * decisive; conditions the harness or the reviewer already settled are shown
+		 * to it but not re-scored. "when_undetermined": only conditions nothing else
+		 * could settle reach the Judge, and a fully settled completion passes without
+		 * a Judge call.
+		 */
+		consultOnCompletion: Type.Union([Type.Literal("always"), Type.Literal("when_undetermined")], { default: "always" }),
 		failurePolicy: Type.Object(
 			{
 				critical: Type.Union(

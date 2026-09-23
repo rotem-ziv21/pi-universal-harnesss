@@ -60,6 +60,13 @@ export function normalizeDecision(args: {
 
 		if (p >= requirementSupported) {
 			reasons.push(`Requirement "${requirement.description}" is supported by the evidence (p=${fmt(p)}).`);
+		} else if (requirement.settled) {
+			/**
+			 * Settled by a harness check or by the reviewer reading the produced content.
+			 * The Judge's score is recorded as an opinion, not applied: re-scoring a
+			 * settled condition is how three correct reports were rejected in a row.
+			 */
+			reasons.push(`Requirement "${requirement.description}" was already settled by the harness; the Judge rates it p=${fmt(p)} (not applied).`);
 		} else if (requirement.priority === "hard") {
 			unsupportedHard.push(requirement.id);
 			missingEvidence.push(

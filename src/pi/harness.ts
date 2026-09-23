@@ -289,11 +289,11 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 				deps.state.rejectCompletion(message);
 				return halt({ allowed: false, message });
 			}
-			if (hardUnknown.length === 0) {
+			if (hardUnknown.length === 0 && deps.config.judge.consultOnCompletion !== "always") {
 				deps.state.completeTask();
 				return { allowed: true };
 			}
-			if (before.actions.length === 0) {
+			if (before.actions.length === 0 && hardUnknown.length > 0) {
 				const message = renderNoActionNudge(hardUnknown);
 				deps.state.rejectCompletion(message);
 				log.warn("worker settled without any tool call; nudging it to act", { unverified: hardUnknown.length });
@@ -301,9 +301,10 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			}
 
 			const detected = deps.detector.evaluateCompletion({ contract, state: deps.state.getState() });
+			const hardIds = evaluation.conditions.filter((condition) => condition.priority === "hard").map((condition) => condition.id);
 			const checkpoint: CheckpointDecision = {
 				...detected,
-				relatedRequirements: hardUnknown.map((condition) => condition.id),
+				relatedRequirements: hardUnknown.length > 0 ? hardUnknown.map((condition) => condition.id) : hardIds,
 			};
 			const action: ProposedAction = {
 				id: `completion-${deps.state.getVersion()}`,
@@ -432,6 +433,14 @@ async function runGate(args: {
 
 	let checkpointForJudge = checkpoint;
 	let completionEvaluation: CompletionEvaluation | undefined;
+	let settledRequirements: ReadonlySet<string> | undefined;
+	/**
+	 * Every hard condition is already settled and the Judge is consulted anyway
+	 * (`judge.consultOnCompletion = "always"`). Its role is then bounded: it sees the
+	 * whole state and can veto with a constraint violation, which nothing else
+	 * catches; it cannot send the worker back for conditions that are settled.
+	 */
+	let settledOnly = false;
 	if (checkpoint.checkpointType === "completion_claim") {
 		const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
 		completionEvaluation = evaluation;
@@ -447,11 +456,14 @@ async function runGate(args: {
 		const hardUnknown = evaluation.conditions.filter(
 			(condition) => condition.priority === "hard" && condition.status === "UNKNOWN",
 		);
-		if (hardUnknown.length === 0) {
+		if (hardUnknown.length === 0 && deps.config.judge.consultOnCompletion !== "always") {
 			deps.state.recordAllowed(action.id, checkpointId);
 			return { allowed: true, checkpoint, plan };
 		}
-		checkpointForJudge = { ...checkpoint, relatedRequirements: hardUnknown.map((condition) => condition.id) };
+		settledOnly = hardUnknown.length === 0;
+		settledRequirements = new Set(evaluation.conditions.filter((condition) => condition.status === "SATISFIED").map((condition) => condition.id));
+		const hardIds = evaluation.conditions.filter((condition) => condition.priority === "hard").map((condition) => condition.id);
+		checkpointForJudge = { ...checkpoint, relatedRequirements: settledOnly ? hardIds : hardUnknown.map((condition) => condition.id) };
 	}
 
 	// --- judge ---
@@ -466,6 +478,7 @@ async function runGate(args: {
 		action,
 		...(agentAssessment ? { agentAssessment } : {}),
 		...(signal ? { signal } : {}),
+		...(settledRequirements ? { settledRequirements } : {}),
 	});
 
 	deps.state.emit("judge_requested", {
@@ -524,6 +537,16 @@ async function runGate(args: {
 	}
 
 	// --- decide ---
+	if (settledOnly && decision.decision !== "FAIL") {
+		deps.state.recordAllowed(action.id, checkpointId);
+		log.info("completion confirmed: all conditions settled, the Judge found no violation", {
+			checkpointId,
+			judge: decision.judgeId,
+			verdict: decision.decision,
+			confidence: decision.confidence,
+		});
+		return { allowed: true, decision, checkpoint, plan };
+	}
 	if (decision.decision === "PASS") {
 		deps.state.recordAllowed(action.id, checkpointId);
 		log.info("checkpoint passed", { checkpointId, judge: decision.judgeId, confidence: decision.confidence });

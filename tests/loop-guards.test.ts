@@ -787,8 +787,8 @@ describe("Sixth live run: completion gets real evidence for prose conditions", (
 			assert.equal(evidence?.trust, "model_interpretation");
 			assert.equal(evidence?.result, "supported");
 			assert.ok(
-				judge.calls.every((q) => !q.requirements.some((r) => r.id === "r2")),
-				"a condition the reviewer verified from the content is settled; the Judge is not asked to second-guess it",
+				judge.calls.every((q) => q.requirements.filter((r) => r.id === "r2").every((r) => r.settled)),
+				"a condition the reviewer verified from the content reaches the Judge only as settled context, never for re-scoring",
 			);
 			const settled = state.getState().lastCompletionEvaluation?.conditions.find((c) => c.id === "r2");
 			assert.equal(settled?.status, "SATISFIED");
@@ -1043,5 +1043,106 @@ describe("Clean run 1: a progress ticker whose context died must not crash Pi", 
 		await new Promise((resolve) => setTimeout(resolve, 1100));
 		assert.equal(calls, 1, "no further ticks after the callback failed");
 		ticker.stop();
+	});
+});
+
+describe("Clean run 1: the Judge is always consulted at completion, in a bounded role", () => {
+	const settledContract = () =>
+		contract({
+			requirements: [{ id: "r1", description: "notes/glossary.md has five terms", source: "user", priority: "hard", status: "pending", verification: [] }],
+			constraints: [{ id: "c1", description: "No file outside notes/ is created", source: "user", priority: "hard" }],
+		});
+	const reviewer = createStubModelAdapter(() => "VERIFIED — five bullet terms are present.");
+	const settle = (state: ReturnType<typeof createStateManager>) => {
+		recordWork(state, "notes/glossary.md");
+	};
+
+	test("a settled completion still costs one Judge call; a low score on a settled item does not reject", async () => {
+		const c = settledContract();
+		const paths = tempPaths();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const judge = scriptedJudge((query) => ({
+			decision: "MORE_EVIDENCE",
+			confidence: 0.2,
+			detail: { requirementSupport: Object.fromEntries(query.requirements.map((r) => [r.id, 0.05])) },
+		}));
+		const config = testConfig();
+		const core = createHarnessCore({
+			config, paths, state,
+			detector: createCheckpointDetector({ config, judge }),
+			planner: createEvidencePlanner(),
+			collector: createEvidenceCollector({ reviewer }),
+			judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+			progress: createProgressMonitor({ config }),
+			logger: nullLogger,
+		});
+		try {
+			settle(state);
+			const outcome = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(judge.calls.length, 1, "the Judge saw the completion");
+			assert.deepEqual(judge.calls[0]!.requirements.map((r) => [r.id, r.settled]), [["r1", true]]);
+			assert.equal(outcome.allowed, true, "its opinion on a settled condition is recorded, not applied");
+			assert.equal(state.getState().phase, "completed");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("a constraint violation found by the Judge vetoes a settled completion", async () => {
+		const c = settledContract();
+		const paths = tempPaths();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const judge = scriptedJudge(() => ({
+			decision: "FAIL",
+			confidence: 0.9,
+			detail: { requirementSupport: { r1: 0.95 }, constraintViolation: { c1: 0.92 } },
+		}));
+		const config = testConfig();
+		const core = createHarnessCore({
+			config, paths, state,
+			detector: createCheckpointDetector({ config, judge }),
+			planner: createEvidencePlanner(),
+			collector: createEvidenceCollector({ reviewer }),
+			judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+			progress: createProgressMonitor({ config }),
+			logger: nullLogger,
+		});
+		try {
+			settle(state);
+			const outcome = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(outcome.allowed, false);
+			assert.match(outcome.message ?? "", /c1|No file outside notes/);
+			assert.notEqual(state.getState().phase, "completed");
+		} finally {
+			paths.cleanup();
+		}
+	});
+
+	test("with consultOnCompletion = when_undetermined a settled completion passes without a Judge call", async () => {
+		const c = settledContract();
+		const paths = tempPaths();
+		const state = createStateManager(c.id, c, { persist: false });
+		state.lockContract(c);
+		const judge = scriptedJudge(() => ({ decision: "FAIL", confidence: 0.9 }));
+		const config = testConfig({ judge: { ...testConfig().judge, consultOnCompletion: "when_undetermined" } });
+		const core = createHarnessCore({
+			config, paths, state,
+			detector: createCheckpointDetector({ config, judge }),
+			planner: createEvidencePlanner(),
+			collector: createEvidenceCollector({ reviewer }),
+			judge: createJudgeRouter({ primary: judge, fallbacks: [], config: config.judge }),
+			progress: createProgressMonitor({ config }),
+			logger: nullLogger,
+		});
+		try {
+			settle(state);
+			const outcome = await core.gateCompletion({ cwd: paths.configDir });
+			assert.equal(outcome.allowed, true);
+			assert.equal(judge.calls.length, 0);
+		} finally {
+			paths.cleanup();
+		}
 	});
 });

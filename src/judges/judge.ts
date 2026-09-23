@@ -64,7 +64,14 @@ export interface JudgeQuery {
 	 * ever produce linked runtime evidence, so a Judge that cannot reason must hand the
 	 * item to a human rather than demand the impossible.
 	 */
-	readonly requirements: ReadonlyArray<{ id: string; description: string; priority: "hard" | "soft"; verifiable?: boolean }>;
+	readonly requirements: ReadonlyArray<{
+		id: string;
+		description: string;
+		priority: "hard" | "soft";
+		verifiable?: boolean;
+		/** Already settled by a harness check or the reviewer; shown for context, never re-scored. */
+		settled?: boolean;
+	}>;
 	/** Hard constraints to check the proposed action against, by id. */
 	readonly constraints: ReadonlyArray<{ id: string; description: string }>;
 	readonly checkpointType: string;

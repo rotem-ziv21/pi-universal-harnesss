@@ -558,6 +558,7 @@ Global config lives outside the repository and contains **no secrets**:
     "modelFallbackTimeoutMs": 90000,     // budget per attempt for the chat-model fallback Judge
     "modelFallbackRepairAttempts": 1,
     "fallbackChain": ["model", "deterministic"],
+    "consultOnCompletion": "always",      // every completion is put to the Judge; it can veto with a violation, never re-scores settled conditions
     "failurePolicy": { "critical": "user_review", "noncritical": "fallback" },
     "thresholds": {
       "requirementSupported": 0.75,

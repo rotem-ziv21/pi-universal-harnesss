@@ -54,12 +54,15 @@ export interface BuildPayloadArgs {
 	/** Untrusted worker opinion, if it offered one. */
 	readonly agentAssessment?: string | undefined;
 	readonly signal?: AbortSignal | undefined;
+	/** Condition ids the harness has already settled; carried to the Judge as `settled`. */
+	readonly settledRequirements?: ReadonlySet<string> | undefined;
 }
 
 export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	const { contract, state, checkpoint, action } = args;
 
 	const relevantIds = new Set(checkpoint.relatedRequirements);
+	const settled = (id: string) => args.settledRequirements?.has(id) ?? false;
 
 	/**
 	 * What must this checkpoint prove?
@@ -74,7 +77,7 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	 * evidence would be filtered straight back out and the Judge would be asked to
 	 * approve an irreversible action with nothing in front of it.
 	 */
-	const requirements: Array<{ id: string; description: string; priority: "hard" | "soft"; verifiable: boolean }> = [];
+	const requirements: Array<{ id: string; description: string; priority: "hard" | "soft"; verifiable: boolean; settled: boolean }> = [];
 	const verifiable = (item: { verification?: readonly unknown[] }) => (item.verification?.length ?? 0) > 0;
 
 	/**
@@ -85,12 +88,12 @@ export function buildJudgeQuery(args: BuildPayloadArgs): JudgeQuery {
 	 * says "p=0.06" would override runtime truth with an opinion, and did.
 	 */
 	for (const r of contract.requirements) {
-		if (relevantIds.has(r.id)) requirements.push({ id: r.id, description: r.description, priority: r.priority, verifiable: verifiable(r) });
+		if (relevantIds.has(r.id)) requirements.push({ id: r.id, description: r.description, priority: r.priority, verifiable: verifiable(r), settled: settled(r.id) });
 	}
 
 	for (const s of contract.successConditions) {
 		if (relevantIds.has(s.id)) {
-			requirements.push({ id: s.id, description: s.description, priority: s.priority, verifiable: verifiable(s) });
+			requirements.push({ id: s.id, description: s.description, priority: s.priority, verifiable: verifiable(s), settled: settled(s.id) });
 		}
 	}
 

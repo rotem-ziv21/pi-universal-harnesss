@@ -94,7 +94,8 @@ describe("A. local file and code workflow", () => {
 			assert.deepEqual(calls, [
 				{ program: "node", args: ["tools/verify-widget.mjs", "dist/widget.bin"], cwd: paths.configDir },
 			]);
-			assert.equal(judge.calls.length, 0);
+			assert.equal(judge.calls.length, 1, "a settled completion is still put to the Judge once, for a violation check");
+			assert.ok(judge.calls[0]!.requirements.every((r) => r.settled), "every condition is flagged as settled");
 			assert.equal(state.getState().evidence[0]?.result, "supported");
 			assert.equal(state.getState().evidence[0]?.provenance, "explicit_contract_strategy");
 		} finally {
@@ -168,7 +169,8 @@ describe("C. non-code artifact workflow", () => {
 			core.recordToolResult({ actionId: proposed.id, summary: "cover rendered", isError: false });
 			const completion = await core.gateCompletion({ cwd: paths.configDir });
 			assert.equal(completion.allowed, true);
-			assert.equal(judge.calls.length, 0);
+			assert.equal(judge.calls.length, 1);
+			assert.ok(judge.calls[0]!.requirements.every((r) => r.settled));
 			assert.equal(state.getState().workspace.resources[0]?.kind, "artifact");
 			assert.equal(state.getState().workspace.resources[0]?.provenance, "created_by_current_task");
 		} finally {
@@ -248,7 +250,8 @@ describe("CSV reproduction paired with unrelated verification", () => {
 			recordWork(state);
 			const completion = await core.gateCompletion({ cwd: paths.configDir });
 			assert.equal(completion.allowed, true);
-			assert.equal(judge.calls.length, 0);
+			assert.equal(judge.calls.length, 1);
+			assert.ok(judge.calls[0]!.requirements.every((r) => r.settled));
 		} finally {
 			paths.cleanup();
 		}
