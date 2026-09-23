@@ -163,14 +163,18 @@ function createAdapter(args: {
 				 */
 				const kinds = [...new Set((response.content ?? []).map((c) => c.type))];
 				const usage = normalizeUsage(response.usage);
-				throw new HarnessError(
-					"MODEL_OUTPUT_UNPARSEABLE",
-					`Model ${id} returned no text content` +
-						(kinds.length > 0 ? ` (only ${kinds.join(", ")} blocks` : " (empty reply") +
-						(usage?.output !== undefined ? `, ${usage.output} output tokens)` : ")") +
-						".",
-					{ retryable: true, details: { model: id, blocks: kinds, ...(usage ? { usage } : {}) } },
-				);
+				// Pi reports a provider failure as a message with stopReason "error", not a throw.
+				const { stopReason, errorMessage } = response as { stopReason?: string; errorMessage?: string };
+				const detail =
+					errorMessage
+						? ` provider error: ${errorMessage.slice(0, 300)}`
+						: (kinds.length > 0 ? ` (only ${kinds.join(", ")} blocks` : " (empty reply") +
+							(stopReason ? `, stop reason ${stopReason}` : "") +
+							(usage?.output !== undefined ? `, ${usage.output} output tokens)` : ")");
+				throw new HarnessError("MODEL_OUTPUT_UNPARSEABLE", `Model ${id} returned no text content;${detail}.`, {
+					retryable: true,
+					details: { model: id, blocks: kinds, ...(stopReason ? { stopReason } : {}), ...(errorMessage ? { errorMessage } : {}), ...(usage ? { usage } : {}) },
+				});
 			}
 
 			return { text, model: id, usage: normalizeUsage(response.usage) };
