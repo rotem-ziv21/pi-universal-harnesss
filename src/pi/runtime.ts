@@ -384,11 +384,35 @@ export function createRuntime(deps: RuntimeDeps): HarnessRuntime {
 					}
 				}
 			} catch (e) {
-				// §limitation 5: degrade honestly rather than fabricating a contract.
-				logger.error("contract compilation failed", { error: errorMessage(e) });
-				contract = degradedContract(compilerInput, errorMessage(e));
-				degraded = true;
-				reviewNotes.push(`Contract compilation failed: ${errorMessage(e)}. Running with generic gating only.`);
+				/**
+				 * A pinned compiler that cannot answer is not a reason to run without a
+				 * contract while a working model sits in the session. Try that one once;
+				 * a contract from the session model beats generic gating. Only when it
+				 * fails too does the harness degrade — honestly, never by fabricating.
+				 */
+				const fallback = sessionFallbackAdapter(host, modelAdapter.id);
+				if (fallback) {
+					logger.warn("contract compilation failed; retrying on the session model", { error: errorMessage(e), fallback: fallback.id });
+					reviewNotes.push(`Compiler ${modelAdapter.id} failed (${errorMessage(e)}); the contract was compiled by ${fallback.id} instead.`);
+					try {
+						const fallbackProgress = makeProgress(onProgress, fallback.id);
+						contract = await createTaskCompiler(fallback, { logger, maxRepairAttempts: 1, timeoutMs: config.compiler.timeoutMs }).compile({
+							...compilerInput,
+							onAttempt: fallbackProgress("Compiling the Task Contract (fallback model)"),
+						});
+					} catch (fallbackError) {
+						logger.error("contract compilation failed", { error: errorMessage(fallbackError), first: errorMessage(e) });
+						contract = degradedContract(compilerInput, errorMessage(fallbackError));
+						degraded = true;
+						reviewNotes.push(`Contract compilation failed: ${errorMessage(fallbackError)}. Running with generic gating only.`);
+					}
+				} else {
+					// §limitation 5: degrade honestly rather than fabricating a contract.
+					logger.error("contract compilation failed", { error: errorMessage(e) });
+					contract = degradedContract(compilerInput, errorMessage(e));
+					degraded = true;
+					reviewNotes.push(`Contract compilation failed: ${errorMessage(e)}. Running with generic gating only.`);
+				}
 			} finally {
 				ticker.stop();
 			}
@@ -599,7 +623,7 @@ interface ProviderRefLike {
 	model?: string | undefined;
 	maxRepairAttempts?: number | undefined;
 	timeoutMs?: number | undefined;
-	reasoning?: "minimal" | "low" | "medium" | "high" | undefined;
+	reasoning?: "off" | "minimal" | "low" | "medium" | "high" | undefined;
 	maxOutputTokens?: number | undefined;
 }
 
@@ -610,6 +634,13 @@ function buildAdapter(host: PiModelHost, ref: ProviderRefLike): ModelAdapter {
 		return createPinnedModelAdapter(host, ref.provider, ref.model, defaults);
 	}
 	return createCurrentModelAdapter(host, defaults);
+}
+
+/** The session's own model, when it is a different, available model from the one that just failed. */
+function sessionFallbackAdapter(host: PiModelHost, failedId: string): ModelAdapter | undefined {
+	const current = createCurrentModelAdapter(host, { reasoning: "off", maxTokens: 32_000 });
+	if (!current.available || current.id === failedId) return undefined;
+	return current;
 }
 
 /** A stable task id for callers that need one before compilation. */

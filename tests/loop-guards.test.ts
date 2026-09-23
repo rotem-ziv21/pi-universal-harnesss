@@ -853,7 +853,7 @@ describe("Harness model calls do not deliberate", () => {
 			await rt.startTask({ request: "Write a summary of the three databases for me please", cwd: paths.configDir, availableTools: [] });
 			assert.ok(seen.length >= 1);
 			assert.equal(seen[0]!.reasoning, "minimal", "a schema-bound JSON call does not need 20k tokens of thinking");
-			assert.equal(seen[0]!.maxTokens, 8000);
+			assert.equal(seen[0]!.maxTokens, 16000);
 			assert.equal(seen[0]!.cacheRetention, "none");
 		} finally {
 			paths.cleanup();
@@ -973,5 +973,34 @@ describe("Shorty run: exercising the task's own local server is not an external 
 		assert.notEqual(named.actionType, "external_mutation");
 		const remote = classifyAction("bash", { command: `curl -X POST -d '{}' https://api.example.com/links` }, { cwd: "/work" });
 		assert.equal(remote.actionType, "external_mutation");
+	});
+});
+
+describe("Shorty run: an empty reply from a thinking model is retried, not fatal", () => {
+	test("completeStructured turns thinking off and enlarges the budget on the second attempt", async () => {
+		const { completeStructured } = await import("../src/models/structured.ts");
+		const { HarnessError } = await import("../src/util/errors.ts");
+		const { Type } = await import("typebox");
+		const seen: Array<{ reasoning?: string; maxTokens?: number }> = [];
+		const adapter = {
+			id: "openrouter/z-ai/glm-5.3",
+			available: true,
+			async complete(request: { reasoning?: string; maxTokens?: number }) {
+				seen.push({ reasoning: request.reasoning, maxTokens: request.maxTokens });
+				if (seen.length === 1) throw new HarnessError("MODEL_OUTPUT_UNPARSEABLE", "Model returned no text content (only thinking blocks, 8000 output tokens).", { retryable: true });
+				return { text: '{"answer":"yes"}', model: "openrouter/z-ai/glm-5.3" };
+			},
+		};
+		const result = await completeStructured<{ answer: string }>(adapter, {
+			systemPrompt: "s",
+			userPrompt: "u",
+			schema: Type.Object({ answer: Type.String() }),
+			maxRepairAttempts: 2,
+		});
+		assert.equal(result.value.answer, "yes");
+		assert.equal(result.attempts, 2);
+		assert.equal(seen[0]?.reasoning, undefined, "first attempt uses the role's defaults");
+		assert.equal(seen[1]?.reasoning, "off");
+		assert.ok((seen[1]?.maxTokens ?? 0) >= 16_000, "the retry has room for the document");
 	});
 });

@@ -11,7 +11,7 @@ import { HarnessError } from "../util/errors.ts";
  * adapter deliberately exposes the smallest possible surface: one text completion.
  */
 
-export type ReasoningLevel = "minimal" | "low" | "medium" | "high";
+export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high";
 
 export interface ModelRequest {
 	readonly systemPrompt: string;
@@ -156,7 +156,21 @@ function createAdapter(args: {
 				.trim();
 
 			if (!text) {
-				throw new HarnessError("MODEL_OUTPUT_UNPARSEABLE", `Model ${id} returned no text content.`, { retryable: true });
+				/**
+				 * A reasoning model that spends its whole output budget thinking returns
+				 * a thinking block and no text. Say so, with the usage, so the caller can
+				 * retry with thinking off and a larger budget instead of giving up.
+				 */
+				const kinds = [...new Set((response.content ?? []).map((c) => c.type))];
+				const usage = normalizeUsage(response.usage);
+				throw new HarnessError(
+					"MODEL_OUTPUT_UNPARSEABLE",
+					`Model ${id} returned no text content` +
+						(kinds.length > 0 ? ` (only ${kinds.join(", ")} blocks` : " (empty reply") +
+						(usage?.output !== undefined ? `, ${usage.output} output tokens)` : ")") +
+						".",
+					{ retryable: true, details: { model: id, blocks: kinds, ...(usage ? { usage } : {}) } },
+				);
 			}
 
 			return { text, model: id, usage: normalizeUsage(response.usage) };

@@ -546,7 +546,7 @@ Global config lives outside the repository and contains **no secrets**:
 ```jsonc
 {
   "enabled": true,
-  "compiler":        { "provider": "current-pi-model", "reasoning": "minimal", "maxOutputTokens": 8000 },
+  "compiler":        { "provider": "current-pi-model", "reasoning": "minimal", "maxOutputTokens": 16000 },
   "contractReviewer": { "provider": "current-pi-model", "enabled": true, "reasoning": "minimal" },
   "judge": {
     "enabled": true,

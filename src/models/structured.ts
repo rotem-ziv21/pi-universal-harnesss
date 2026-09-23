@@ -43,6 +43,9 @@ export interface StructuredResult<T> {
 /** Generous: a large local model on modest hardware is slow, not broken. */
 const DEFAULT_TIMEOUT_MS = 180_000;
 
+/** Output budget for the retry after an empty reply: room for the document with thinking off. */
+const EMPTY_REPLY_RETRY_MAX_TOKENS = 32_000;
+
 const JSON_DISCIPLINE = [
 	"OUTPUT FORMAT — this is not negotiable:",
 	"- Reply with exactly one JSON document and nothing else.",
@@ -75,6 +78,7 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 
 	let userPrompt = request.userPrompt;
 	let lastError = "";
+	let override: Pick<ModelRequest, "reasoning" | "maxTokens"> | undefined;
 	let totalUsage: { input?: number; output?: number } | undefined;
 
 	const totalAttempts = maxRepairs + 1;
@@ -98,10 +102,24 @@ export async function completeStructured<T>(adapter: ModelAdapter, request: Stru
 				systemPrompt,
 				userPrompt,
 				signal: combineSignals(request.signal, timeout.signal),
+				...(override ?? {}),
 			};
 			response = await adapter.complete(modelRequest);
 		} catch (e) {
 			if (request.signal?.aborted) throw new HarnessError("ABORTED", "Structured model call aborted.");
+			/**
+			 * No text came back. With a reasoning model this almost always means the
+			 * thinking ate the output budget (GLM did exactly that: 8k tokens of
+			 * deliberation, zero tokens of JSON, three compilations in a row). That is a
+			 * request-shape problem, not a model problem, so the next attempt turns
+			 * thinking off and gives the answer room. Only then is the failure real.
+			 */
+			if (e instanceof HarnessError && e.code === "MODEL_OUTPUT_UNPARSEABLE" && attempt < totalAttempts) {
+				lastError = e.message;
+				override = { reasoning: "off", maxTokens: EMPTY_REPLY_RETRY_MAX_TOKENS };
+				log?.warn("structured output: empty reply; retrying with thinking off", { attempt, model: adapter.id, error: e.message });
+				continue;
+			}
 			if (timeout.signal.aborted) {
 				const seconds = Math.round((request.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000);
 				throw new HarnessError(

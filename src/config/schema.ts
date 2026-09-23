@@ -107,9 +107,9 @@ const providerRefFields = {
 	 * 138 seconds, most of it thinking. Minimal is the default; raise it for a
 	 * role if its output quality actually suffers.
 	 */
-	reasoning: Type.Union([Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], { default: "minimal" }),
+	reasoning: Type.Union([Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], { default: "minimal" }),
 	/** Hard cap on output tokens per call. A contract or review fits comfortably. */
-	maxOutputTokens: Type.Integer({ default: 8_000, minimum: 500, maximum: 200_000 }),
+	maxOutputTokens: Type.Integer({ default: 16_000, minimum: 500, maximum: 200_000 }),
 };
 
 export const ProviderRefSchema = Type.Object(providerRefFields, { default: {} });
