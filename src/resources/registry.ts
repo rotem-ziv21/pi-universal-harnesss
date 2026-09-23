@@ -45,6 +45,16 @@ export function isTempUri(uri: string): boolean {
 	return TEMP_SCOPES.some((scope) => uriWithin(uri, scope));
 }
 
+/**
+ * Scratch: in the temp directory and not inside the task's own workspace. A
+ * workspace that itself lives under /tmp (test fixtures, throwaway checkouts)
+ * is still the workspace; its files are deliverables, not scratch.
+ */
+export function isScratchUri(uri: string, workspace: TaskWorkspaceState): boolean {
+	if (!isTempUri(uri)) return false;
+	return !workspace.allowedScopes.some((scope) => uriWithin(uri, scope));
+}
+
 export function resourcePath(uri: string): string | undefined {
 	if (!uri.startsWith("file:")) return undefined;
 	try {

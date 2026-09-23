@@ -4,7 +4,7 @@ import type { Judge } from "../judges/judge.ts";
 import type { HarnessState } from "../state/types.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
-import { isTempUri } from "../resources/registry.ts";
+import { isScratchUri } from "../resources/registry.ts";
 import {
 	constraintRiskSignals,
 	contractCriticalActionSignals,
@@ -101,7 +101,7 @@ export function createCheckpointDetector(options: {
 			 * a creation there is not what any such constraint is about. Deletions
 			 * and out-of-scope effects are unaffected.
 			 */
-			const scratchOnly = isScratchConstruction(action);
+			const scratchOnly = isScratchConstruction(action, state.workspace);
 			for (const constraint of contract.constraints) {
 				if (constraint.priority !== "hard" || constraint.policy?.effect !== "forbid") continue;
 				if (scratchOnly) continue;
@@ -131,6 +131,9 @@ export function createCheckpointDetector(options: {
 			directSignals.push(...protectedPathSignals(protectedPaths, action));
 			if (directSignals.length > 0) {
 				return { ...decide(directSignals, false), policyDecision: "block" };
+			}
+			if (scratchOnly) {
+				return { ...NO_GATE, reason: "Scratch work in the temp directory; no contract policy or relevance applies." };
 			}
 			if (policySignals.length > 0) {
 				const decision = decide(policySignals, false);
@@ -253,10 +256,10 @@ export function createCheckpointDetector(options: {
  * workspace; scratch is neither, so they do not apply. Anything outside temp
  * in the same command brings the policies back for the whole action.
  */
-function isScratchConstruction(action: ProposedAction): boolean {
+function isScratchConstruction(action: ProposedAction, workspace: HarnessState["workspace"]): boolean {
 	const mutating = action.actionSemantics.effects.filter((effect) => !["read", "query", "execute"].includes(effect.operation));
 	if (mutating.length === 0) return false;
-	return mutating.every((effect) => isTempUri(effect.uri));
+	return mutating.every((effect) => isScratchUri(effect.uri, workspace));
 }
 
 function isReversibleConstruction(action: ProposedAction): boolean {
