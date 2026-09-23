@@ -9,7 +9,7 @@ import { extractCompletionClaim, signatureOf, summarize, toProposedAction } from
 import { createProgressMonitor } from "../src/progress/monitor.ts";
 import { createStateManager } from "../src/state/state-manager.ts";
 import { nullLogger } from "../src/util/logger.ts";
-import { action, contract, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
+import { action, contract, recordWork, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
 
 /**
  * End-to-end gate behaviour (§45, §44).
@@ -218,6 +218,7 @@ describe("The completion gate (§44)", () => {
 			}),
 		});
 		try {
+			recordWork(state);
 			const outcome = await core.gateCompletion({ cwd: process.cwd() });
 
 			assert.equal(outcome.allowed, false);
@@ -241,6 +242,7 @@ describe("The completion gate (§44)", () => {
 			judgeResponse: () => ({ decision: "PASS", confidence: 0.97 }),
 		});
 		try {
+			recordWork(state);
 			const outcome = await core.gateCompletion({ cwd: process.cwd() });
 			assert.equal(outcome.allowed, true);
 			assert.equal(state.getState().phase, "completed");

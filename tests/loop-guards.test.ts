@@ -14,7 +14,7 @@ import { createRuntime } from "../src/pi/runtime.ts";
 import { createProgressMonitor } from "../src/progress/monitor.ts";
 import { createStateManager } from "../src/state/state-manager.ts";
 import { nullLogger } from "../src/util/logger.ts";
-import { action, contract, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
+import { action, contract, recordWork, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
 
 /**
  * Regression tests for the failure a live run exposed: the worker was sent round in
@@ -270,6 +270,7 @@ describe("The completion gate cannot loop", () => {
 	test("a verified completion is unaffected by the guard", async () => {
 		const { core, state, cleanup } = buildCore({ judgeResponse: () => ({ decision: "PASS", confidence: 0.97 }) });
 		try {
+			recordWork(state);
 			const outcome = await core.gateCompletion({ cwd: process.cwd() });
 			assert.equal(outcome.allowed, true);
 			assert.equal(state.getState().phase, "completed");
@@ -431,6 +432,7 @@ describe("Second live run: false positives that blocked correct work", () => {
 			logger: nullLogger,
 		});
 		try {
+			recordWork(state);
 			const outcome = await core.gateCompletion({ cwd: process.cwd() });
 			assert.deepEqual(executed, ["npm test"], "'npm test' with empty args is run as argv, not rejected");
 			const asked = judge.calls.at(-1)!.requirements.map((r) => r.id);
@@ -1002,5 +1004,26 @@ describe("Shorty run: an empty reply from a thinking model is retried, not fatal
 		assert.equal(seen[0]?.reasoning, undefined, "first attempt uses the role's defaults");
 		assert.equal(seen[1]?.reasoning, "off");
 		assert.ok((seen[1]?.maxTokens ?? 0) >= 16_000, "the retry has room for the document");
+	});
+});
+
+describe("Shorty run: a turn with no tool call is nudged automatically", () => {
+	test("first idle turn: rejected without evidence or Judge, worker resumed; second idle turn: halted to the user", async () => {
+		const c = contract({
+			requirements: [{ id: "r1", description: "src/store.js exists", source: "user", priority: "hard", status: "pending", verification: [] }],
+		});
+		let judgeCalls = 0;
+		const { core } = buildCore({ c, judgeResponse: () => { judgeCalls++; return { decision: "PASS", confidence: 0.9 }; } });
+		const first = await core.gateCompletion({ cwd: process.cwd() });
+		assert.equal(first.allowed, false);
+		assert.equal(first.resume, true, "the worker is sent back to act");
+		assert.match(first.message ?? "", /NO PROGRESS/);
+		assert.match(first.message ?? "", /write tool/);
+		assert.equal(judgeCalls, 0, "no Judge call for an idle turn");
+
+		const second = await core.gateCompletion({ cwd: process.cwd() });
+		assert.equal(second.allowed, false);
+		assert.equal(second.resume, false, "a second idle turn goes to the user");
+		assert.equal(judgeCalls, 0);
 	});
 });

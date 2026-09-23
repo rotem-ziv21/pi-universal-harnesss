@@ -21,7 +21,7 @@ import type { StateManager } from "../state/state-manager.ts";
 import type { CheckpointRecord, CompletionConditionResult, CompletionEvaluation, EvidenceRef } from "../state/types.ts";
 import { newCheckpointId, newDecisionId, newEvidenceId, nowIso } from "../util/ids.ts";
 import type { Logger } from "../util/logger.ts";
-import { renderBlock, renderCompletionHalt, renderCompletionRejection } from "./render.ts";
+import { renderBlock, renderCompletionHalt, renderCompletionRejection, renderNoActionNudge } from "./render.ts";
 
 /**
  * The gate.
@@ -265,6 +265,14 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 				};
 			};
 
+			/**
+			 * The worker ended its turn without calling a single tool. That is not a
+			 * completion claim to verify; it is a model planning in prose. Running the
+			 * full gate here spends reviewer and Judge calls to conclude "nothing was
+			 * done". Say that directly instead, and send the worker back to the tools.
+			 * The idle turn still counts as a rejection, so a second one halts to the
+			 * user through the same loop guard as any other no-progress rejection.
+			 */
 			deps.state.requestCompletion();
 
 			const evaluation = evaluateCompletionConditions({ contract, state: deps.state.getState() });
@@ -284,6 +292,12 @@ export function createHarnessCore(deps: HarnessCoreDeps): HarnessCore {
 			if (hardUnknown.length === 0) {
 				deps.state.completeTask();
 				return { allowed: true };
+			}
+			if (before.actions.length === 0) {
+				const message = renderNoActionNudge(hardUnknown);
+				deps.state.rejectCompletion(message);
+				log.warn("worker settled without any tool call; nudging it to act", { unverified: hardUnknown.length });
+				return halt({ allowed: false, message });
 			}
 
 			const detected = deps.detector.evaluateCompletion({ contract, state: deps.state.getState() });

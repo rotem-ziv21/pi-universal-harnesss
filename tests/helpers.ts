@@ -8,6 +8,7 @@ import type { HarnessPaths } from "../src/config/paths.ts";
 import type { HarnessConfig } from "../src/config/schema.ts";
 import type { TaskContract } from "../src/contract/schema.ts";
 import type { AssessQuery, Judge, JudgeDecision, JudgeQuery, JudgeStats } from "../src/judges/judge.ts";
+import type { RecordedAction } from "../src/state/types.ts";
 import { emptyStats } from "../src/judges/judge.ts";
 import { hashValue } from "../src/util/json.ts";
 
@@ -162,3 +163,15 @@ export const choiceAnswer = (choice: string, probabilities: Record<string, numbe
 	probabilities,
 	confidence,
 });
+
+/**
+ * Record one successful write so a completion gate sees a worker that did
+ * something. A gate reached with zero actions is an idle turn and is nudged
+ * instead of judged, so tests of the Judge path start from here.
+ */
+export function recordWork(state: { recordProposedAction(a: RecordedAction): void; recordAllowed(id: string): void; recordToolResult(id: string, s: string, e: boolean): void; getVersion(): number }, path = "src/work.js"): void {
+	const write = action("write", { path, content: "export const done = true;\n" });
+	state.recordProposedAction({ ...write, at: new Date().toISOString(), stateVersion: state.getVersion(), outcome: "pending" });
+	state.recordAllowed(write.id);
+	state.recordToolResult(write.id, "written", false);
+}

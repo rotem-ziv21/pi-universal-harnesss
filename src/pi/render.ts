@@ -156,6 +156,24 @@ export function renderCompletionRejection(args: {
  * Written for the user as much as for the worker: the worker will not be restarted
  * by this message, so it must explain what happened and what the user can do.
  */
+/** The worker ended a turn with prose only. Planning is not progress; the tools are. */
+export function renderNoActionNudge(pending: ReadonlyArray<{ id: string; description: string }>): string {
+	return [
+		"NO PROGRESS — this turn made no tool call.",
+		"",
+		"Reasoning in text is not work the harness can see or verify. Nothing has been",
+		"created, edited or run yet, and these conditions of the task are still open:",
+		...pending.slice(0, 8).map((item) => `  - ${item.id}: ${item.description}`),
+		"",
+		"Start now:",
+		"  - create files with the write tool and change them with the edit tool,",
+		"  - run commands (tests, listings, checks) with bash,",
+		"  - keep each step small and let the tool results guide the next one.",
+		"",
+		"Do not restate the plan. The next turn must contain tool calls.",
+	].join("\n");
+}
+
 export function renderCompletionHalt(args: { reason: string; rejection: string }): string {
 	return [
 		"COMPLETION NOT VERIFIED — the harness has stopped the verify/retry loop.",

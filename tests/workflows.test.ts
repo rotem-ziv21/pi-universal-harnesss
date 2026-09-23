@@ -13,7 +13,7 @@ import { createHarnessCore } from "../src/pi/harness.ts";
 import { createProgressMonitor } from "../src/progress/monitor.ts";
 import { createStateManager } from "../src/state/state-manager.ts";
 import { nullLogger } from "../src/util/logger.ts";
-import { action, contract, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
+import { action, contract, recordWork, scriptedJudge, tempPaths, testConfig } from "./helpers.ts";
 
 const config = testConfig();
 
@@ -243,8 +243,9 @@ describe("CSV reproduction paired with unrelated verification", () => {
 				},
 			],
 		});
-		const { core, judge } = createCore(c, paths, async () => ({ stdout: "0\n", stderr: "", exitCode: 0 }));
+		const { core, judge, state } = createCore(c, paths, async () => ({ stdout: "0\n", stderr: "", exitCode: 0 }));
 		try {
+			recordWork(state);
 			const completion = await core.gateCompletion({ cwd: paths.configDir });
 			assert.equal(completion.allowed, true);
 			assert.equal(judge.calls.length, 0);
