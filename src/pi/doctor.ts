@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { displayPath, discoverConfigDirName, type HarnessPaths, isWritable, pathExists } from "../config/paths.ts";
 import type { HarnessConfig } from "../config/schema.ts";
-import type { JudgeRouter } from "../judges/router.ts";
 import { checkPermissions, describeSource, type ResolvedSecret } from "../security/secrets.ts";
 import { errorMessage } from "../util/errors.ts";
 
@@ -27,7 +26,6 @@ export interface Check {
 export interface DoctorArgs {
 	readonly paths: HarnessPaths;
 	readonly config: HarnessConfig;
-	readonly judge: JudgeRouter;
 	readonly secret: ResolvedSecret;
 	/** Skip everything except Judge reachability — used right after `/harness setup`. */
 	readonly onlyJudge?: boolean;
@@ -118,32 +116,16 @@ function stateChecks(args: DoctorArgs): Check[] {
 	if (ephemeral) checks.push(ephemeral);
 
 	checks.push({
-		name: "Persistence",
-		status: args.config.state.persist ? "PASS" : "WARN",
-		detail: args.config.state.persist
-			? `Enabled; snapshots every ${args.config.state.snapshotEveryEvents} events`
-			: "Disabled in config — state will not survive a Pi restart.",
-		...(args.config.state.persist ? {} : { fix: 'Set "state": {"persist": true} in the harness config to keep task history.' }),
-	});
-
-	checks.push({
 		name: "Harness enabled",
 		status: args.config.enabled ? "PASS" : "WARN",
 		detail: args.config.enabled ? "The harness is enabled." : "The harness is disabled; no gating is performed.",
 		...(args.config.enabled ? {} : { fix: "Run /harness enable, then /reload." }),
 	});
 
-	// A fail-open critical policy silently disables the harness's core promise.
-	const criticalPolicy = args.config.judge.failurePolicy.critical;
 	checks.push({
-		name: "Failure policy",
-		status: criticalPolicy === "fail_open" ? "WARN" : "PASS",
-		detail: `critical=${criticalPolicy}, noncritical=${args.config.judge.failurePolicy.noncritical}`,
-		...(criticalPolicy === "fail_open"
-			? {
-					fix: "critical=fail_open means critical actions proceed unverified whenever the Judge is down. Consider user_review or fail_closed.",
-				}
-			: {}),
+		name: "Mode",
+		status: args.config.mode === "enforce" ? "PASS" : "WARN",
+		detail: args.config.mode === "enforce" ? "enforce: risky actions are held and unverified completions are sent back once." : "observe: decisions are only logged (the deny list still applies).",
 	});
 
 	return checks;
@@ -204,15 +186,13 @@ async function judgeChecks(args: DoctorArgs): Promise<Check[]> {
 	const { judge: judgeConfig } = args.config;
 
 	if (!judgeConfig.enabled) {
-		return [{ name: "Judge", status: "WARN", detail: "The Judge is disabled in configuration; gating falls back to the deterministic engine." }];
+		return [{ name: "Judge", status: "WARN", detail: "The Judge is disabled in configuration; routine actions pass, flagged ones are held for you, and the done check is skipped." }];
 	}
 
-	const described = args.judge.describe();
 	checks.push({
 		name: "Judge configuration",
-		status: described.primary ? "PASS" : "WARN",
-		detail: `primary=${described.primary ?? "(none)"}, fallbacks=${described.fallbacks.join(" → ") || "(none)"}`,
-		...(described.primary ? {} : { fix: 'Set judge.provider to "openrouter" in the harness config.' }),
+		status: "PASS",
+		detail: `Jev model ${judgeConfig.model} at ${judgeConfig.baseUrl}${judgeConfig.decisionsPath}, budget ${judgeConfig.timeoutMs}ms per decision`,
 	});
 
 	if (!args.secret.value) {
@@ -278,7 +258,7 @@ async function judgeChecks(args: DoctorArgs): Promise<Check[]> {
 					detail: usable
 						? `${judgeConfig.model} answered in ${latency}ms via ${endpoint}`
 						: `The endpoint responded in ${latency}ms but the answer was not in the expected shape.`,
-					...(usable ? {} : { fix: "The decisions API may have changed shape. Check https://docs.typesafe.ai/api and the adapter in src/judges/openrouter-jev.ts." }),
+					...(usable ? {} : { fix: "The decisions API may have changed shape. Check https://docs.typesafe.ai/api and src/decide/jev.ts." }),
 				});
 			} else if (response.status === 401 || response.status === 403) {
 				checks.push({
@@ -310,7 +290,7 @@ async function judgeChecks(args: DoctorArgs): Promise<Check[]> {
 			name: "Judge connectivity",
 			status: "FAIL",
 			detail: `Could not reach ${endpoint}: ${errorMessage(e)}`,
-			fix: "Check network access and any proxy settings. The harness will use its fallback chain until this is resolved.",
+			fix: "Check network access and any proxy settings. Until then the harness passes routine actions and holds flagged ones for you.",
 		});
 	}
 

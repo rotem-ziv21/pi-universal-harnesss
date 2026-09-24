@@ -212,7 +212,7 @@ fi
 # --- 7. state directories -----------------------------------------------------
 
 step "Creating the state directory"
-run mkdir -p "$HARNESS_STATE_DIR/tasks"
+run mkdir -p "$HARNESS_STATE_DIR"
 if [ "$DRY_RUN" -eq 0 ]; then chmod 700 "$HARNESS_STATE_DIR" 2>/dev/null || true; fi
 ok "$HARNESS_STATE_DIR (mode 700)"
 
@@ -225,9 +225,9 @@ else
     cat > "$CONFIG_FILE" <<'JSON'
 {
   "enabled": true,
+  "mode": "enforce",
   "judge": {
     "enabled": true,
-    "provider": "openrouter",
     "baseUrl": "https://openrouter.ai/api",
     "decisionsPath": "/alpha/decisions",
     "model": "~typesafe/jev-latest"

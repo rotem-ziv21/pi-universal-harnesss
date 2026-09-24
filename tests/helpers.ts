@@ -1,177 +1,58 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyAction } from "../src/checkpoints/action-semantics.ts";
-import type { ProposedAction } from "../src/checkpoints/types.ts";
-import { defaultConfig } from "../src/config/loader.ts";
-import type { HarnessPaths } from "../src/config/paths.ts";
-import type { HarnessConfig } from "../src/config/schema.ts";
-import type { TaskContract } from "../src/contract/schema.ts";
-import type { AssessQuery, Judge, JudgeDecision, JudgeQuery, JudgeStats } from "../src/judges/judge.ts";
-import type { RecordedAction } from "../src/state/types.ts";
-import { emptyStats } from "../src/judges/judge.ts";
-import { hashValue } from "../src/util/json.ts";
-
-/** Shared fixtures. Nothing here touches the real Pi config directory. */
-
-export function tempPaths(): HarnessPaths & { cleanup(): void } {
-	const root = mkdtempSync(join(tmpdir(), "harness-test-"));
-	const harnessDir = join(root, "harness");
-
-	return {
-		configDir: root,
-		agentDir: join(root, "agent"),
-		extensionsDir: join(root, "agent", "extensions"),
-		harnessDir,
-		configFile: join(harnessDir, "config.json"),
-		secretsFile: join(harnessDir, "secrets.json"),
-		tasksDir: join(harnessDir, "tasks"),
-		activeTaskFile: join(harnessDir, "active-task.json"),
-		logFile: join(harnessDir, "harness.log"),
-		configDirName: ".pi",
-		cleanup: () => rmSync(root, { recursive: true, force: true }),
-	};
-}
-
-export function testConfig(overrides: Partial<HarnessConfig> = {}): HarnessConfig {
-	return { ...defaultConfig(), ...overrides };
-}
-
-export function action(toolName: string, input: Record<string, unknown>, summary?: string): ProposedAction {
-	return {
-		id: `act-${Math.random().toString(36).slice(2, 8)}`,
-		toolName,
-		input,
-		actionSemantics: classifyAction(toolName, input, { cwd: process.cwd() }),
-		summary: summary ?? `${toolName} ${JSON.stringify(input).slice(0, 80)}`,
-		signature: hashValue({ tool: toolName, input }),
-	};
-}
+import { createDecisionLog } from "../src/decide/decision-log.ts";
+import { createGates, type GatesConfig } from "../src/decide/gates.ts";
+import { createJevClient, type QuestionSet } from "../src/decide/jev.ts";
 
 /**
- * A minimal but structurally complete contract.
- *
- * Tests build on this rather than on a fixture from one domain, so that no test
- * accidentally encodes an assumption that only holds for, say, coding tasks.
+ * A stand-in for the decisions endpoint. `answer` receives the state and the
+ * question ids and returns a probability (noul) or an option (choice) per id.
  */
-export function contract(overrides: Partial<TaskContract> = {}): TaskContract {
-	return {
-		id: "task-test",
-		version: 1,
-		originalRequest: "test request",
-		goal: "test goal",
-		requirements: [],
-		constraints: [],
-		successConditions: [],
-		forbiddenConditions: [],
-		criticalActions: [],
-		ambiguities: [],
-		assumptions: [],
-		metadata: { createdAt: new Date().toISOString() },
-		...overrides,
-	};
+export type Responder = (state: any, questions: QuestionSet) => Record<string, number | string> | "fail";
+
+export interface FakeJev {
+	fetchImpl: typeof fetch;
+	calls: Array<{ state: any; questions: QuestionSet }>;
 }
 
-/** A Judge that returns exactly what a test tells it to. */
-export function scriptedJudge(
-	responder: (query: JudgeQuery) => Partial<JudgeDecision>,
-	options: { id?: string; available?: boolean; assess?: number } = {},
-): Judge & { calls: JudgeQuery[] } {
-	const calls: JudgeQuery[] = [];
-	let stats: JudgeStats = emptyStats();
-
-	return {
-		id: options.id ?? "scripted",
-		calls,
-		async isAvailable() {
-			return options.available !== false;
-		},
-		async evaluate(query) {
-			calls.push(query);
-			stats = { ...stats, calls: stats.calls + 1 };
-			const partial = responder(query);
-			return {
-				decision: "PASS",
-				confidence: 0.9,
-				reasons: [],
-				missingEvidence: [],
-				stateVersion: query.stateVersion,
-				judgeId: options.id ?? "scripted",
-				...partial,
-			};
-		},
-		async assess() {
-			stats = { ...stats, calls: stats.calls + 1 };
-			return options.assess ?? 0;
-		},
-		stats: () => stats,
-	};
+export function fakeJev(respond: Responder): FakeJev {
+	const calls: FakeJev["calls"] = [];
+	const fetchImpl = (async (_url: string, init: { body: string }) => {
+		const body = JSON.parse(init.body) as { state: unknown; questions: QuestionSet };
+		calls.push({ state: body.state, questions: body.questions });
+		const result = respond(body.state, body.questions);
+		if (result === "fail") return new Response("upstream error", { status: 503 });
+		const answers: Record<string, unknown> = {};
+		for (const [id, q] of Object.entries(body.questions)) {
+			const value = result[id];
+			if (q.type === "noul") answers[id] = { type: "noul", noul: typeof value === "number" ? value : 0.05 };
+			else {
+				const choice = typeof value === "string" ? value : Object.keys(q.criteria).at(-1)!;
+				answers[id] = { type: "choice", choice, probabilities: { [choice]: 0.9 }, confidence: 0.8 };
+			}
+		}
+		return new Response(JSON.stringify({ model: "typesafe/jev-test", answers, usage: { input_tokens: 100 } }), { status: 200 });
+	}) as unknown as typeof fetch;
+	return { fetchImpl, calls };
 }
 
-/** A Judge that always throws, for failure-policy tests. */
-export function brokenJudge(error: Error, id = "broken"): Judge {
-	return {
-		id,
-		async isAvailable() {
-			return true;
-		},
-		async evaluate() {
-			throw error;
-		},
-		async assess() {
-			throw error;
-		},
-		stats: () => emptyStats(),
-	};
-}
+export const DEFAULT_GATES: GatesConfig = {
+	mode: "enforce",
+	action: { destructiveConfirm: 0.8, exfiltrationBlock: 0.8, outwardConfirm: 0.85, offRequestConfirm: 0.9 },
+	done: { enabled: true, claimsDone: 0.7, applies: 0.5, maxNudgesPerPrompt: 1, maxNudgesPerSession: 3 },
+	stuckThreshold: 3,
+};
 
-/** Build a `fetch` that returns canned decisions-endpoint responses. */
-export function fakeFetch(
-	handler: (url: string, init: RequestInit) => { status?: number; body: unknown },
-): typeof fetch & { calls: Array<{ url: string; body: unknown }> } {
-	const calls: Array<{ url: string; body: unknown }> = [];
-
-	const impl = (async (input: string | URL | Request, init?: RequestInit) => {
-		const url = String(input);
-		const parsedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
-		calls.push({ url, body: parsedBody });
-
-		const result = handler(url, init ?? {});
-		const status = result.status ?? 200;
-
-		return {
-			ok: status >= 200 && status < 300,
-			status,
-			async json() {
-				return result.body;
-			},
-			async text() {
-				return typeof result.body === "string" ? result.body : JSON.stringify(result.body);
-			},
-		} as Response;
-	}) as typeof fetch & { calls: Array<{ url: string; body: unknown }> };
-
-	impl.calls = calls;
-	return impl;
-}
-
-export const noulAnswer = (value: number) => ({ type: "noul", noul: value });
-
-export const choiceAnswer = (choice: string, probabilities: Record<string, number>, confidence: number) => ({
-	type: "choice",
-	choice,
-	probabilities,
-	confidence,
-});
-
-/**
- * Record one successful write so a completion gate sees a worker that did
- * something. A gate reached with zero actions is an idle turn and is nudged
- * instead of judged, so tests of the Judge path start from here.
- */
-export function recordWork(state: { recordProposedAction(a: RecordedAction): void; recordAllowed(id: string): void; recordToolResult(id: string, s: string, e: boolean): void; getVersion(): number }, path = "src/work.js"): void {
-	const write = action("write", { path, content: "export const done = true;\n" });
-	state.recordProposedAction({ ...write, at: new Date().toISOString(), stateVersion: state.getVersion(), outcome: "pending" });
-	state.recordAllowed(write.id);
-	state.recordToolResult(write.id, "written", false);
+export function makeGates(respond: Responder, overrides: Partial<GatesConfig> = {}, options: { key?: string | undefined } = { key: "sk-test" }) {
+	const jev = fakeJev(respond);
+	const dir = mkdtempSync(join(tmpdir(), "harness-test-"));
+	const log = createDecisionLog(join(dir, "decisions.jsonl"));
+	const client = createJevClient({
+		config: { enabled: true, baseUrl: "https://example.test/api", decisionsPath: "/alpha/decisions", model: "~typesafe/jev-latest", timeoutMs: 2000 },
+		getApiKey: async () => options.key,
+		fetchImpl: jev.fetchImpl,
+	});
+	const gates = createGates({ config: { ...DEFAULT_GATES, ...overrides }, jev: client, log, cwd: "/work/project" });
+	return { gates, jev, log, dir };
 }

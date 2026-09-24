@@ -86,8 +86,8 @@ else
 fi
 
 if [ -d "$HARNESS_STATE_DIR" ] && [ -w "$HARNESS_STATE_DIR" ]; then
-  TASKS=$(find "$HARNESS_STATE_DIR/tasks" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-  pass "State directory" "$HARNESS_STATE_DIR is writable ($TASKS task record(s))"
+  DECISIONS=$(wc -l < "$HARNESS_STATE_DIR/decisions.jsonl" 2>/dev/null | tr -d ' ' || echo 0)
+  pass "State directory" "$HARNESS_STATE_DIR is writable (${DECISIONS:-0} logged decision(s))"
 elif [ -d "$HARNESS_STATE_DIR" ]; then
   fail "State directory" "$HARNESS_STATE_DIR is not writable"
   fix "chmod u+rwx \"$HARNESS_STATE_DIR\""
@@ -100,7 +100,7 @@ fi
 #
 # In a container, anything on the root overlay is destroyed when the container is
 # recreated; only mounted volumes survive. Harness state on the overlay silently
-# loses every task contract, the audit log and the stored key on the next restart,
+# loses the decision log and the stored key on the next restart,
 # and nothing else here would hint at it: the directory is present and writable.
 #
 # Generic by construction — detect a container, then find the mount point the state
@@ -118,7 +118,7 @@ if [ "$(uname -s)" = "Linux" ] && { [ -f /.dockerenv ] || [ -f /run/.containeren
     :
   elif [ "$STATE_MOUNT" = "/" ]; then
     warn "State survives a restart" "container detected, and state is on the root filesystem, not a mounted volume"
-    fix "Task contracts, the audit log and any stored key will be lost when the container is recreated."
+    fix "The decision log and any stored key will be lost when the container is recreated."
     fix "Before starting Pi:  export PI_CODING_AGENT_DIR=\"<volume>/.pi/agent\"  and  export PI_HARNESS_HOME=\"<volume>/.pi/agent/harness\""
     fix "Then re-run ./scripts/install.sh, and put those exports somewhere that runs on login."
   else
@@ -247,7 +247,7 @@ if [ -n "$OPENROUTER_KEY" ] && command -v curl >/dev/null 2>&1; then
         pass "Judge connectivity" "$MODEL answered via $ENDPOINT"
       else
         warn "Judge connectivity" "HTTP 200 but the answer was not in the expected shape"
-        fix "Check https://docs.typesafe.ai/api and src/judges/openrouter-jev.ts."
+        fix "Check https://docs.typesafe.ai/api and src/decide/jev.ts."
       fi ;;
     401|403)
       fail "Judge connectivity" "OpenRouter rejected the key (HTTP $STATUS)"

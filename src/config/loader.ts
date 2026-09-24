@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { HarnessError } from "../util/errors.ts";
 import { readJsonFile, writeJsonAtomic } from "../util/json.ts";
 import { formatIssues, withDefaults } from "../util/validate.ts";
-import { type HarnessConfig, HarnessConfigSchema, type ProjectConfig, ProjectConfigSchema } from "./schema.ts";
+import { type HarnessConfig, HarnessConfigSchema, LEGACY_KEYS, type ProjectConfig, ProjectConfigSchema } from "./schema.ts";
 import type { HarnessPaths } from "./paths.ts";
 
 /**
@@ -39,6 +39,11 @@ export function loadConfig(paths: HarnessPaths): LoadedConfig {
 		warnings.push(
 			"config.json contains judge.apiKey — it is ignored. Use OPENROUTER_API_KEY or `/harness setup`, and remove it.",
 		);
+	}
+
+	const legacy = isRecord(raw) ? LEGACY_KEYS.filter((key) => key in raw) : [];
+	if (legacy.length > 0) {
+		warnings.push(`config.json has settings from the previous harness that no longer apply (${legacy.join(", ")}); they are ignored.`);
 	}
 
 	const result = withDefaults<HarnessConfig>(HarnessConfigSchema, raw);
