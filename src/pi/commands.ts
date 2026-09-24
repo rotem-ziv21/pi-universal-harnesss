@@ -99,6 +99,9 @@ function evidenceText(rt: HarnessRuntime): string {
 	lines.push("", "Checks:");
 	for (const c of evidence.checks) lines.push(`  #${c.seq} ${c.passed ? "PASS" : "FAIL"} ${c.command} → ${c.summary}`);
 	if (evidence.checks.length === 0) lines.push("  (none)");
+	lines.push("", "Other commands (last 10):");
+	for (const o of evidence.observations.slice(-10)) lines.push(`  #${o.seq} ${o.ok ? "ok  " : "err "} ${o.command} → ${o.summary}`);
+	if (evidence.observations.length === 0) lines.push("  (none)");
 	return lines.join("\n");
 }
 

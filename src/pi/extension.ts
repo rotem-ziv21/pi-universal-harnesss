@@ -231,15 +231,15 @@ export function activate(pi: PiExtensionAPI): void {
 					lastStopReason = undefined;
 
 					if (outcome.kind === "nudge") {
-						if (ctx.hasUI) ctx.ui.notify("Harness: no passing check after the last change — sending the agent back once", "warning");
+						if (ctx.hasUI) ctx.ui.notify(`Harness: ${clamp(outcome.why, 120)} — sending the agent back once`, "warning");
 						pi.sendMessage({ customType: CUSTOM_TYPE_DONE, content: outcome.message, display: true }, { triggerTurn: true, deliverAs: "followUp" });
 						return;
 					}
 
-					if (ctx.hasUI) {
-						if (outcome.kind === "skip" && outcome.verified) ctx.ui.notify("Harness: done — a check passed after the last change.", "info");
-						// An accept always follows file changes with no passing check since.
-						else if (outcome.kind === "accept") ctx.ui.notify(`Harness: done, not verified — ${outcome.why}.`, "warning");
+					if (ctx.hasUI && outcome.kind === "accept") {
+						if (outcome.status === "verified") ctx.ui.notify(`Harness: done, verified — ${clamp(outcome.why, 160)}.`, "info");
+						else if (outcome.status === "partial") ctx.ui.notify(`Harness: done, partially verified — ${clamp(outcome.why, 200)}.`, "warning");
+						else ctx.ui.notify(`Harness: done, not verified — ${clamp(outcome.why, 200)}.`, "warning");
 					}
 				} finally {
 					doneGateRunning = false;

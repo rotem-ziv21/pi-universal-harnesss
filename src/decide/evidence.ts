@@ -27,10 +27,21 @@ export interface Check {
 	readonly summary: string;
 }
 
+/** A command that is neither a check nor a change: what it printed is still evidence (curl, ls, cat, node -e). */
+export interface Observation {
+	readonly seq: number;
+	readonly command: string;
+	readonly ok: boolean;
+	readonly summary: string;
+}
+
 export interface RunEvidence {
 	readonly mutations: readonly Mutation[];
 	readonly checks: readonly Check[];
+	readonly observations: readonly Observation[];
 }
+
+const MAX_OBSERVATIONS = 40;
 
 export interface ToolOutcome {
 	readonly toolName: string;
@@ -51,6 +62,7 @@ export function createEvidenceTracker(options: { extraCheckCommands?: readonly s
 	let seq = 0;
 	let mutations: Mutation[] = [];
 	let checks: Check[] = [];
+	let observations: Observation[] = [];
 	const extra = (options.extraCheckCommands ?? []).map(normalize).filter(Boolean);
 
 	return {
@@ -75,11 +87,16 @@ export function createEvidenceTracker(options: { extraCheckCommands?: readonly s
 			if (outcome.changed && outcome.changed.length > 0) {
 				mutations.push({ seq, tool, paths: outcome.changed.slice(0, 50) });
 			}
+			if (command) {
+				observations.push({ seq, command: clip(command, 200), ok: !outcome.isError, summary: observationSummary(outcome.output) });
+				if (observations.length > MAX_OBSERVATIONS) observations = observations.slice(-MAX_OBSERVATIONS);
+			}
 		},
-		get: () => ({ mutations, checks }),
+		get: () => ({ mutations, checks, observations }),
 		reset() {
 			mutations = [];
 			checks = [];
+			observations = [];
 		},
 	};
 }
@@ -126,6 +143,14 @@ function summaryLine(output: string): string {
 	const lines = output.trim().split("\n").map((l) => l.trim()).filter(Boolean);
 	const summary = [...lines].reverse().find((l) => /\b(pass|passed|passing|fail|failed|failing|error|errors|tests?|ok)\b/i.test(l));
 	return clip(summary ?? lines.at(-1) ?? "(no output)", 200);
+}
+
+/** The first and last lines of what a command printed: enough to see a status code, a listing, a count. */
+function observationSummary(output: string): string {
+	const lines = output.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+	if (lines.length === 0) return "(no output)";
+	if (lines.length <= 4) return clip(lines.join(" | "), 300);
+	return clip([...lines.slice(0, 2), "…", ...lines.slice(-2)].join(" | "), 300);
 }
 
 const normalize = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();

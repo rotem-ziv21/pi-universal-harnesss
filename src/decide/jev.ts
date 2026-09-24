@@ -15,19 +15,33 @@ import { nullLogger } from "../util/logger.ts";
  * has already failed whatever it was protecting.
  */
 
+/**
+ * `instructions` may be a string or an object: TypeSafe's docs recommend an object
+ * when part of the question comes from code (a record, an item, a value), with the
+ * question in one field and the data it refers to in the others.
+ */
+export type Instructions = string | Readonly<Record<string, unknown>>;
+
 export interface NoulQuestion {
 	readonly type: "noul";
-	readonly instructions: string;
+	readonly instructions: Instructions;
 	readonly criteria?: { readonly true: string; readonly false: string };
 }
 
 export interface ChoiceQuestion {
 	readonly type: "choice";
-	readonly instructions: string;
+	readonly instructions: Instructions;
 	readonly criteria: Readonly<Record<string, string>>;
 }
 
-export type Question = NoulQuestion | ChoiceQuestion;
+/** A position on an ordered rubric; each level describes a concrete situation. */
+export interface ScoreQuestion {
+	readonly type: "score";
+	readonly instructions: Instructions;
+	readonly criteria: readonly string[];
+}
+
+export type Question = NoulQuestion | ChoiceQuestion | ScoreQuestion;
 export type QuestionSet = Readonly<Record<string, Question>>;
 
 export interface NoulAnswer {
@@ -43,7 +57,15 @@ export interface ChoiceAnswer {
 	readonly probabilities: Readonly<Record<string, number>>;
 }
 
-export type Answer = NoulAnswer | ChoiceAnswer;
+export interface ScoreAnswer {
+	readonly type: "score";
+	/** Probability-weighted level, 0 .. levels-1. A threshold check is fine; interpolation is not. */
+	readonly score: number;
+	readonly probabilities: readonly number[];
+	readonly confidence: number;
+}
+
+export type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
 
 export type JevResult =
 	| { readonly ok: true; readonly answers: Readonly<Record<string, Answer>>; readonly model: string; readonly latencyMs: number; readonly inputTokens: number }
@@ -179,6 +201,14 @@ function readAnswers(raw: Record<string, unknown> | undefined, questions: Questi
 			out[id] = { type: "noul", p: clamp01(p) };
 			continue;
 		}
+		if (question.type === "score") {
+			const score = answer.score;
+			if (typeof score !== "number" || !Number.isFinite(score)) return undefined;
+			const probabilities = readScoreProbabilities(answer.probabilities, question.criteria.length);
+			const confidence = typeof answer.confidence === "number" ? clamp01(answer.confidence) : Math.max(...probabilities, 0);
+			out[id] = { type: "score", score: Math.max(0, Math.min(question.criteria.length - 1, score)), probabilities, confidence };
+			continue;
+		}
 		const choice = answer.choice;
 		const probabilities = answer.probabilities as Record<string, number> | undefined;
 		if (typeof choice !== "string" || !(choice in question.criteria)) return undefined;
@@ -187,6 +217,27 @@ function readAnswers(raw: Record<string, unknown> | undefined, questions: Questi
 		out[id] = { type: "choice", choice, p, probabilities: probabilities ?? {} };
 	}
 	return out;
+}
+
+/** Score probabilities arrive as an array or as a `{ "0": p, "1": p }` object; either way, one per level. */
+function readScoreProbabilities(raw: unknown, levels: number): number[] {
+	const out = new Array<number>(levels).fill(0);
+	if (Array.isArray(raw)) {
+		raw.forEach((p, i) => {
+			if (i < levels && typeof p === "number") out[i] = clamp01(p);
+		});
+	} else if (raw && typeof raw === "object") {
+		for (const [key, p] of Object.entries(raw as Record<string, unknown>)) {
+			const i = Number(key);
+			if (Number.isInteger(i) && i >= 0 && i < levels && typeof p === "number") out[i] = clamp01(p);
+		}
+	}
+	return out;
+}
+
+export function score(answers: Readonly<Record<string, Answer>>, id: string): ScoreAnswer | undefined {
+	const answer = answers[id];
+	return answer?.type === "score" ? answer : undefined;
 }
 
 export function noul(answers: Readonly<Record<string, Answer>>, id: string): number {

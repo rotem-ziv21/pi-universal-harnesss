@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { createEvidenceTracker, freshChecks, reportsFailure } from "../src/decide/evidence.ts";
-import { ACTION_QUESTIONS, DONE_QUESTIONS, QUESTIONS_VERSION } from "../src/decide/questions.ts";
+import { ACTION_QUESTIONS, DONE_QUESTIONS, OUTCOME_TEMPLATES, QUESTIONS_VERSION } from "../src/decide/questions.ts";
 import { makeGates } from "./helpers.ts";
 
 const edit = (path: string) => ({ toolName: "edit", input: { path, edits: [] }, isError: false, output: "ok" });
@@ -13,11 +13,12 @@ describe("question pack", () => {
 	 * instrument, and thresholds tuned on the old one do not carry over. Update this
 	 * hash only after looking at the thresholds against the decision log.
 	 */
-	it("is pinned", () => assert.equal(QUESTIONS_VERSION, "cc7b454617d7"));
+	it("is pinned", () => assert.equal(QUESTIONS_VERSION, "ed7dd0661b2b"));
 	it("keeps every choice open-ended", () => {
 		for (const q of Object.values({ ...ACTION_QUESTIONS, ...DONE_QUESTIONS })) {
 			if (q.type === "choice") assert.ok("other" in q.criteria, "a choice needs a none-of-these option");
 		}
+		assert.equal(OUTCOME_TEMPLATES.completeness.criteria.length, 5, "the completeness rubric has five levels");
 	});
 });
 
@@ -127,7 +128,10 @@ describe("action gate", () => {
 });
 
 describe("done gate", () => {
-	const claimsDone = { claims_done: 0.95, claims_verified: 0.2, verification_applies: 0.9, outcome: "complete" };
+	// Every requested item shown by the evidence, none exercised by a passed check.
+	const claimsDone = { claims_done: 0.95, claims_verified: 0.2, verification_applies: 0.9, outcome: "complete", item_done: 0.9, item_checked: 0.1 };
+	// ...and each exercised by a passed check.
+	const checkedToo = { ...claimsDone, item_checked: 0.9 };
 
 	it("no changes: nothing to check, no Judge call", async () => {
 		const { gates, jev } = makeGates(() => claimsDone);
@@ -137,13 +141,45 @@ describe("done gate", () => {
 		assert.equal(jev.calls.length, 0);
 	});
 
-	it("a check that passed after the last change settles it, whatever the model says", async () => {
-		const { gates, jev } = makeGates(() => claimsDone);
+	it("a passing check after the last change plus every item shown and exercised is verified, in one Judge call", async () => {
+		const { gates, jev } = makeGates(() => checkedToo);
+		gates.onUserPrompt("Fix the parser bug");
 		gates.recordResult(edit("src/a.ts"));
 		gates.recordResult(bash("npm test", "12 passing"));
 		const outcome = await gates.gateDone({ finalMessage: "Done." });
-		assert.deepEqual([outcome.kind, outcome.kind === "skip" && outcome.verified], ["skip", true]);
-		assert.equal(jev.calls.length, 0);
+		assert.ok(outcome.kind === "accept" && outcome.status === "verified" && outcome.verified, JSON.stringify(outcome));
+		assert.equal(jev.calls.length, 1);
+		const asked = Object.keys(jev.calls[0]!.questions);
+		assert.ok(asked.includes("item_0_done") && asked.includes("item_0_checked") && asked.includes("completeness") && asked.includes("claim_beyond_evidence"));
+		assert.deepEqual(jev.calls[0]!.state.request_items, ["Fix the parser bug"]);
+		assert.equal(jev.calls[0]!.state.changes[0].path, "src/a.ts");
+	});
+
+	it("a passing check that covers only some items is partial, not verified, and is not sent back", async () => {
+		const { gates } = makeGates((_state, questions) => ({
+			...checkedToo,
+			// Item 1 (the commit) is shown but no check exercises it.
+			...(Object.keys(questions).includes("item_1_checked") ? { item_1_checked: 0.1 } : {}),
+		}));
+		gates.onUserPrompt("1. Fix the parser bug\n2. Commit with the message fix: parser");
+		gates.recordResult(edit("src/a.ts"));
+		gates.recordResult(bash("npm test", "12 passing"));
+		const outcome = await gates.gateDone({ finalMessage: "Done." });
+		assert.ok(outcome.kind === "accept" && outcome.status === "partial", JSON.stringify(outcome));
+		assert.match(outcome.why, /not exercised by a passed check/);
+	});
+
+	it("an item the evidence does not show sends the worker back once, naming the item", async () => {
+		const { gates } = makeGates((_state, questions) => ({
+			...checkedToo,
+			...(Object.keys(questions).includes("item_1_done") ? { item_1_done: 0.05 } : {}),
+		}));
+		gates.onUserPrompt("1. Fix the parser bug\n2. Add a CHANGELOG entry for the fix");
+		gates.recordResult(edit("src/a.ts"));
+		gates.recordResult(bash("npm test", "12 passing"));
+		const outcome = await gates.gateDone({ finalMessage: "All done, tests pass." });
+		assert.equal(outcome.kind, "nudge");
+		assert.ok(outcome.kind === "nudge" && /CHANGELOG entry/.test(outcome.message) && /not shown by any changed file/.test(outcome.message));
 	});
 
 	it("an unverified done claim sends the worker back once, then lets go", async () => {
@@ -154,8 +190,8 @@ describe("done gate", () => {
 		const first = await gates.gateDone({ finalMessage: "Fixed the parser, all good." });
 		assert.equal(first.kind, "nudge");
 		assert.ok(first.kind === "nudge" && first.message.includes("src/parse.ts"));
-		assert.deepEqual(Object.keys(jev.calls[0]!.questions).sort(), Object.keys(DONE_QUESTIONS).sort());
-		assert.equal(jev.calls[0]!.state.task, "Fix the parser bug");
+		for (const id of Object.keys(DONE_QUESTIONS)) assert.ok(id in jev.calls[0]!.questions, `${id} is asked`);
+		assert.equal(jev.calls[0]!.state.request, "Fix the parser bug");
 
 		// The worker answers the nudge without running anything.
 		const second = await gates.gateDone({ finalMessage: "It is fixed." });
@@ -176,10 +212,12 @@ describe("done gate", () => {
 		assert.equal((await gates.gateDone({ finalMessage: "Should I also update the docs?" })).kind, "accept");
 	});
 
-	it("work a test cannot check is not pushed", async () => {
+	it("work a test cannot check is judged on what the files show, and is not pushed", async () => {
 		const { gates } = makeGates(() => ({ ...claimsDone, verification_applies: 0.1 }));
+		gates.onUserPrompt("Update the README with install steps");
 		gates.recordResult(edit("README.md"));
-		assert.equal((await gates.gateDone({ finalMessage: "Updated the README." })).kind, "accept");
+		const outcome = await gates.gateDone({ finalMessage: "Updated the README." });
+		assert.ok(outcome.kind === "accept" && outcome.status === "verified", JSON.stringify(outcome));
 	});
 
 	it("an error or an abort is not a completion claim", async () => {
@@ -206,7 +244,7 @@ describe("done gate", () => {
 	});
 
 	it("the session cap holds across prompts", async () => {
-		const { gates } = makeGates(() => claimsDone, { done: { enabled: true, claimsDone: 0.7, applies: 0.5, maxNudgesPerPrompt: 1, maxNudgesPerSession: 2 } });
+		const { gates } = makeGates(() => claimsDone, { done: { enabled: true, claimsDone: 0.7, applies: 0.5, itemDone: 0.8, itemNotDone: 0.2, claimBeyond: 0.7, maxNudgesPerPrompt: 1, maxNudgesPerSession: 2 } });
 		const kinds: string[] = [];
 		for (let i = 0; i < 3; i++) {
 			gates.onUserPrompt(`task ${i}`);

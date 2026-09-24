@@ -59,6 +59,11 @@ export const HarnessConfigSchema = Type.Object(
 				enabled: Type.Boolean({ default: true }),
 				claimsDone: Type.Number({ default: 0.7, minimum: 0, maximum: 1 }),
 				applies: Type.Number({ default: 0.5, minimum: 0, maximum: 1 }),
+				/** Per requested item: shown by the evidence at or above itemDone, not shown at or below itemNotDone, uncertain between. */
+				itemDone: Type.Number({ default: 0.8, minimum: 0, maximum: 1 }),
+				itemNotDone: Type.Number({ default: 0.2, minimum: 0, maximum: 1 }),
+				/** The final message claims results the evidence does not show. */
+				claimBeyond: Type.Number({ default: 0.7, minimum: 0, maximum: 1 }),
 				/** How many times one user prompt may send the worker back. After that the run ends, reported as unverified. */
 				maxNudgesPerPrompt: Type.Integer({ default: 1, minimum: 0, maximum: 3 }),
 				maxNudgesPerSession: Type.Integer({ default: 3, minimum: 0, maximum: 20 }),

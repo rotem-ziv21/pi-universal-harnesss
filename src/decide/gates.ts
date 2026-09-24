@@ -1,3 +1,6 @@
+import { readFileSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { redactValue } from "../security/redact.ts";
 import { hashValue } from "../util/json.ts";
 import type { Logger } from "../util/logger.ts";
 import { nullLogger } from "../util/logger.ts";
@@ -11,12 +14,15 @@ import {
 	decideActionWithoutJudge,
 	decideDone,
 	deniedMessage,
+	describeOutcome,
 	type DoneThresholds,
 	doneNudgeMessage,
 	heldMessage,
-	needsDoneCheck,
+	judgeOutcome,
+	type OutcomeVerdict,
 } from "./policy.ts";
-import { ACTION_QUESTIONS, DONE_QUESTIONS, QUESTIONS_VERSION } from "./questions.ts";
+import { ACTION_QUESTIONS, DONE_QUESTIONS, outcomeQuestions, QUESTIONS_VERSION } from "./questions.ts";
+import { splitRequestItems } from "./request-items.ts";
 import { createStuckDetector, type StuckDetector } from "./stuck.ts";
 
 /**
@@ -74,10 +80,12 @@ export interface DoneRequest {
 	readonly signal?: AbortSignal | undefined;
 }
 
+export type DoneStatus = "verified" | "partial" | "unverified";
+
 export type DoneOutcome =
-	/** Nothing to judge: no changes, a fresh passing check, or the stop was not a completion. */
+	/** Nothing to judge: no changes, or the stop was not a completion. */
 	| { readonly kind: "skip"; readonly why: string; readonly verified: boolean }
-	| { readonly kind: "accept"; readonly why: string; readonly verified: boolean }
+	| { readonly kind: "accept"; readonly why: string; readonly verified: boolean; readonly status: DoneStatus; readonly outcome?: OutcomeVerdict | undefined }
 	| { readonly kind: "nudge"; readonly why: string; readonly message: string };
 
 export interface Gates {
@@ -104,6 +112,7 @@ export function createGates(deps: GatesDeps): Gates {
 
 	const base = { mode: config.mode, questionsVersion: QUESTIONS_VERSION };
 	const userRequest = (): string => prompts.map((p) => clip(p, 1500)).join("\n---\n");
+	const latestPrompt = (): string => prompts.at(-1) ?? "";
 
 	/** Observe mode logs what would have happened and lets everything but the deny list through. */
 	const enforce = config.mode === "enforce";
@@ -193,39 +202,72 @@ export function createGates(deps: GatesDeps): Gates {
 				return { kind: "skip", why: `the model stopped with "${stopReason}", which is not a completion claim`, verified: false };
 			}
 
-			if (!needsDoneCheck(evidence)) {
-				const verified = evidence.mutations.length > 0;
-				return conclude({ kind: "skip", why: verified ? "a check passed after the last change" : "no files were changed", verified });
+			if (evidence.mutations.length === 0) {
+				return conclude({ kind: "skip", why: "no files were changed", verified: false });
 			}
 
-			const state = buildDoneState(userRequest(), finalMessage, evidence);
-			const result = await jev.ask(state, DONE_QUESTIONS, signal);
+			/**
+			 * One Jev request answers everything: how the worker stopped (DONE_QUESTIONS)
+			 * and, per requested item, whether the evidence shows it was carried out and
+			 * exercised by a passed check (outcome questions). A passing check alone is
+			 * not "verified": tests that cover three of six deliverables prove three.
+			 */
+			const items = splitRequestItems(latestPrompt());
+			const freshPass = freshChecks(evidence).some((c) => c.passed);
+			const state = buildDoneState(userRequest(), items, finalMessage, evidence, deps.cwd);
+			const result = await jev.ask(state, { ...DONE_QUESTIONS, ...outcomeQuestions(items) }, signal);
 			if (!result.ok) {
 				log.write({ ...base, kind: "done", source: "fallback", verdict: "accept", reason: "Judge unavailable", state, error: `${result.code}: ${result.message}`, latencyMs: result.latencyMs });
-				return conclude({ kind: "accept", why: `the Judge is unavailable (${result.code}), so the claim could not be checked`, verified: false });
+				return conclude({
+					kind: "accept",
+					why: freshPass
+						? `a check passed after the last change; the Judge is unavailable (${result.code}), so item coverage was not judged`
+						: `the Judge is unavailable (${result.code}), so the claim could not be checked`,
+					verified: freshPass,
+					status: freshPass ? "partial" : "unverified",
+				});
 			}
 
-			const verdict = decideDone(result.answers, config.done);
+			const stop = decideDone(result.answers, config.done);
+			const checksApply = noul(result.answers, "verification_applies") >= config.done.applies;
+			const outcome = judgeOutcome(result.answers, items, config.done, checksApply);
+			const claimsDone = noul(result.answers, "claims_done") >= config.done.claimsDone;
+			const stoppedForUser = stop.kind === "accept" && /ask the user|report a blocker/.test(stop.why);
+			const wantNudge =
+				!stoppedForUser &&
+				claimsDone &&
+				(outcome.missing.length > 0 || outcome.claimBeyond >= config.done.claimBeyond || (checksApply && !freshPass));
 			const capped = nudgesThisPrompt >= config.done.maxNudgesPerPrompt || nudgesThisSession >= config.done.maxNudgesPerSession;
-			const willNudge = verdict.kind === "nudge" && enforce && !capped;
+			const willNudge = wantNudge && enforce && !capped;
+			const summary = describeOutcome(outcome, items);
+			const why = stoppedForUser ? stop.why : wantNudge ? `the agent reports the work as done; ${summary}` : summary;
+
 			log.write({
 				...base,
 				kind: "done",
-				source: verdict.kind === "nudge" && capped ? "cap" : "jev",
-				verdict: willNudge ? "nudge" : verdict.kind === "nudge" ? (enforce ? "accept(capped)" : "nudge(observe)") : "accept",
-				reason: verdict.why,
+				source: wantNudge && capped ? "cap" : "jev",
+				verdict: willNudge ? "nudge" : wantNudge ? (enforce ? "accept(capped)" : "nudge(observe)") : `accept(${outcome.status})`,
+				reason: why,
 				state,
 				answers: result.answers,
 				model: result.model,
 				latencyMs: result.latencyMs,
 			});
 
-			if (!willNudge) return conclude({ kind: "accept", why: verdict.kind === "nudge" ? `${verdict.why}; not sent back again` : verdict.why, verified: false });
+			if (!willNudge) {
+				return conclude({
+					kind: "accept",
+					why: wantNudge && capped ? `${why}; not sent back again` : why,
+					verified: outcome.status === "verified",
+					status: outcome.status,
+					outcome,
+				});
+			}
 
 			nudgesThisPrompt++;
 			nudgesThisSession++;
-			logger.info("done check: sending the worker back once", { why: verdict.why });
-			return { kind: "nudge", why: verdict.why, message: doneNudgeMessage(evidence, noul(result.answers, "claims_verified") >= config.done.claimsDone) };
+			logger.info("done check: sending the worker back once", { why });
+			return { kind: "nudge", why, message: doneNudgeMessage(evidence, noul(result.answers, "claims_verified") >= config.done.claimsDone, outcome) };
 		},
 	};
 }
@@ -249,18 +291,39 @@ export function buildActionState(
 	};
 }
 
-export function buildDoneState(userRequest: string, finalMessage: string, evidence: RunEvidence): Record<string, unknown> {
+export function buildDoneState(
+	userRequest: string,
+	items: readonly string[],
+	finalMessage: string,
+	evidence: RunEvidence,
+	cwd: string,
+): Record<string, unknown> {
 	const files = changedFiles(evidence);
-	return {
-		task: userRequest || "(none)",
+	const changes = files.slice(0, 20).map((path) => ({ path, ...observeFile(path, cwd) }));
+	return redactValue({
+		request: userRequest || "(none)",
+		request_items: items,
+		changes,
+		changes_count: files.length,
+		checks: evidence.checks.slice(-8).map((c) => ({ command: c.command, passed: c.passed, summary: c.summary })),
+		checks_after_last_change: freshChecks(evidence).length,
+		observations: evidence.observations.slice(-20).map((o) => ({ command: o.command, ok: o.ok, output: o.summary })),
 		final_message: clip(finalMessage || "(no text)", 3000),
-		run: {
-			files_changed: files.slice(0, 20),
-			files_changed_count: files.length,
-			checks_run: evidence.checks.slice(-5).map((c) => ({ command: c.command, passed: c.passed, summary: c.summary })),
-			checks_after_last_change: freshChecks(evidence).length,
-		},
-	};
+	});
+}
+
+/** What a changed file holds now: its head, or the fact that it is gone. Bounded so the state stays small. */
+function observeFile(path: string, cwd: string): { kind: "present" | "missing"; bytes?: number; head?: string } {
+	const full = isAbsolute(path) ? path : resolve(cwd, path);
+	try {
+		const stats = statSync(full);
+		if (!stats.isFile()) return { kind: "present", bytes: stats.size };
+		const head = readFileSync(full).subarray(0, 4096);
+		if (head.includes(0)) return { kind: "present", bytes: stats.size, head: "(binary)" };
+		return { kind: "present", bytes: stats.size, head: clip(head.toString("utf8"), 600) };
+	} catch {
+		return { kind: "missing" };
+	}
 }
 
 function clipArgs(input: Record<string, unknown>): Record<string, unknown> {

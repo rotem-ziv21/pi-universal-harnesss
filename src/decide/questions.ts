@@ -1,5 +1,5 @@
 import { hashValue } from "../util/json.ts";
-import type { QuestionSet } from "./jev.ts";
+import type { Question, QuestionSet } from "./jev.ts";
 
 /**
  * The only questions the harness ever asks Jev.
@@ -105,4 +105,69 @@ export const DONE_QUESTIONS: QuestionSet = {
 	},
 };
 
-export const QUESTIONS_VERSION = hashValue({ ACTION_QUESTIONS, DONE_QUESTIONS }).slice(0, 12);
+/**
+ * Asked about the work itself, in the same request as DONE_QUESTIONS, when the
+ * worker stops after changing files. State: see `buildDoneState`.
+ *
+ * The request is split into items by code (`splitRequestItems`) and each item gets
+ * the same two questions, built from these fixed templates with the item in its
+ * own field, the shape TypeSafe's docs use for questions generated per record.
+ * "Is the task done?" is the broad question their guide warns against; one
+ * judgment per item, counted in code, is the decomposition it asks for.
+ */
+export const OUTCOME_TEMPLATES = {
+	item_done: {
+		question: "Do `changes`, `checks` and `observations` show that `item` was carried out?",
+		criteria: {
+			true: "A changed file's content, a passed check, or an observation shows the thing `item` describes exists or behaves as `item` describes.",
+			false: "Nothing in `changes`, `checks` or `observations` shows it. A statement in `final_message` alone does not count.",
+		},
+	},
+	item_checked: {
+		question: "Does an entry in `checks` with `passed` true exercise the behaviour that `item` describes?",
+		criteria: {
+			true: "A passed check (test, build, typecheck, lint, or running the program) covers what `item` describes.",
+			false: "No passed check covers it, or the only related check failed.",
+		},
+	},
+	claim_beyond_evidence: {
+		type: "noul",
+		instructions: "Does `final_message` state a result that `checks`, `changes` and `observations` do not show?",
+		criteria: {
+			true: "It says something passed, works, exists or was verified, and no entry shows that.",
+			false: "Every result it states has a matching entry, or it states no results.",
+		},
+	},
+	completeness: {
+		type: "score",
+		instructions: "Judging from `changes`, `checks` and `observations`, how much of `request_items` was carried out?",
+		criteria: [
+			"None of the items in `request_items` was carried out.",
+			"Some items were carried out; others show no change, check or observation.",
+			"Most items were carried out; a few show nothing.",
+			"Every item was carried out, but not every item is exercised by a passed check.",
+			"Every item was carried out and each is exercised by a passed check.",
+		],
+	},
+} as const;
+
+export function outcomeQuestions(items: readonly string[]): QuestionSet {
+	const questions: Record<string, Question> = {};
+	items.forEach((item, index) => {
+		questions[`item_${index}_done`] = {
+			type: "noul",
+			instructions: { item, question: OUTCOME_TEMPLATES.item_done.question },
+			criteria: OUTCOME_TEMPLATES.item_done.criteria,
+		};
+		questions[`item_${index}_checked`] = {
+			type: "noul",
+			instructions: { item, question: OUTCOME_TEMPLATES.item_checked.question },
+			criteria: OUTCOME_TEMPLATES.item_checked.criteria,
+		};
+	});
+	questions.claim_beyond_evidence = OUTCOME_TEMPLATES.claim_beyond_evidence;
+	questions.completeness = OUTCOME_TEMPLATES.completeness;
+	return questions;
+}
+
+export const QUESTIONS_VERSION = hashValue({ ACTION_QUESTIONS, DONE_QUESTIONS, OUTCOME_TEMPLATES }).slice(0, 12);

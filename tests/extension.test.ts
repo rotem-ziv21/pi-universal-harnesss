@@ -80,7 +80,7 @@ afterEach(() => {
 });
 
 describe("extension", () => {
-	const claimsDone = { claims_done: 0.95, verification_applies: 0.9, outcome: "complete" };
+	const claimsDone = { claims_done: 0.95, verification_applies: 0.9, outcome: "complete", item_done: 0.9, item_checked: 0.1 };
 
 	it("an unverified 'done' gets exactly one nudge, then the run ends and the user is told", async () => {
 		const { fire, ctx, sent, notes } = setup(() => claimsDone);
@@ -100,11 +100,11 @@ describe("extension", () => {
 		await fire("agent_end", { messages: [assistant("It is fixed.")] }, ctx);
 		await fire("agent_settled", {}, ctx);
 		assert.equal(sent.length, 1, "no second nudge");
-		assert.ok(notes.some((n) => /not verified/.test(n)));
+		assert.ok(notes.some((n) => /partially verified.*not exercised by a passed check/.test(n)), notes.join(" | "));
 	});
 
-	it("running the tests after the change ends the run as verified, with no Judge call", async () => {
-		const { fire, ctx, sent, jev, notes } = setup(() => claimsDone);
+	it("running the tests after the change, with every item shown and checked, ends the run as verified", async () => {
+		const { fire, ctx, sent, jev, notes } = setup(() => ({ ...claimsDone, item_checked: 0.9 }));
 		await fire("session_start", {}, ctx);
 		await fire("before_agent_start", { prompt: "Fix the parser bug" }, ctx);
 		await fire("tool_call", { toolName: "edit", toolCallId: "1", input: { path: "src/parse.ts" } }, ctx);
@@ -114,8 +114,8 @@ describe("extension", () => {
 		await fire("agent_end", { messages: [assistant("Fixed; tests pass.")] }, ctx);
 		await fire("agent_settled", {}, ctx);
 		assert.equal(sent.length, 0);
-		assert.equal(jev.calls.length, 0);
-		assert.ok(notes.some((n) => /a check passed after the last change/.test(n)));
+		assert.equal(jev.calls.length, 1, "one Judge call judges item coverage");
+		assert.ok(notes.some((n) => /done, verified/.test(n)), notes.join(" | "));
 	});
 
 	it("a provider error is not treated as a completion", async () => {

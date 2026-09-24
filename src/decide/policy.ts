@@ -1,4 +1,4 @@
-import { choice, noul, type Answer } from "./jev.ts";
+import { choice, noul, score, type Answer } from "./jev.ts";
 import { changedFiles, freshChecks, type RunEvidence } from "./evidence.ts";
 
 /**
@@ -70,6 +70,72 @@ export function deniedMessage(summary: string, reason: string): string {
 export interface DoneThresholds {
 	readonly claimsDone: number;
 	readonly applies: number;
+	/** An item's `item_i_done` at or above this counts as carried out. */
+	readonly itemDone: number;
+	/** At or below this it counts as not carried out; between the two it is uncertain. */
+	readonly itemNotDone: number;
+	/** `claim_beyond_evidence` at or above this is a claim the evidence does not back. */
+	readonly claimBeyond: number;
+}
+
+/**
+ * What the outcome questions say about the work, counted in code: which
+ * requested items the evidence shows, which it does not, which are uncertain,
+ * and which were never exercised by a passed check.
+ */
+export interface OutcomeVerdict {
+	readonly status: "verified" | "partial" | "unverified";
+	readonly done: readonly string[];
+	readonly missing: readonly string[];
+	readonly uncertain: readonly string[];
+	readonly unchecked: readonly string[];
+	readonly claimBeyond: number;
+	/** The `completeness` score level, 0..4, when Jev returned one. */
+	readonly completeness?: number | undefined;
+}
+
+export function judgeOutcome(
+	answers: Readonly<Record<string, Answer>>,
+	items: readonly string[],
+	t: DoneThresholds,
+	checksApply: boolean,
+): OutcomeVerdict {
+	const done: string[] = [];
+	const missing: string[] = [];
+	const uncertain: string[] = [];
+	const unchecked: string[] = [];
+	items.forEach((item, i) => {
+		const d = noul(answers, `item_${i}_done`);
+		const c = noul(answers, `item_${i}_checked`);
+		if (d >= t.itemDone) {
+			done.push(item);
+			if (checksApply && c < t.itemDone) unchecked.push(item);
+		} else if (d <= t.itemNotDone) missing.push(item);
+		else uncertain.push(item);
+	});
+	const claimBeyond = noul(answers, "claim_beyond_evidence");
+	const completeness = score(answers, "completeness")?.score;
+	const status: OutcomeVerdict["status"] =
+		items.length > 0 && missing.length === 0 && uncertain.length === 0 && unchecked.length === 0
+			? "verified"
+			: missing.length === 0 && done.length > 0
+				? "partial"
+				: "unverified";
+	return { status, done, missing, uncertain, unchecked, claimBeyond, completeness };
+}
+
+/** One line for the user: what was shown, what was not. */
+export function describeOutcome(v: OutcomeVerdict, items: readonly string[]): string {
+	const name = (item: string) => `"${item.length > 70 ? `${item.slice(0, 69)}…` : item}"`;
+	const list = (label: string, xs: readonly string[]) => (xs.length === 0 ? undefined : `${label}: ${xs.slice(0, 4).map(name).join(", ")}${xs.length > 4 ? ` (+${xs.length - 4} more)` : ""}`);
+	const parts = [
+		`${v.done.length} of ${items.length} requested item(s) shown by the evidence`,
+		list("not shown", v.missing),
+		list("uncertain", v.uncertain),
+		list("shown but not exercised by a passed check", v.unchecked),
+		v.claimBeyond >= 0.7 ? `the final message claims results the evidence does not show (p=${fmt(v.claimBeyond)})` : undefined,
+	].filter((p): p is string => p !== undefined);
+	return parts.join("; ");
 }
 
 /**
@@ -98,17 +164,33 @@ export function decideDone(answers: Readonly<Record<string, Answer>>, t: DoneThr
 	return { kind: "nudge", why: `the agent claims the work is done (p=${fmt(claimsDone)}) with no passing check after its last change` };
 }
 
-export function doneNudgeMessage(evidence: RunEvidence, claimedVerified: boolean): string {
+export function doneNudgeMessage(evidence: RunEvidence, claimedVerified: boolean, outcome?: OutcomeVerdict): string {
 	const files = changedFiles(evidence);
 	const fresh = freshChecks(evidence);
+	const freshPass = fresh.some((c) => c.passed);
 	const lastFailed = fresh.filter((c) => !c.passed).at(-1);
 	const list = files.slice(0, 8).join(", ") + (files.length > 8 ? ` (+${files.length - 8} more)` : "");
+	const missing = outcome?.missing ?? [];
+	const beyond = outcome !== undefined && outcome.claimBeyond >= 0.7;
 	return [
-		`Harness: you changed ${files.length} file(s) (${list}) and no test, build or check has passed since the last change.`,
+		freshPass
+			? `Harness: you report the work as done. You changed ${files.length} file(s) (${list}); a check passed after the last change.`
+			: `Harness: you changed ${files.length} file(s) (${list}) and no test, build or check has passed since the last change.`,
+		...(missing.length > 0
+			? [
+					"These requested items are not shown by any changed file, passed check or command output:",
+					...missing.slice(0, 6).map((item) => `  - ${item}`),
+					...(missing.length > 6 ? [`  (+${missing.length - 6} more)`] : []),
+				]
+			: []),
 		...(lastFailed ? [`The last check after your change failed: \`${lastFailed.command}\` → ${lastFailed.summary}`] : []),
-		...(claimedVerified ? ["Your reply says the work was checked, but the harness saw no passing check after the last change."] : []),
-		"Run the check that applies to this work and report its actual result. " +
-			"If no check exists or none can run here, say that plainly in your reply instead of claiming it was verified.",
+		...(claimedVerified && !freshPass ? ["Your reply says the work was checked, but the harness saw no passing check after the last change."] : []),
+		...(beyond ? ["Your reply states results that no tool output shows."] : []),
+		missing.length > 0
+			? "For each item above: do it, or show it with a tool result (a listing, a test, a run) and report the actual output. " +
+				"If an item cannot be done here, say so plainly instead of reporting it as done."
+			: "Run the check that applies to this work and report its actual result. " +
+				"If no check exists or none can run here, say that plainly in your reply instead of claiming it was verified.",
 	].join("\n");
 }
 

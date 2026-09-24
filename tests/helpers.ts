@@ -25,9 +25,15 @@ export function fakeJev(respond: Responder): FakeJev {
 		if (result === "fail") return new Response("upstream error", { status: 503 });
 		const answers: Record<string, unknown> = {};
 		for (const [id, q] of Object.entries(body.questions)) {
-			const value = result[id];
+			// `item_done` / `item_checked` in the responder answer for every requested item.
+			const alias = /^item_\d+_(done|checked)$/.exec(id)?.[1];
+			const value = result[id] ?? (alias ? result[`item_${alias}`] : undefined);
 			if (q.type === "noul") answers[id] = { type: "noul", noul: typeof value === "number" ? value : 0.05 };
-			else {
+			else if (q.type === "score") {
+				const level = typeof value === "number" ? value : 0;
+				const probabilities = q.criteria.map((_, i) => (i === Math.round(level) ? 0.9 : 0.1 / Math.max(1, q.criteria.length - 1)));
+				answers[id] = { type: "score", score: level, probabilities, confidence: 0.85 };
+			} else {
 				const choice = typeof value === "string" ? value : Object.keys(q.criteria).at(-1)!;
 				answers[id] = { type: "choice", choice, probabilities: { [choice]: 0.9 }, confidence: 0.8 };
 			}
@@ -40,7 +46,7 @@ export function fakeJev(respond: Responder): FakeJev {
 export const DEFAULT_GATES: GatesConfig = {
 	mode: "enforce",
 	action: { destructiveConfirm: 0.8, exfiltrationBlock: 0.8, outwardConfirm: 0.85, offRequestConfirm: 0.9 },
-	done: { enabled: true, claimsDone: 0.7, applies: 0.5, maxNudgesPerPrompt: 1, maxNudgesPerSession: 3 },
+	done: { enabled: true, claimsDone: 0.7, applies: 0.5, itemDone: 0.8, itemNotDone: 0.2, claimBeyond: 0.7, maxNudgesPerPrompt: 1, maxNudgesPerSession: 3 },
 	stuckThreshold: 3,
 };
 

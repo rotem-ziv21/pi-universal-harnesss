@@ -81,14 +81,27 @@ worker stops
    │
    ├─ stopped on an error, abort or length limit? ─► not a completion claim; nothing to check
    ├─ no files changed? ───────────────────────────► done (nothing to verify)
-   ├─ a check passed after the last change? ───────► done, verified (no Judge call)
-   └─ otherwise: one Jev request over {task, final message, files changed, checks run}
+   └─ otherwise: the request is split into items by code (numbered lines, bullets,
+      sentences) and ONE Jev request is made over
+      {request, request_items, changes (path + head), checks, observations, final_message}
          claims_done · claims_verified · verification_applies · outcome
+         per item i:  item_i_done · item_i_checked
+         claim_beyond_evidence · completeness (score, 5 levels)
          │
-         ├─ asking you a question, blocked, or a test can't check this work ─► done, not verified
-         └─ claims done with no passing check ─► sent back ONCE with the facts;
-                                                 the next stop ends the run, reported as not verified
+         ├─ asking you a question or blocked ─────────────► done, reported as is
+         ├─ every item shown and exercised by a passed check ─► done, verified
+         ├─ every item shown, some not checked ───────────► done, partially verified (says which)
+         └─ an item not shown, a claim beyond the evidence, or
+            a done claim with no passing check ───────────► sent back ONCE, naming the items;
+                                                            the next stop ends the run
 ```
+
+The code counts: an item is "shown" at `item_i_done ≥ itemDone` (0.8), "not shown"
+at `≤ itemNotDone` (0.2), uncertain in between. Uncertain items are listed to you,
+never used to block or to pass. "Is the task done?" is the broad question TypeSafe's
+guide warns against; one judgment per item, in the user's own words, is the
+decomposition it asks for. A passing test alone is not "verified": tests that cover
+three of six deliverables prove three.
 
 A check is a test, build, typecheck or lint command. Whether it passed is read from its
 exit status and from the runner's own summary line. Changes are write and edit calls,
@@ -215,7 +228,7 @@ artifact to keep in sync.
     "timeoutMs": 8000
   },
   "action": { "destructiveConfirm": 0.8, "exfiltrationBlock": 0.8, "outwardConfirm": 0.85, "offRequestConfirm": 0.9 },
-  "done": { "enabled": true, "claimsDone": 0.7, "applies": 0.5, "maxNudgesPerPrompt": 1, "maxNudgesPerSession": 3 },
+  "done": { "enabled": true, "claimsDone": 0.7, "applies": 0.5, "itemDone": 0.8, "itemNotDone": 0.2, "claimBeyond": 0.7, "maxNudgesPerPrompt": 1, "maxNudgesPerSession": 3 },
   "stuck": { "repeatThreshold": 3 }
 }
 ```
